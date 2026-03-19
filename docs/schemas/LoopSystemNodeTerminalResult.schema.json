@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopSystemNodeTerminalResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "node_id",
+    "round_id",
+    "generation",
+    "outcome",
+    "node_status",
+    "summary",
+    "evidence_refs",
+    "self_attribution",
+    "self_repair"
+  ],
+  "properties": {
+    "node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "round_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "outcome": {
+      "type": "string",
+      "enum": [
+        "PASS",
+        "FAIL",
+        "BUG",
+        "STUCK",
+        "FAIL_CLOSED"
+      ]
+    },
+    "node_status": {
+      "type": "string",
+      "minLength": 1
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "self_attribution": {
+      "type": "string"
+    },
+    "self_repair": {
+      "type": "string"
+    }
+  }
+}

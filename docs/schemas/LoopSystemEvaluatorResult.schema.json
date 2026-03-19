@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopSystemEvaluatorResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "verdict",
+    "lane",
+    "summary",
+    "evidence_refs",
+    "retryable",
+    "diagnostics",
+    "recovery"
+  ],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "PASS",
+        "FAIL",
+        "STRUCTURED_EXCEPTION",
+        "BUG",
+        "STUCK",
+        "ERROR"
+      ]
+    },
+    "lane": {
+      "type": "string",
+      "minLength": 1
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "retryable": {
+      "type": "boolean"
+    },
+    "diagnostics": {
+      "type": "object",
+      "properties": {
+        "self_attribution": {
+          "type": "string"
+        },
+        "self_repair": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "recovery": {
+      "type": "object",
+      "properties": {
+        "required": {
+          "type": "boolean"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "run_state_ref": {
+          "type": "string"
+        },
+        "resume_from_stage": {
+          "type": "string"
+        },
+        "preserve_frozen_checker_graph": {
+          "type": "boolean"
+        },
+        "completed_lane_unit_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "remaining_lane_unit_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

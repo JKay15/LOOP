@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "TERMINAL"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "terminal_evaluation_report_ref",
+          "terminal_evaluation_status"
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "child_exit_code": {
+      "type": "integer"
+    },
+    "child_stderr_ref": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "child_stdout_ref": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "evaluation_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "message": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "no_progress_timeout_s": {
+      "exclusiveMinimum": 0,
+      "type": "number"
+    },
+    "notes": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "poll_interval_s": {
+      "exclusiveMinimum": 0,
+      "type": "number"
+    },
+    "progress_log_ref": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "request_ref": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "run_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "run_root": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "schema": {
+      "const": "loop_product.loop_evaluator_prototype_supervisor_report"
+    },
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "status": {
+      "enum": [
+        "TERMINAL",
+        "BUG",
+        "STUCK"
+      ],
+      "type": "string"
+    },
+    "terminal_evaluation_report_ref": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "terminal_evaluation_status": {
+      "enum": [
+        "PASS",
+        "FAIL",
+        "INCONCLUSIVE",
+        "ERROR"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "evaluation_id",
+    "run_id",
+    "run_root",
+    "request_ref",
+    "status",
+    "message",
+    "poll_interval_s",
+    "no_progress_timeout_s",
+    "child_stdout_ref",
+    "child_stderr_ref",
+    "progress_log_ref",
+    "notes"
+  ],
+  "title": "loop_product.loop_evaluator_prototype_supervisor_report",
+  "type": "object"
+}

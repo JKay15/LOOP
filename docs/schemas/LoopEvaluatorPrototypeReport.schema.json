@@ -1,0 +1,794 @@
+{
+  "$defs": {
+    "agentPolicy": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "aiUserEffect": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence_refs": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "outcome": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "requirement_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "summary": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "requirement_id",
+        "outcome",
+        "summary",
+        "evidence_refs"
+      ],
+      "type": "object"
+    },
+    "aiUserRun": {
+      "additionalProperties": false,
+      "properties": {
+        "effect_results": {
+          "items": {
+            "$ref": "#/$defs/aiUserEffect"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "effect_scratch_dir": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "operation_log_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "response_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "result_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "role_run": {
+          "$ref": "#/$defs/roleRun"
+        },
+        "target_evaluation_unit": {
+          "$ref": "#/$defs/evaluationUnit"
+        },
+        "unit_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "unit_id",
+        "target_evaluation_unit",
+        "effect_scratch_dir",
+        "result_ref",
+        "response_ref",
+        "operation_log_ref",
+        "effect_results",
+        "role_run"
+      ],
+      "type": "object"
+    },
+    "aiUserScheduler": {
+      "additionalProperties": false,
+      "properties": {
+        "batches": {
+          "items": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "configured_max_parallel_runs": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_parallel_runs": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mode": {
+          "enum": [
+            "parallel_evaluation_units"
+          ],
+          "type": "string"
+        },
+        "planned_runs": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "mode",
+        "planned_runs",
+        "max_parallel_runs",
+        "batches"
+      ],
+      "type": "object"
+    },
+    "checkerRepairAction": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "emitted_requirement_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "raw_item": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "raw_item",
+        "action",
+        "emitted_requirement_ids"
+      ],
+      "type": "object"
+    },
+    "checkerResult": {
+      "additionalProperties": false,
+      "properties": {
+        "normalized_requirements": {
+          "items": {
+            "$ref": "#/$defs/finalEffectRequirement"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "notes": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "repair_actions": {
+          "items": {
+            "$ref": "#/$defs/checkerRepairAction"
+          },
+          "type": "array"
+        },
+        "requirement_graph": {
+          "$ref": "#/$defs/requirementGraph"
+        },
+        "response_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "result_ref": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "result_ref",
+        "response_ref",
+        "normalized_requirements",
+        "requirement_graph",
+        "notes",
+        "repair_actions"
+      ],
+      "type": "object"
+    },
+    "dependencyEdge": {
+      "additionalProperties": false,
+      "properties": {
+        "from_unit_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "to_unit_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "from_unit_id",
+        "to_unit_id"
+      ],
+      "type": "object"
+    },
+    "effectReview": {
+      "additionalProperties": true,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "verdict": {
+                "enum": [
+                  "PASS",
+                  "FAIL"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reproduction_steps"
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "evidence_refs": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "reproduction_steps": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "requirement_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "summary": {},
+        "verdict": {
+          "enum": [
+            "PASS",
+            "FAIL",
+            "INCONCLUSIVE",
+            "UNCERTAIN"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "requirement_id",
+        "verdict",
+        "evidence_refs"
+      ],
+      "type": "object"
+    },
+    "errorInfo": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence_refs": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "human_gate_reasons": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "kind": {
+          "enum": [
+            "HUMAN_GATE",
+            "CONTRACT_VALIDATION_FAILURE",
+            "RUNTIME_FAILURE"
+          ],
+          "type": "string"
+        },
+        "message": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "stage": {
+          "enum": [
+            "preflight",
+            "checker",
+            "test_designer",
+            "ordinary_tests",
+            "ai_user",
+            "reviewer"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "stage",
+        "kind",
+        "message"
+      ],
+      "type": "object"
+    },
+    "evaluationUnit": {
+      "additionalProperties": false,
+      "properties": {
+        "requirement_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "unit_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "unit_id",
+        "requirement_ids"
+      ],
+      "type": "object"
+    },
+    "executedTest": {
+      "additionalProperties": false,
+      "properties": {
+        "argv": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "exec_span_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "passed": {
+          "type": "boolean"
+        },
+        "stderr_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "stdout_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "test_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "test_kind": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "test_id",
+        "test_kind",
+        "argv",
+        "passed",
+        "exit_code",
+        "stdout_ref",
+        "stderr_ref",
+        "exec_span_ref"
+      ],
+      "type": "object"
+    },
+    "finalEffectRequirement": {
+      "additionalProperties": false,
+      "properties": {
+        "blocking": {
+          "type": "boolean"
+        },
+        "description": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "requirement_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "requirement_id",
+        "description"
+      ],
+      "type": "object"
+    },
+    "ordinaryTestResults": {
+      "additionalProperties": false,
+      "properties": {
+        "all_passed": {
+          "type": "boolean"
+        },
+        "executed_tests": {
+          "items": {
+            "$ref": "#/$defs/executedTest"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "generated_tests_ref": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "generated_tests_ref",
+        "all_passed",
+        "executed_tests"
+      ],
+      "type": "object"
+    },
+    "ordinaryTestReview": {},
+    "requirementGraph": {
+      "additionalProperties": false,
+      "properties": {
+        "dependency_edges": {
+          "items": {
+            "$ref": "#/$defs/dependencyEdge"
+          },
+          "type": "array"
+        },
+        "evaluation_units": {
+          "items": {
+            "$ref": "#/$defs/evaluationUnit"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "requirements": {
+          "items": {
+            "$ref": "#/$defs/finalEffectRequirement"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "requirements",
+        "evaluation_units",
+        "dependency_edges"
+      ],
+      "type": "object"
+    },
+    "reviewerResult": {
+      "additionalProperties": true,
+      "properties": {
+        "effect_reviews": {
+          "items": {
+            "$ref": "#/$defs/effectReview"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "evidence_refs": {},
+        "ordinary_test_review": {
+          "$ref": "#/$defs/ordinaryTestReview"
+        },
+        "response_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "result_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "summary": {}
+      },
+      "required": [
+        "result_ref",
+        "response_ref",
+        "effect_reviews"
+      ],
+      "type": "object"
+    },
+    "roleRun": {
+      "additionalProperties": true,
+      "properties": {
+        "agent_provider_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "attempt_count": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "context_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "effective_agent_cmd": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "exec_span_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "invocation_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "launch_spec": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "observed_runtime": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "prompt_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "requested_agent_policy": {
+          "$ref": "#/$defs/agentPolicy"
+        },
+        "resolved_invocation": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "response_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "result_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_history": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "prompt_ref",
+        "context_ref",
+        "result_ref",
+        "response_ref",
+        "invocation_ref",
+        "exec_span_ref",
+        "exit_code",
+        "agent_provider_id",
+        "requested_agent_policy",
+        "resolved_invocation",
+        "effective_agent_cmd",
+        "observed_runtime"
+      ],
+      "type": "object"
+    },
+    "roleRuns": {
+      "additionalProperties": false,
+      "properties": {
+        "checker": {
+          "$ref": "#/$defs/roleRun"
+        },
+        "reviewer": {
+          "$ref": "#/$defs/roleRun"
+        },
+        "test_designer": {
+          "$ref": "#/$defs/roleRun"
+        }
+      },
+      "type": "object"
+    },
+    "runtimeAssertionResult": {
+      "additionalProperties": false,
+      "properties": {
+        "assertion_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "blocking": {
+          "type": "boolean"
+        },
+        "kind": {
+          "enum": [
+            "evaluation_report",
+            "supervisor_report"
+          ],
+          "type": "string"
+        },
+        "notes": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "report_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "PASS",
+            "FAIL"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "assertion_id",
+        "kind",
+        "blocking",
+        "status",
+        "report_ref",
+        "notes"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://loop-product.dev/schemas/LoopEvaluatorPrototypeReport.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "else": {
+        "properties": {
+          "ai_user_runs": {
+            "minItems": 1
+          },
+          "final_effect_requirements": {
+            "minItems": 1
+          },
+          "role_runs": {
+            "required": [
+              "test_designer",
+              "reviewer"
+            ]
+          }
+        },
+        "required": [
+          "final_effect_requirements",
+          "requirement_graph",
+          "ordinary_test_results",
+          "ai_user_scheduler",
+          "ai_user_runs",
+          "reviewer_result"
+        ]
+      },
+      "if": {
+        "properties": {
+          "status": {
+            "const": "ERROR"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "error"
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "ai_user_runs": {
+      "items": {
+        "$ref": "#/$defs/aiUserRun"
+      },
+      "type": "array"
+    },
+    "ai_user_scheduler": {
+      "$ref": "#/$defs/aiUserScheduler"
+    },
+    "checker_result": {
+      "$ref": "#/$defs/checkerResult"
+    },
+    "error": {
+      "$ref": "#/$defs/errorInfo"
+    },
+    "evaluation_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "final_effect_requirements": {
+      "items": {
+        "$ref": "#/$defs/finalEffectRequirement"
+      },
+      "type": "array"
+    },
+    "final_effects_text_ref": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "notes": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "ordinary_test_results": {
+      "$ref": "#/$defs/ordinaryTestResults"
+    },
+    "product_manual_ref": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "requirement_graph": {
+      "$ref": "#/$defs/requirementGraph"
+    },
+    "reviewer_result": {
+      "$ref": "#/$defs/reviewerResult"
+    },
+    "role_runs": {
+      "$ref": "#/$defs/roleRuns"
+    },
+    "run_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "run_root": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "runtime_assertions": {
+      "items": {
+        "$ref": "#/$defs/runtimeAssertionResult"
+      },
+      "type": "array"
+    },
+    "schema": {
+      "const": "loop_product.loop_evaluator_prototype_report"
+    },
+    "schema_version": {
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "PASS",
+        "FAIL",
+        "INCONCLUSIVE",
+        "ERROR"
+      ],
+      "type": "string"
+    },
+    "workspace_root": {
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "evaluation_id",
+    "run_id",
+    "run_root",
+    "workspace_root",
+    "product_manual_ref",
+    "status",
+    "role_runs",
+    "notes"
+  ],
+  "title": "loop_product.loop_evaluator_prototype_report",
+  "type": "object"
+}

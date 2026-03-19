@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "enum": [
+        "START",
+        "CONTINUE"
+      ],
+      "type": "string"
+    },
+    "artifact_location_disclosed": {
+      "type": "boolean"
+    },
+    "artifact_ref": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "assistant_message": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "assistant_question": {
+      "type": "string"
+    },
+    "mode_decision": {
+      "enum": [
+        "VISION_COMPILER",
+        "BYPASS"
+      ],
+      "type": "string"
+    },
+    "question_count": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "requirement_artifact_ready_for_persistence": {
+      "type": "boolean"
+    },
+    "session_status": {
+      "enum": [
+        "ACTIVE",
+        "CLARIFIED",
+        "BYPASSED"
+      ],
+      "type": "string"
+    },
+    "turn_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "turn_result_ref": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "version": {
+      "const": "1",
+      "type": "string"
+    }
+  },
+  "required": [
+    "action",
+    "artifact_location_disclosed",
+    "artifact_ref",
+    "assistant_message",
+    "assistant_question",
+    "mode_decision",
+    "question_count",
+    "requirement_artifact_ready_for_persistence",
+    "session_status",
+    "turn_id",
+    "turn_result_ref",
+    "version"
+  ],
+  "type": "object"
+}

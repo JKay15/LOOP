@@ -1,0 +1,241 @@
+{
+  "$defs": {
+    "agentExecution": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_cmd": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "agent_profile": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "agent_provider": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reasoning_effort": {
+          "enum": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "type": "string"
+        },
+        "sandbox_mode": {
+          "enum": [
+            "read-only",
+            "workspace-write",
+            "danger-full-access"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "finalEffectRequirement": {
+      "additionalProperties": false,
+      "properties": {
+        "blocking": {
+          "type": "boolean"
+        },
+        "description": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "requirement_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "requirement_id",
+        "description"
+      ],
+      "type": "object"
+    },
+    "runtimeAssertion": {
+      "additionalProperties": false,
+      "properties": {
+        "assertion_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "blocking": {
+          "type": "boolean"
+        },
+        "expected_error_message_substring": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "expected_error_stage": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "expected_evaluation_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "expected_run_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "expected_status": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "evaluation_report",
+            "supervisor_report"
+          ],
+          "type": "string"
+        },
+        "report_ref": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "assertion_id",
+        "kind",
+        "report_ref",
+        "expected_status"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://loop-product.dev/schemas/LoopEvaluatorPrototypeInput.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "anyOf": [
+    {
+      "required": [
+        "final_effect_requirements"
+      ]
+    },
+    {
+      "required": [
+        "final_effects_text_ref"
+      ]
+    }
+  ],
+  "properties": {
+    "agent_execution": {
+      "additionalProperties": false,
+      "properties": {
+        "ai_user": {
+          "$ref": "#/$defs/agentExecution"
+        },
+        "checker": {
+          "$ref": "#/$defs/agentExecution"
+        },
+        "default": {
+          "$ref": "#/$defs/agentExecution"
+        },
+        "reviewer": {
+          "$ref": "#/$defs/agentExecution"
+        },
+        "test_designer": {
+          "$ref": "#/$defs/agentExecution"
+        }
+      },
+      "type": "object"
+    },
+    "ai_user_scheduler": {
+      "additionalProperties": false,
+      "properties": {
+        "max_parallel_runs": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "evaluation_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "final_effect_requirements": {
+      "items": {
+        "$ref": "#/$defs/finalEffectRequirement"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "final_effects_text_ref": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "output_root": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "product_manual_ref": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "role_requirements": {
+      "additionalProperties": false,
+      "properties": {
+        "ai_user": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "checker": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reviewer": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "test_designer": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "test_designer",
+        "ai_user",
+        "reviewer"
+      ],
+      "type": "object"
+    },
+    "run_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "runtime_assertions": {
+      "items": {
+        "$ref": "#/$defs/runtimeAssertion"
+      },
+      "type": "array"
+    },
+    "schema": {
+      "const": "loop_product.loop_evaluator_prototype_input"
+    },
+    "schema_version": {
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "type": "string"
+    },
+    "workspace_root": {
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "evaluation_id",
+    "workspace_root",
+    "output_root",
+    "product_manual_ref",
+    "role_requirements"
+  ],
+  "title": "loop_product.loop_evaluator_prototype_input",
+  "type": "object"
+}

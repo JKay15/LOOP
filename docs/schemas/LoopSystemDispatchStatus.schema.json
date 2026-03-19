@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopSystemDispatchStatus",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "node_id",
+    "parent_node_id",
+    "round_id",
+    "generation",
+    "dispatch_state",
+    "node_status",
+    "summary",
+    "active_child_ids",
+    "evidence_refs",
+    "self_attribution",
+    "self_repair"
+  ],
+  "properties": {
+    "node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "parent_node_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "round_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "dispatch_state": {
+      "type": "string",
+      "enum": [
+        "MATERIALIZED",
+        "HEARTBEAT",
+        "BLOCKED",
+        "COMPLETED"
+      ]
+    },
+    "node_status": {
+      "type": "string",
+      "minLength": 1
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "active_child_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "self_attribution": {
+      "type": "string"
+    },
+    "self_repair": {
+      "type": "string"
+    }
+  }
+}

@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopChildLaunchResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "launch_decision",
+    "source_result_ref",
+    "node_id",
+    "workspace_root",
+    "state_root",
+    "startup_health_timeout_ms",
+    "startup_retry_limit",
+    "attempt_count",
+    "retryable_failure_kind",
+    "attempts",
+    "launch_request_ref",
+    "launch_result_ref",
+    "launch_log_dir",
+    "stdout_ref",
+    "stderr_ref",
+    "stdin_ref",
+    "wrapped_argv",
+    "pid",
+    "exit_code"
+  ],
+  "properties": {
+    "launch_decision": {
+      "type": "string",
+      "enum": ["started", "started_existing", "exited", "retry_exhausted"]
+    },
+    "source_result_ref": { "type": "string", "minLength": 1 },
+    "node_id": { "type": "string", "minLength": 1 },
+    "workspace_root": { "type": "string", "minLength": 1 },
+    "state_root": { "type": "string", "minLength": 1 },
+    "startup_health_timeout_ms": { "type": "integer", "minimum": 0 },
+    "startup_retry_limit": { "type": "integer", "minimum": 0 },
+    "attempt_count": { "type": "integer", "minimum": 0 },
+    "retryable_failure_kind": { "type": "string" },
+    "attempts": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "attempt_index",
+          "launch_decision",
+          "launch_request_ref",
+          "launch_log_dir",
+          "stdout_ref",
+          "stderr_ref",
+          "stdin_ref",
+          "wrapped_argv",
+          "pid",
+          "exit_code",
+          "retryable_failure_kind"
+        ],
+        "properties": {
+          "attempt_index": { "type": "integer", "minimum": 1 },
+          "launch_decision": { "type": "string", "enum": ["started", "exited"] },
+          "source_result_ref": { "type": "string" },
+          "node_id": { "type": "string" },
+          "workspace_root": { "type": "string" },
+          "state_root": { "type": "string" },
+          "startup_health_timeout_ms": { "type": "integer", "minimum": 0 },
+          "launch_request_ref": { "type": "string", "minLength": 1 },
+          "launch_log_dir": { "type": "string", "minLength": 1 },
+          "stdout_ref": { "type": "string", "minLength": 1 },
+          "stderr_ref": { "type": "string", "minLength": 1 },
+          "stdin_ref": { "type": "string", "minLength": 1 },
+          "wrapped_argv": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "wrapper_cmd": { "type": "string" },
+          "pid": { "type": "integer", "minimum": 1 },
+          "exit_code": {
+            "anyOf": [
+              { "type": "integer" },
+              { "type": "null" }
+            ]
+          },
+          "retryable_failure_kind": { "type": "string" }
+        }
+      }
+    },
+    "launch_request_ref": { "type": "string", "minLength": 1 },
+    "launch_result_ref": { "type": "string", "minLength": 1 },
+    "launch_log_dir": { "type": "string", "minLength": 1 },
+    "stdout_ref": { "type": "string", "minLength": 1 },
+    "stderr_ref": { "type": "string", "minLength": 1 },
+    "stdin_ref": { "type": "string", "minLength": 1 },
+    "wrapped_argv": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "wrapper_cmd": { "type": "string" },
+    "reuse_launch_result_ref": { "type": "string" },
+    "pid": { "type": "integer", "minimum": 1 },
+    "exit_code": {
+      "anyOf": [
+        { "type": "integer" },
+        { "type": "null" }
+      ]
+    }
+  }
+}

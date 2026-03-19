@@ -1,0 +1,14 @@
+.venv/
+.uv-cache/
+__pycache__/
+*.pyc
+.DS_Store
+
+.loop/
+.cache/
+.playwright-cli/
+artifacts/
+*.egg-info/
+workspace/*
+!workspace/AGENTS.md
+!workspace/AGENTS.override.md

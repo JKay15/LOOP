@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopSystemAuditExperienceView",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "recent_structural_decisions",
+    "recent_node_events",
+    "effective_rule_sources",
+    "experience_assets",
+    "storage_partitions"
+  ],
+  "properties": {
+    "recent_structural_decisions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/auditRecord"
+      }
+    },
+    "recent_node_events": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/auditRecord"
+      }
+    },
+    "effective_rule_sources": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "experience_assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "round_id",
+          "lane",
+          "summary"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string"
+          },
+          "round_id": {
+            "type": "string"
+          },
+          "lane": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "self_attribution": {
+            "type": "string"
+          },
+          "self_repair": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "storage_partitions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "experience_assets",
+        "audit",
+        "cache",
+        "durable_state",
+        "hard_rules"
+      ],
+      "properties": {
+        "experience_assets": {
+          "type": "string",
+          "minLength": 1
+        },
+        "audit": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cache": {
+          "type": "string",
+          "minLength": 1
+        },
+        "durable_state": {
+          "type": "string",
+          "minLength": 1
+        },
+        "hard_rules": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "auditRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_type",
+        "record_ref",
+        "node_id",
+        "summary",
+        "round_id",
+        "classification"
+      ],
+      "properties": {
+        "event_type": {
+          "type": "string"
+        },
+        "record_ref": {
+          "type": "string"
+        },
+        "node_id": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "round_id": {
+          "type": "string"
+        },
+        "classification": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

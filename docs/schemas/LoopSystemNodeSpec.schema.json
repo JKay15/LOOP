@@ -1,0 +1,180 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopSystemNodeSpec",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "node_id",
+    "node_kind",
+    "goal_slice",
+    "parent_node_id",
+    "generation",
+    "round_id",
+    "execution_policy",
+    "reasoning_profile",
+    "budget_profile",
+    "allowed_actions",
+    "workspace_root",
+    "codex_home",
+    "depends_on_node_ids",
+    "activation_condition",
+    "runtime_state",
+    "delegation_ref",
+    "result_sink_ref",
+    "lineage_ref",
+    "status"
+  ],
+  "properties": {
+    "node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "node_kind": {
+      "type": "string",
+      "minLength": 1
+    },
+    "goal_slice": {
+      "type": "string",
+      "minLength": 1
+    },
+    "parent_node_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "round_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "execution_policy": {
+      "type": "object",
+      "required": [
+        "agent_provider",
+        "sandbox_mode"
+      ],
+      "properties": {
+        "agent_provider": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sandbox_mode": {
+          "type": "string",
+          "minLength": 1
+        },
+        "retry_policy": {
+          "type": "string",
+          "minLength": 1
+        },
+        "mode": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": true
+    },
+    "reasoning_profile": {
+      "type": "object",
+      "required": [
+        "role",
+        "thinking_budget"
+      ],
+      "properties": {
+        "role": {
+          "type": "string",
+          "minLength": 1
+        },
+        "thinking_budget": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": true
+    },
+    "budget_profile": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "allowed_actions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "workspace_root": {
+      "type": "string"
+    },
+    "codex_home": {
+      "type": "string"
+    },
+    "depends_on_node_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "activation_condition": {
+      "type": "string"
+    },
+    "runtime_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attachment_state",
+        "observed_at",
+        "summary",
+        "observation_kind",
+        "evidence_refs"
+      ],
+      "properties": {
+        "attachment_state": {
+          "type": "string",
+          "enum": [
+            "UNOBSERVED",
+            "ATTACHED",
+            "LOST",
+            "TERMINAL"
+          ]
+        },
+        "observed_at": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "observation_kind": {
+          "type": "string"
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "delegation_ref": {
+      "type": "string"
+    },
+    "result_sink_ref": {
+      "type": "string"
+    },
+    "lineage_ref": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "PLANNED",
+        "ACTIVE",
+        "BLOCKED",
+        "COMPLETED",
+        "FAILED"
+      ]
+    }
+  }
+}

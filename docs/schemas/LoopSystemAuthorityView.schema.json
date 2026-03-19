@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopSystemAuthorityView",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "root_goal",
+    "root_node_id",
+    "status",
+    "node_graph",
+    "node_lifecycle",
+    "effective_requirements",
+    "budget_view",
+    "blocked_reasons",
+    "delegation_map",
+    "active_evaluator_lanes",
+    "active_child_nodes",
+    "planned_child_nodes"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "root_goal": {
+      "type": "string",
+      "minLength": 1
+    },
+    "root_node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "minLength": 1
+    },
+    "node_graph": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "node_id",
+          "parent_node_id",
+          "node_kind",
+          "goal_slice",
+          "generation",
+          "round_id",
+          "status",
+          "runtime_state"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "parent_node_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_kind": {
+            "type": "string",
+            "minLength": 1
+          },
+          "goal_slice": {
+            "type": "string",
+            "minLength": 1
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "round_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "status": {
+            "type": "string",
+            "minLength": 1
+          },
+          "runtime_state": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "attachment_state",
+              "observed_at",
+              "summary",
+              "observation_kind",
+              "evidence_refs"
+            ],
+            "properties": {
+              "attachment_state": {
+                "type": "string",
+                "enum": [
+                  "UNOBSERVED",
+                  "ATTACHED",
+                  "LOST",
+                  "TERMINAL"
+                ]
+              },
+              "observed_at": {
+                "type": "string"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "observation_kind": {
+                "type": "string"
+              },
+              "evidence_refs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "node_lifecycle": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "effective_requirements": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "budget_view": {
+      "type": "object"
+    },
+    "blocked_reasons": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "delegation_map": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "active_evaluator_lanes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "lane",
+          "verdict",
+          "round_id",
+          "summary"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string"
+          },
+          "lane": {
+            "type": "string"
+          },
+          "verdict": {
+            "type": "string"
+          },
+          "round_id": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "active_child_nodes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "planned_child_nodes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopFirstImplementerBootstrapRequest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "mode",
+    "task_slug",
+    "root_goal",
+    "child_goal_slice",
+    "endpoint_artifact_ref",
+    "workspace_mirror_relpath",
+    "external_publish_target",
+    "context_refs"
+  ],
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": [
+        "fresh",
+        "continue_exact"
+      ]
+    },
+    "task_slug": {
+      "type": "string"
+    },
+    "root_goal": {
+      "type": "string",
+      "minLength": 1
+    },
+    "child_goal_slice": {
+      "type": "string",
+      "minLength": 1
+    },
+    "endpoint_artifact_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "workspace_root": {
+      "type": "string"
+    },
+    "state_root": {
+      "type": "string"
+    },
+    "node_id": {
+      "type": "string"
+    },
+    "round_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "workspace_mirror_relpath": {
+      "type": "string",
+      "minLength": 1
+    },
+    "external_publish_target": {
+      "type": "string"
+    },
+    "context_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "result_sink_ref": {
+      "type": "string"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "continue_exact"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "workspace_root": {
+            "minLength": 1
+          },
+          "state_root": {
+            "minLength": 1
+          },
+          "node_id": {
+            "minLength": 1
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,434 @@
+{
+  "$defs": {
+    "checkerState": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "error": {
+          "$ref": "#/$defs/issueInfo"
+        },
+        "human_gate_reasons": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "normalized_requirements": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "notes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "repair_actions": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "requirement_graph": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "response_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "result_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "PENDING",
+            "RUNNING",
+            "COMPLETED",
+            "HUMAN_GATE",
+            "BLOCKED_RETRYABLE",
+            "BLOCKED_TERMINAL",
+            "ERROR",
+            "SKIPPED"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "attempt_count"
+      ],
+      "type": "object"
+    },
+    "evaluationUnit": {
+      "additionalProperties": false,
+      "properties": {
+        "requirement_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "requirements": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "unit_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "unit_id",
+        "requirement_ids",
+        "requirements"
+      ],
+      "type": "object"
+    },
+    "issueInfo": {
+      "additionalProperties": false,
+      "properties": {
+        "issue_kind": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "self_attribution": {
+          "type": "string"
+        },
+        "self_repair": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "message",
+        "issue_kind",
+        "self_attribution",
+        "self_repair"
+      ],
+      "type": "object"
+    },
+    "laneState": {
+      "additionalProperties": false,
+      "properties": {
+        "ai_user": {
+          "$ref": "#/$defs/roleState"
+        },
+        "error": {
+          "$ref": "#/$defs/issueInfo"
+        },
+        "lane_root": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "PENDING",
+            "RUNNING",
+            "COMPLETED",
+            "BLOCKED_RETRYABLE",
+            "BLOCKED_TERMINAL"
+          ],
+          "type": "string"
+        },
+        "target_evaluation_unit": {
+          "$ref": "#/$defs/evaluationUnit"
+        },
+        "test_ai": {
+          "$ref": "#/$defs/roleState"
+        }
+      },
+      "required": [
+        "status",
+        "lane_root",
+        "target_evaluation_unit"
+      ],
+      "type": "object"
+    },
+    "reviewerState": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "context_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "error": {
+          "$ref": "#/$defs/issueInfo"
+        },
+        "exec_span_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "invocation_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "operation_log_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "prompt_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "raw_output_source": {
+          "type": "string"
+        },
+        "raw_output_text": {
+          "type": "string"
+        },
+        "response_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_history": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "role_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "role_instance_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "PENDING",
+            "RUNNING",
+            "COMPLETED",
+            "BLOCKED_RETRYABLE",
+            "BLOCKED_TERMINAL"
+          ],
+          "type": "string"
+        },
+        "stderr_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "stdout_ref": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "attempt_count"
+      ],
+      "type": "object"
+    },
+    "roleState": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "context_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "error": {
+          "$ref": "#/$defs/issueInfo"
+        },
+        "exec_span_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "invocation_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "operation_log_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "prompt_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "raw_output_source": {
+          "type": "string"
+        },
+        "raw_output_text": {
+          "type": "string"
+        },
+        "response_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_history": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "role_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "role_instance_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "PENDING",
+            "RUNNING",
+            "COMPLETED",
+            "BLOCKED_RETRYABLE",
+            "BLOCKED_TERMINAL"
+          ],
+          "type": "string"
+        },
+        "stderr_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "stdout_ref": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "attempt_count"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://loop-product.dev/schemas/LoopEvaluatorRunState.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "checker": {
+      "$ref": "#/$defs/checkerState"
+    },
+    "evaluation_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "final_effect_requirements": {
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "final_effects_text_ref": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "lane_plan": {
+      "items": {
+        "$ref": "#/$defs/evaluationUnit"
+      },
+      "type": "array"
+    },
+    "lanes_by_unit_id": {
+      "additionalProperties": {
+        "$ref": "#/$defs/laneState"
+      },
+      "type": "object"
+    },
+    "notes": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "product_manual_ref": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "request_fingerprint": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "reviewer": {
+      "$ref": "#/$defs/reviewerState"
+    },
+    "run_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "run_root": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "schema": {
+      "const": "loop_product.loop_evaluator_run_state"
+    },
+    "schema_version": {
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "IN_PROGRESS",
+        "HUMAN_GATE",
+        "RECOVERY_REQUIRED",
+        "ERROR",
+        "COMPLETED"
+      ],
+      "type": "string"
+    },
+    "workspace_root": {
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "evaluation_id",
+    "run_id",
+    "run_root",
+    "workspace_root",
+    "product_manual_ref",
+    "request_fingerprint",
+    "status",
+    "checker",
+    "final_effect_requirements",
+    "lane_plan",
+    "lanes_by_unit_id",
+    "reviewer",
+    "notes"
+  ],
+  "type": "object"
+}

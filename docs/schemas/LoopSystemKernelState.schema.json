@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopSystemKernelState",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "root_goal",
+    "root_node_id",
+    "status",
+    "nodes",
+    "delegation_map",
+    "blocked_reasons",
+    "complexity_budget",
+    "accepted_envelopes",
+    "active_evaluator_lanes",
+    "active_requirements",
+    "experience_assets",
+    "active_node_ids",
+    "accepted_envelope_count"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "root_goal": {
+      "type": "string",
+      "minLength": 1
+    },
+    "root_node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "minLength": 1
+    },
+    "nodes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object"
+      }
+    },
+    "delegation_map": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "blocked_reasons": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "complexity_budget": {
+      "type": "object"
+    },
+    "accepted_envelopes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "envelope_type",
+          "payload_type",
+          "source",
+          "status",
+          "round_id",
+          "classification"
+        ],
+        "properties": {
+          "envelope_type": {
+            "type": "string"
+          },
+          "payload_type": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "round_id": {
+            "type": "string"
+          },
+          "classification": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "active_evaluator_lanes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "lane",
+          "verdict",
+          "round_id",
+          "summary"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string"
+          },
+          "lane": {
+            "type": "string"
+          },
+          "verdict": {
+            "type": "string"
+          },
+          "round_id": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "active_requirements": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "experience_assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "node_id": {
+            "type": "string"
+          },
+          "round_id": {
+            "type": "string"
+          },
+          "lane": {
+            "type": "string"
+          },
+          "self_attribution": {
+            "type": "string"
+          },
+          "self_repair": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "round_id",
+          "lane",
+          "summary"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "active_node_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "accepted_envelope_count": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

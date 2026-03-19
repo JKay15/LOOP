@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopChildRuntimeStatusResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "launch_result_ref",
+    "status_result_ref",
+    "node_id",
+    "workspace_root",
+    "state_root",
+    "launch_decision",
+    "pid",
+    "pid_alive",
+    "exit_code",
+    "lifecycle_status",
+    "runtime_attachment_state",
+    "runtime_observed_at",
+    "runtime_observation_kind",
+    "runtime_summary",
+    "runtime_evidence_refs",
+    "stdout_ref",
+    "stderr_ref",
+    "latest_log_ref",
+    "latest_log_mtime",
+    "latest_log_age_s",
+    "stall_threshold_s",
+    "stalled_hint",
+    "recovery_eligible",
+    "recovery_reason"
+  ],
+  "properties": {
+    "launch_result_ref": { "type": "string", "minLength": 1 },
+    "status_result_ref": { "type": "string", "minLength": 1 },
+    "node_id": { "type": "string", "minLength": 1 },
+    "workspace_root": { "type": "string", "minLength": 1 },
+    "state_root": { "type": "string", "minLength": 1 },
+    "node_ref": { "type": "string" },
+    "launch_decision": {
+      "type": "string",
+      "enum": ["started", "started_existing", "exited", "retry_exhausted"]
+    },
+    "pid": { "type": "integer", "minimum": 1 },
+    "pid_alive": { "type": "boolean" },
+    "exit_code": {
+      "anyOf": [
+        { "type": "integer" },
+        { "type": "null" }
+      ]
+    },
+    "lifecycle_status": { "type": "string" },
+    "runtime_attachment_state": { "type": "string", "enum": ["UNOBSERVED", "ATTACHED", "LOST", "TERMINAL"] },
+    "runtime_observed_at": { "type": "string" },
+    "runtime_observation_kind": { "type": "string" },
+    "runtime_summary": { "type": "string" },
+    "runtime_evidence_refs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "stdout_ref": { "type": "string", "minLength": 1 },
+    "stderr_ref": { "type": "string", "minLength": 1 },
+    "latest_log_ref": { "type": "string", "minLength": 1 },
+    "latest_log_mtime": { "type": "string", "minLength": 1 },
+    "latest_log_age_s": { "type": "number", "minimum": 0 },
+    "stall_threshold_s": { "type": "number", "minimum": 0 },
+    "stalled_hint": { "type": "boolean" },
+    "recovery_eligible": { "type": "boolean" },
+    "recovery_reason": { "type": "string", "minLength": 1 }
+  }
+}

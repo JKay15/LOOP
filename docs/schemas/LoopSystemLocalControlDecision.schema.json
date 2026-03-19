@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopSystemLocalControlDecision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "node_id",
+    "round_id",
+    "generation",
+    "action",
+    "source_lane",
+    "summary",
+    "evidence_refs",
+    "retryable",
+    "self_attribution",
+    "self_repair"
+  ],
+  "properties": {
+    "node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "round_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "COMPLETE",
+        "RETRY",
+        "ESCALATE_BUG",
+        "ESCALATE_STUCK",
+        "FAIL_CLOSED"
+      ]
+    },
+    "source_lane": {
+      "type": "string",
+      "minLength": 1
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "retryable": {
+      "type": "boolean"
+    },
+    "self_attribution": {
+      "type": "string"
+    },
+    "self_repair": {
+      "type": "string"
+    }
+  }
+}

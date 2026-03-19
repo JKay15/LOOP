@@ -1,0 +1,195 @@
+{
+  "$defs": {
+    "clause": {
+      "additionalProperties": false,
+      "properties": {
+        "clause_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "MANDATORY",
+            "FORBIDDEN",
+            "VALUABLE"
+          ],
+          "type": "string"
+        },
+        "source_turn_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "text": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "clause_id",
+        "kind",
+        "source_turn_id",
+        "text"
+      ],
+      "type": "object"
+    },
+    "requirement_artifact": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_ready_for_persistence": {
+          "type": "boolean"
+        },
+        "final_effect": {
+          "type": "string"
+        },
+        "hard_constraints": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "non_goals": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "observable_success_criteria": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "open_questions": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "relevant_context": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sufficient": {
+          "type": "boolean"
+        },
+        "task_type": {
+          "enum": [
+            "code",
+            "writing",
+            "research",
+            "analysis",
+            "planning",
+            "design",
+            "data",
+            "other"
+          ],
+          "type": "string"
+        },
+        "user_request_summary": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact_ready_for_persistence",
+        "final_effect",
+        "hard_constraints",
+        "non_goals",
+        "observable_success_criteria",
+        "open_questions",
+        "relevant_context",
+        "sufficient",
+        "task_type",
+        "user_request_summary"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifact_ref": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "confirmed_requirements": {
+      "items": {
+        "$ref": "#/$defs/clause"
+      },
+      "type": "array"
+    },
+    "denied_requirements": {
+      "items": {
+        "$ref": "#/$defs/clause"
+      },
+      "type": "array"
+    },
+    "latest_turn_ref": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "mode": {
+      "enum": [
+        "VISION_COMPILER",
+        "BYPASS"
+      ],
+      "type": "string"
+    },
+    "original_user_prompt": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "requirement_artifact": {
+      "$ref": "#/$defs/requirement_artifact"
+    },
+    "question_history": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "session_root": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "ACTIVE",
+        "CLARIFIED",
+        "BYPASSED"
+      ],
+      "type": "string"
+    },
+    "turn_count": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "version": {
+      "const": "1",
+      "type": "string"
+    }
+  },
+  "required": [
+    "artifact_ref",
+    "confirmed_requirements",
+    "denied_requirements",
+    "latest_turn_ref",
+    "mode",
+    "original_user_prompt",
+    "requirement_artifact",
+    "question_history",
+    "session_root",
+    "status",
+    "turn_count",
+    "version"
+  ],
+  "type": "object"
+}

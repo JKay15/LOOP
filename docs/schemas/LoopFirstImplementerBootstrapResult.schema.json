@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopFirstImplementerBootstrapResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "mode",
+    "reuse_decision",
+    "node_id",
+    "workspace_root",
+    "state_root",
+    "node_ref",
+    "delegation_ref",
+    "handoff_json_ref",
+    "handoff_md_ref",
+    "child_prompt_ref",
+    "workspace_result_sink_ref",
+    "kernel_result_sink_ref",
+    "evaluator_submission_ref",
+    "evaluator_runner_ref",
+    "launch_spec",
+    "bootstrap_result_ref"
+  ],
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": [
+        "fresh",
+        "continue_exact"
+      ]
+    },
+    "reuse_decision": {
+      "type": "string",
+      "enum": [
+        "fresh",
+        "continue_exact"
+      ]
+    },
+    "node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "workspace_root": {
+      "type": "string",
+      "minLength": 1
+    },
+    "state_root": {
+      "type": "string",
+      "minLength": 1
+    },
+    "node_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "delegation_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "handoff_json_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "handoff_md_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "child_prompt_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "workspace_result_sink_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "kernel_result_sink_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evaluator_submission_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evaluator_runner_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "bootstrap_result_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "launch_spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "argv",
+        "env",
+        "cwd",
+        "stdin_path"
+      ],
+      "properties": {
+        "argv": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "cwd": {
+          "type": "string",
+          "minLength": 1
+        },
+        "stdin_path": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

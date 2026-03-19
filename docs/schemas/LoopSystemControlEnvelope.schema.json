@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopSystemControlEnvelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "source",
+    "envelope_type",
+    "payload_type",
+    "round_id",
+    "generation",
+    "payload",
+    "status",
+    "note",
+    "envelope_id",
+    "classification",
+    "accepted_at"
+  ],
+  "properties": {
+    "source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "envelope_type": {
+      "type": "string",
+      "minLength": 1
+    },
+    "payload_type": {
+      "type": "string",
+      "minLength": 1
+    },
+    "round_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "payload": {
+      "type": "object"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "proposal",
+        "report",
+        "accepted",
+        "rejected"
+      ]
+    },
+    "note": {
+      "type": "string"
+    },
+    "envelope_id": {
+      "type": "string"
+    },
+    "classification": {
+      "type": "string",
+      "enum": [
+        "control",
+        "heartbeat",
+        "dispatch",
+        "local_control",
+        "evaluator",
+        "topology",
+        "terminal",
+        "unknown",
+        "rejected"
+      ]
+    },
+    "accepted_at": {
+      "type": "string"
+    }
+  }
+}

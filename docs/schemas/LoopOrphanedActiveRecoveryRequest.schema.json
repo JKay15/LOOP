@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopOrphanedActiveRecoveryRequest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "state_root",
+    "node_id",
+    "reason",
+    "self_attribution",
+    "self_repair",
+    "observation_kind",
+    "summary",
+    "evidence_refs"
+  ],
+  "properties": {
+    "state_root": { "type": "string", "minLength": 1 },
+    "node_id": { "type": "string", "minLength": 1 },
+    "workspace_root": { "type": "string" },
+    "reason": { "type": "string", "minLength": 1 },
+    "self_attribution": { "type": "string", "minLength": 1 },
+    "self_repair": { "type": "string", "minLength": 1 },
+    "observation_kind": { "type": "string", "minLength": 1 },
+    "summary": { "type": "string", "minLength": 1 },
+    "evidence_refs": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

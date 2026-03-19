@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopSystemTopologyMutation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "source_node_id",
+    "target_node_ids",
+    "payload",
+    "reason"
+  ],
+  "properties": {
+    "kind": {
+      "type": "string",
+      "enum": [
+        "split",
+        "merge",
+        "resume",
+        "retry",
+        "relaunch",
+        "reap"
+      ]
+    },
+    "source_node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "target_node_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "payload": {
+      "type": "object"
+    },
+    "reason": {
+      "type": "string"
+    }
+  }
+}

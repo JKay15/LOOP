@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopExternalPublicationResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "node_id",
+    "published",
+    "source_ref",
+    "target_ref",
+    "source_sha256",
+    "target_sha256",
+    "bytes_copied",
+    "publication_result_ref"
+  ],
+  "properties": {
+    "node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "published": {
+      "type": "boolean"
+    },
+    "source_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "target_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "target_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "bytes_copied": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "publication_result_ref": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

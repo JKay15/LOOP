@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopChildLaunchRequest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "source_result_ref",
+    "node_id",
+    "workspace_root",
+    "state_root",
+    "launch_spec",
+    "startup_probe_ms",
+    "startup_health_timeout_ms",
+    "startup_retry_limit"
+  ],
+  "properties": {
+    "source_result_ref": { "type": "string", "minLength": 1 },
+    "node_id": { "type": "string", "minLength": 1 },
+    "workspace_root": { "type": "string", "minLength": 1 },
+    "state_root": { "type": "string", "minLength": 1 },
+    "startup_probe_ms": { "type": "integer", "minimum": 0 },
+    "startup_health_timeout_ms": { "type": "integer", "minimum": 0 },
+    "startup_retry_limit": { "type": "integer", "minimum": 0 },
+    "launch_spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["argv", "env", "cwd", "stdin_path"],
+      "properties": {
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "cwd": { "type": "string", "minLength": 1 },
+        "stdin_path": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

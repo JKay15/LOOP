@@ -1,0 +1,21 @@
+[project]
+name = "loop-product"
+version = "0.1.0"
+description = "Shared standalone LOOP product repo containing endpoint clarification and evaluator surfaces."
+requires-python = ">=3.10"
+dependencies = [
+  "jsonschema>=4.0.0",
+]
+
+[project.scripts]
+loop-endpoint-clarification = "loop_product.endpoint.clarification:main"
+loop-evaluator = "loop_product.evaluator.simple:main"
+loop-evaluator-prototype = "loop_product.evaluator.prototype:main"
+loop-kernel-entry = "loop_product.kernel.entry:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["loop_product*"]

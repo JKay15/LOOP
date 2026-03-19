@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopSystemEvaluatorSubmission",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "evaluation_id",
+    "evaluator_node_id",
+    "target_node_id",
+    "parent_node_id",
+    "generation",
+    "round_id",
+    "lineage_ref",
+    "goal_slice",
+    "workspace_root",
+    "output_root",
+    "implementation_package_ref",
+    "product_manual_ref",
+    "role_requirements",
+    "agent_execution"
+  ],
+  "properties": {
+    "evaluation_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evaluator_node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "target_node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "parent_node_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "round_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "lineage_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "goal_slice": {
+      "type": "string",
+      "minLength": 1
+    },
+    "workspace_root": {
+      "type": "string",
+      "minLength": 1
+    },
+    "output_root": {
+      "type": "string",
+      "minLength": 1
+    },
+    "implementation_package_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "product_manual_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "final_effects_text_ref": {
+      "type": "string"
+    },
+    "final_effect_requirements": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "role_requirements": {
+      "type": "object"
+    },
+    "agent_execution": {
+      "type": "object"
+    },
+    "ai_user_scheduler": {
+      "type": "object"
+    },
+    "context_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "required": [
+        "final_effects_text_ref"
+      ]
+    },
+    {
+      "required": [
+        "final_effect_requirements"
+      ]
+    }
+  ]
+}
