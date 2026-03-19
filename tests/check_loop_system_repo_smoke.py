@@ -232,23 +232,15 @@ def main() -> int:
                     f"smoke round {index} grouped lane must preserve the smoke requirement ids, got {target_unit!r}"
                 )
             required_files = (
-                Path(".loop/checker/AGENTS.md"),
-                Path(".loop/checker/AGENTS.override.md"),
                 Path(".loop/checker/runs/checker/result.json"),
                 Path(".loop/checker/runs/checker/invocation.json"),
                 Path(".loop/checker/runs/checker/exec_span.json"),
-                Path(".loop/test_ai/AGENTS.md"),
-                Path(".loop/test_ai/AGENTS.override.md"),
                 Path(".loop/test_ai/runs/test_ai__EU-001/result.json"),
                 Path(".loop/test_ai/runs/test_ai__EU-001/invocation.json"),
                 Path(".loop/test_ai/runs/test_ai__EU-001/exec_span.json"),
-                Path(".loop/ai_user/AGENTS.md"),
-                Path(".loop/ai_user/AGENTS.override.md"),
                 Path(".loop/ai_user/runs/ai_user__EU-001/result.json"),
                 Path(".loop/ai_user/runs/ai_user__EU-001/invocation.json"),
                 Path(".loop/ai_user/runs/ai_user__EU-001/exec_span.json"),
-                Path(".loop/reviewer/AGENTS.md"),
-                Path(".loop/reviewer/AGENTS.override.md"),
                 Path(".loop/reviewer/runs/reviewer/result.json"),
                 Path(".loop/reviewer/runs/reviewer/invocation.json"),
                 Path(".loop/reviewer/runs/reviewer/exec_span.json"),
@@ -259,37 +251,33 @@ def main() -> int:
                 path = run_root / rel
                 if not path.is_file():
                     return _fail(f"smoke round {index} missing evaluator runtime artifact {rel}")
-            expected_role_agents = {
-                Path(".loop/checker/AGENTS.md"): (
-                    "You are evaluator checker.",
-                    "Do not act as test_ai, ai_user, or reviewer.",
+            expected_role_prompts = {
+                Path(".loop/checker/runs/checker/invocation.json"): (
+                    "# LOOP Evaluator Prototype: Checker",
+                    "Use only the final-effects text in this prompt; do not inspect prior runs, prior checker outputs, or unrelated workspace files.",
                 ),
-                Path(".loop/test_ai/AGENTS.md"): (
-                    "You are evaluator test_ai.",
-                    "Do not rewrite final effects, checker grouping, or reviewer verdicts.",
+                Path(".loop/test_ai/runs/test_ai__EU-001/invocation.json"): (
+                    "# LOOP Evaluator Simple Prototype: Test AI",
+                    "Do not ask for confirmation, permission, or a follow-up choice such as `Proceed now?`",
                 ),
-                Path(".loop/ai_user/AGENTS.md"): (
-                    "You are evaluator ai_user.",
-                    "Do not redesign requirements, checker grouping, or reviewer verdicts.",
+                Path(".loop/ai_user/runs/ai_user__EU-001/invocation.json"): (
+                    "# LOOP Evaluator Simple Prototype: AI-as-User",
+                    "Use the product from its documented surface first.",
                 ),
-                Path(".loop/reviewer/AGENTS.md"): (
-                    "You are evaluator reviewer.",
-                    "Judge only from reviewer-visible artifacts.",
+                Path(".loop/reviewer/runs/reviewer/invocation.json"): (
+                    "# LOOP Evaluator Simple Prototype: Reviewer",
+                    "Read the checker output and the delegated raw lane outputs.",
                 ),
             }
-            for rel, needles in expected_role_agents.items():
-                text = (run_root / rel).read_text(encoding="utf-8")
+            for rel, needles in expected_role_prompts.items():
+                invocation_obj = json.loads((run_root / rel).read_text(encoding="utf-8"))
+                prompt_ref = Path(str(invocation_obj.get("prompt_ref") or ""))
+                if not prompt_ref.is_file():
+                    return _fail(f"smoke round {index} role invocation {rel} must reference a materialized prompt")
+                text = prompt_ref.read_text(encoding="utf-8")
                 for needle in needles:
                     if needle not in text:
-                        return _fail(f"smoke round {index} role home file {rel} must contain {needle!r}")
-            for rel in (
-                Path(".loop/checker/AGENTS.override.md"),
-                Path(".loop/test_ai/AGENTS.override.md"),
-                Path(".loop/ai_user/AGENTS.override.md"),
-                Path(".loop/reviewer/AGENTS.override.md"),
-            ):
-                if (run_root / rel).read_text(encoding="utf-8").strip() != "":
-                    return _fail(f"smoke round {index} role override file {rel} must stay empty")
+                        return _fail(f"smoke round {index} role prompt from {rel} must contain {needle!r}")
             for rel in (
                 Path(".loop/checker/config.toml"),
                 Path(".loop/test_ai/config.toml"),
@@ -298,6 +286,26 @@ def main() -> int:
             ):
                 if (run_root / rel).exists():
                     return _fail(f"smoke round {index} role home must not copy host config.toml wholesale into {rel}")
+            for rel in (
+                Path(".loop/checker/AGENTS.md"),
+                Path(".loop/checker/AGENTS.override.md"),
+                Path(".loop/checker/workspaces/checker/workspace/AGENTS.md"),
+                Path(".loop/checker/workspaces/checker/workspace/AGENTS.override.md"),
+                Path(".loop/test_ai/AGENTS.md"),
+                Path(".loop/test_ai/AGENTS.override.md"),
+                Path(".loop/test_ai/workspaces/test_ai__EU-001/workspace/AGENTS.md"),
+                Path(".loop/test_ai/workspaces/test_ai__EU-001/workspace/AGENTS.override.md"),
+                Path(".loop/ai_user/AGENTS.md"),
+                Path(".loop/ai_user/AGENTS.override.md"),
+                Path(".loop/ai_user/workspaces/ai_user__EU-001/workspace/AGENTS.md"),
+                Path(".loop/ai_user/workspaces/ai_user__EU-001/workspace/AGENTS.override.md"),
+                Path(".loop/reviewer/AGENTS.md"),
+                Path(".loop/reviewer/AGENTS.override.md"),
+                Path(".loop/reviewer/workspaces/reviewer/workspace/AGENTS.md"),
+                Path(".loop/reviewer/workspaces/reviewer/workspace/AGENTS.override.md"),
+            ):
+                if (run_root / rel).exists():
+                    return _fail(f"smoke round {index} must not materialize runtime AGENTS file {rel}")
 
             invocation_expectations = (
                 (

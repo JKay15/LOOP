@@ -198,8 +198,6 @@ def _materialize_simple_role_workspace(
 
             shutil.rmtree(workspace_root)
         workspace_root.mkdir(parents=True, exist_ok=True)
-    _legacy._ensure_empty_agent_files(target_dir=role_dir, role_id=role_id)
-    _legacy._ensure_empty_agent_files(target_dir=workspace_root, role_id=role_id)
     _legacy._materialize_current_run_snapshot(
         run_root=run_root,
         snapshot_root=workspace_root / ".loop_evaluator_internal" / "current_run_snapshot",
@@ -399,8 +397,6 @@ def _invoke_text_role(
         effective_cmd=effective_cmd,
         role_root=role_dir,
     )
-    _legacy._ensure_empty_agent_files(target_dir=role_dir, role_id=role_id)
-    _legacy._ensure_empty_agent_files(target_dir=workspace_root, role_id=role_id)
     env = apply_env_map(
         resolved=resolved,
         env={

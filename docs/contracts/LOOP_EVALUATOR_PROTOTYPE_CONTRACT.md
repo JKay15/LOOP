@@ -25,8 +25,8 @@ For the thin evaluator body and any richer compatibility path that resumes insid
 
 For delegated evaluator AI roles:
 - prefer the committed argv-based role-launch runtime over ad hoc `bash -c "codex exec ..."` reconstruction
-- keep role-local `AGENTS.md` / `AGENTS.override.md` in the dedicated role workspace selected by `cwd`
-- keep those role-local rules generic: prefer bounded non-interactive probes, clean up auxiliary browser/server/helper processes, and stop once decisive evidence exists for the current evaluation unit
+- keep role guidance on committed prompts/runtime metadata rather than transient runtime `AGENTS.md` / `AGENTS.override.md` files
+- keep that committed role guidance generic: prefer bounded non-interactive probes, clean up auxiliary browser/server/helper processes, and stop once decisive evidence exists for the current evaluation unit
 - keep auth/config on the default host home instead of changing `CODEX_HOME` merely to select role-local rules
 - exclude runtime-owned/generated source directories such as `.loop/`, `.loop_runtime/`, `workspace/`, and `.uv-cache/` when copying staged evaluator role workspaces from the source workspace
 - generic evaluator submissions should default delegated evaluator reasoning to `high` unless the caller explicitly overrides it
@@ -294,7 +294,7 @@ Each role run must persist:
 - invocation metadata
 - command execution span
 
-Each evaluator role must also keep a dedicated role-specific working directory. That dedicated role workspace must carry role-local `AGENTS.md` / `AGENTS.override.md`, and the per-run runtime artifacts live under `run_root/.loop/<role>/runs/`.
+Each evaluator role must also keep a dedicated role-specific working directory. The per-run runtime artifacts live under `run_root/.loop/<role>/runs/`, but role guidance belongs on committed prompts/runtime metadata instead of transient runtime `AGENTS.md` / `AGENTS.override.md` files.
 
 Nested evaluator role workspaces are runtime-owned isolation surfaces, not copies of the human operator's Codex setup. They must not rely on overriding the default Codex home just to select role-local rules, and they must not copy the host `config.toml` wholesale into a role workspace.
 Nested evaluator role launches must also scrub parent `CODEX_*` session/transport env vars such as `CODEX_THREAD_ID` and `CODEX_INTERNAL_ORIGINATOR_OVERRIDE` before nested agent execution begins.

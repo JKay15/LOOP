@@ -768,57 +768,45 @@ def main() -> int:
 
         evaluator_run_root = evaluation_ref.parent
         expected_role_results = (
-            evaluator_run_root / ".loop" / "checker" / "AGENTS.md",
-            evaluator_run_root / ".loop" / "checker" / "AGENTS.override.md",
             evaluator_run_root / ".loop" / "checker" / "runs" / "checker" / "result.json",
             evaluator_run_root / ".loop" / "checker" / "runs" / "checker" / "exec_span.json",
-            evaluator_run_root / ".loop" / "test_ai" / "AGENTS.md",
-            evaluator_run_root / ".loop" / "test_ai" / "AGENTS.override.md",
             evaluator_run_root / ".loop" / "test_ai" / "runs" / "test_ai__EU-001" / "result.json",
             evaluator_run_root / ".loop" / "test_ai" / "runs" / "test_ai__EU-001" / "exec_span.json",
-            evaluator_run_root / ".loop" / "ai_user" / "AGENTS.md",
-            evaluator_run_root / ".loop" / "ai_user" / "AGENTS.override.md",
             evaluator_run_root / ".loop" / "ai_user" / "runs" / "ai_user__EU-001" / "result.json",
             evaluator_run_root / ".loop" / "ai_user" / "runs" / "ai_user__EU-001" / "exec_span.json",
-            evaluator_run_root / ".loop" / "reviewer" / "AGENTS.md",
-            evaluator_run_root / ".loop" / "reviewer" / "AGENTS.override.md",
             evaluator_run_root / ".loop" / "reviewer" / "runs" / "reviewer" / "response.txt",
             evaluator_run_root / ".loop" / "reviewer" / "runs" / "reviewer" / "exec_span.json",
         )
         for path in expected_role_results:
             if not path.exists():
                 return _fail(f"evaluator node runtime must materialize lane artifact {path}")
-        expected_role_agents = {
-            evaluator_run_root / ".loop" / "checker" / "AGENTS.md": (
-                "You are evaluator checker.",
-                "Do not act as test_ai, ai_user, or reviewer.",
+        expected_role_prompts = {
+            evaluator_run_root / ".loop" / "checker" / "runs" / "checker" / "invocation.json": (
+                "# LOOP Evaluator Prototype: Checker",
+                "Use only the final-effects text in this prompt; do not inspect prior runs, prior checker outputs, or unrelated workspace files.",
             ),
-            evaluator_run_root / ".loop" / "test_ai" / "AGENTS.md": (
-                "You are evaluator test_ai.",
-                "Do not rewrite final effects, checker grouping, or reviewer verdicts.",
+            evaluator_run_root / ".loop" / "test_ai" / "runs" / "test_ai__EU-001" / "invocation.json": (
+                "# LOOP Evaluator Simple Prototype: Test AI",
+                "Do not ask for confirmation, permission, or a follow-up choice such as `Proceed now?`",
             ),
-            evaluator_run_root / ".loop" / "ai_user" / "AGENTS.md": (
-                "You are evaluator ai_user.",
-                "Do not redesign requirements, checker grouping, or reviewer verdicts.",
+            evaluator_run_root / ".loop" / "ai_user" / "runs" / "ai_user__EU-001" / "invocation.json": (
+                "# LOOP Evaluator Simple Prototype: AI-as-User",
+                "Use the product from its documented surface first.",
             ),
-            evaluator_run_root / ".loop" / "reviewer" / "AGENTS.md": (
-                "You are evaluator reviewer.",
-                "Judge only from reviewer-visible artifacts.",
+            evaluator_run_root / ".loop" / "reviewer" / "runs" / "reviewer" / "invocation.json": (
+                "# LOOP Evaluator Simple Prototype: Reviewer",
+                "Read the checker output and the delegated raw lane outputs.",
             ),
         }
-        for path, needles in expected_role_agents.items():
-            text = path.read_text(encoding="utf-8")
+        for path, needles in expected_role_prompts.items():
+            invocation_obj = json.loads(path.read_text(encoding="utf-8"))
+            prompt_ref = Path(str(invocation_obj.get("prompt_ref") or ""))
+            if not prompt_ref.exists():
+                return _fail(f"evaluator node runtime must materialize role prompt referenced by {path}")
+            text = prompt_ref.read_text(encoding="utf-8")
             for needle in needles:
                 if needle not in text:
-                    return _fail(f"evaluator node runtime must materialize role home guidance {needle!r} in {path}")
-        for path in (
-            evaluator_run_root / ".loop" / "checker" / "AGENTS.override.md",
-            evaluator_run_root / ".loop" / "test_ai" / "AGENTS.override.md",
-            evaluator_run_root / ".loop" / "ai_user" / "AGENTS.override.md",
-            evaluator_run_root / ".loop" / "reviewer" / "AGENTS.override.md",
-        ):
-            if path.read_text(encoding="utf-8").strip() != "":
-                return _fail(f"evaluator node runtime must keep role override file empty at {path}")
+                    return _fail(f"evaluator node runtime must preserve role guidance {needle!r} in prompt {prompt_ref}")
         for path in (
             evaluator_run_root / ".loop" / "checker" / "config.toml",
             evaluator_run_root / ".loop" / "test_ai" / "config.toml",
@@ -827,6 +815,26 @@ def main() -> int:
         ):
             if path.exists():
                 return _fail(f"evaluator node runtime must not copy host config.toml wholesale into role home {path}")
+        for path in (
+            evaluator_run_root / ".loop" / "checker" / "AGENTS.md",
+            evaluator_run_root / ".loop" / "checker" / "AGENTS.override.md",
+            evaluator_run_root / ".loop" / "checker" / "workspaces" / "checker" / "workspace" / "AGENTS.md",
+            evaluator_run_root / ".loop" / "checker" / "workspaces" / "checker" / "workspace" / "AGENTS.override.md",
+            evaluator_run_root / ".loop" / "test_ai" / "AGENTS.md",
+            evaluator_run_root / ".loop" / "test_ai" / "AGENTS.override.md",
+            evaluator_run_root / ".loop" / "test_ai" / "workspaces" / "test_ai__EU-001" / "workspace" / "AGENTS.md",
+            evaluator_run_root / ".loop" / "test_ai" / "workspaces" / "test_ai__EU-001" / "workspace" / "AGENTS.override.md",
+            evaluator_run_root / ".loop" / "ai_user" / "AGENTS.md",
+            evaluator_run_root / ".loop" / "ai_user" / "AGENTS.override.md",
+            evaluator_run_root / ".loop" / "ai_user" / "workspaces" / "ai_user__EU-001" / "workspace" / "AGENTS.md",
+            evaluator_run_root / ".loop" / "ai_user" / "workspaces" / "ai_user__EU-001" / "workspace" / "AGENTS.override.md",
+            evaluator_run_root / ".loop" / "reviewer" / "AGENTS.md",
+            evaluator_run_root / ".loop" / "reviewer" / "AGENTS.override.md",
+            evaluator_run_root / ".loop" / "reviewer" / "workspaces" / "reviewer" / "workspace" / "AGENTS.md",
+            evaluator_run_root / ".loop" / "reviewer" / "workspaces" / "reviewer" / "workspace" / "AGENTS.override.md",
+        ):
+            if path.exists():
+                return _fail(f"evaluator node runtime must not create runtime AGENTS file {path}")
 
         invocation_expectations = (
             (

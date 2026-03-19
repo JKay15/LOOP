@@ -851,6 +851,9 @@ def _copy_tree_excluding(*, source_root: Path, dest_root: Path, excluded_paths: 
         current = Path(dirpath).resolve()
         ignored: set[str] = set()
         for name in names:
+            if name in {"AGENTS.md", "AGENTS.override.md"}:
+                ignored.add(name)
+                continue
             candidate = (current / name).resolve()
             if any(candidate == blocked or _is_within(candidate, blocked) for blocked in normalized_excluded):
                 ignored.add(name)
@@ -976,7 +979,6 @@ def _materialize_ai_user_workspace(
     role_root = _default_role_runtime_root(run_root=run_root, role_id="ai_user")
     staging_root = _default_role_unit_workspace_root(role_root=role_root, unit_id=unit_id).parent.resolve()
     workspace_copy_root = staging_root / "workspace"
-    _ensure_empty_agent_files(target_dir=role_root, role_id="ai_user")
     excluded_paths = _default_ai_user_excluded_paths(
         source_workspace_root=source_workspace_root,
         output_root=output_root,
@@ -1007,7 +1009,6 @@ def _materialize_ai_user_workspace(
     control_dir = internal_root / "control"
     dropbox_dir = internal_root / "dropbox"
     scratch_dir = internal_root / "scratch"
-    _ensure_empty_agent_files(target_dir=workspace_copy_root, role_id="ai_user")
     return {
         "workspace_root": workspace_copy_root,
         "manual_path": staged_manual_path,
@@ -1035,7 +1036,6 @@ def _materialize_codex_role_workspace(
     safe_role_id = re.sub(r"[^A-Za-z0-9_.-]+", "__", role_id).strip("._-") or "role"
     role_root = _default_role_runtime_root(run_root=run_root, role_id=role_id)
     workspace_root = _default_role_workspace_root(role_root=role_root)
-    _ensure_empty_agent_files(target_dir=role_root, role_id=role_id)
     if copy_source_workspace:
         excluded_paths = _default_ai_user_excluded_paths(
             source_workspace_root=source_workspace_root,
@@ -1050,7 +1050,6 @@ def _materialize_codex_role_workspace(
         if workspace_root.exists():
             shutil.rmtree(workspace_root)
         workspace_root.mkdir(parents=True, exist_ok=True)
-    _ensure_empty_agent_files(target_dir=workspace_root, role_id=role_id)
     current_run_snapshot_root = _materialize_current_run_snapshot(
         run_root=run_root,
         snapshot_root=workspace_root / ".loop_evaluator_internal" / "current_run_snapshot",
@@ -2083,77 +2082,6 @@ def _agent_runtime_env_overrides(
         "OTEL_LOGS_EXPORTER": "none",
     }
 
-_ROLE_AGENT_RULES: dict[str, str] = {
-    "checker": "\n".join(
-        [
-            "# Evaluator Checker Rules",
-            "",
-            "You are evaluator checker.",
-            "Only normalize the frozen final effects into explicit requirements and a requirement graph.",
-            "Do not act as test_ai, ai_user, or reviewer.",
-        ]
-    ),
-    "test_ai": "\n".join(
-        [
-            "# Evaluator Test AI Rules",
-            "",
-            "You are evaluator test_ai.",
-            "Only run documented-surface ordinary tests for the current evaluation unit.",
-            "Prefer bounded non-interactive probes over headed or long-lived interactive sessions.",
-            "Do not leave long-lived auxiliary processes running after decisive evidence is already available.",
-            "Once decisive evidence exists for the current evaluation unit, stop and emit your terminal output.",
-            "Do not relaunch the evaluator or redesign the frozen checker lane plan.",
-            "Do not rewrite final effects, checker grouping, or reviewer verdicts.",
-        ]
-    ),
-    "test_designer": "\n".join(
-        [
-            "# Evaluator Test AI Rules",
-            "",
-            "You are evaluator test_ai.",
-            "Only run documented-surface ordinary tests for the current evaluation unit.",
-            "Prefer bounded non-interactive probes over headed or long-lived interactive sessions.",
-            "Do not leave long-lived auxiliary processes running after decisive evidence is already available.",
-            "Once decisive evidence exists for the current evaluation unit, stop and emit your terminal output.",
-            "Do not relaunch the evaluator or redesign the frozen checker lane plan.",
-            "Do not rewrite final effects, checker grouping, or reviewer verdicts.",
-        ]
-    ),
-    "ai_user": "\n".join(
-        [
-            "# Evaluator AI-as-User Rules",
-            "",
-            "You are evaluator ai_user.",
-            "Only behave like a user validating the current evaluation unit from the documented surface.",
-            "Prefer bounded non-interactive probes over headed or long-lived interactive sessions.",
-            "Do not leave long-lived auxiliary processes running after decisive evidence is already available.",
-            "Once decisive evidence exists for the current evaluation unit, stop and emit your terminal output.",
-            "Do not relaunch the evaluator or redesign the frozen checker lane plan.",
-            "Do not redesign requirements, checker grouping, or reviewer verdicts.",
-        ]
-    ),
-    "reviewer": "\n".join(
-        [
-            "# Evaluator Reviewer Rules",
-            "",
-            "You are evaluator reviewer.",
-            "Judge only from reviewer-visible artifacts.",
-            "Do not invent new requirements or rerun the product outside the recorded evidence.",
-        ]
-    ),
-}
-
-
-def _ensure_empty_agent_files(*, target_dir: Path, role_id: str | None = None) -> None:
-    target_dir.mkdir(parents=True, exist_ok=True)
-    agents_path = target_dir / "AGENTS.md"
-    override_path = target_dir / "AGENTS.override.md"
-    if not agents_path.exists():
-        _write_text(agents_path, _ROLE_AGENT_RULES.get(str(role_id or "").strip(), ""))
-    if not override_path.exists():
-        _write_text(override_path, "")
-
-
 def _extract_runtime_metadata_from_path(path: Path | None) -> dict[str, str]:
     if path is None or not path.exists():
         return {}
@@ -2384,8 +2312,6 @@ def _invoke_role(
         effective_cmd=effective_cmd,
         role_root=role_dir,
     )
-    _ensure_empty_agent_files(target_dir=role_dir, role_id=role_id)
-    _ensure_empty_agent_files(target_dir=resolved_workspace_root, role_id=role_id)
     invocation_obj = {
         "requested_config": cfg,
         "resolved_invocation": resolved.to_metadata(),

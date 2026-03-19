@@ -38,9 +38,9 @@ The evaluator is a graph participant, not an oracle outside the graph.
 - evaluator lanes must check self-caused execution mistakes before blaming the implementation
 - ordinary implementer evaluator submissions must be task-scoped to the frozen workspace mirror artifact and must not silently reuse endpoint-clarification manuals/final-effects from another product surface
 - each evaluator AI role must run from a dedicated role-specific `cwd`
-- each evaluator AI role must keep role-local `AGENTS.md` / `AGENTS.override.md` files in that dedicated role workspace and keep per-run artifacts under `run_root/.loop/<role>/runs/`
-- role-local evaluator `AGENTS.md` files should stay minimal and role-specific: `checker`, `test_ai`, `ai_user`, and `reviewer` each get only their own boundary rules, while `AGENTS.override.md` remains empty unless a later experiment explicitly needs an override
-- those role-local rules should keep delegated evaluator roles on bounded non-interactive probes by default instead of headed or long-lived interactive sessions
+- per-run artifacts must live under `run_root/.loop/<role>/runs/`
+- evaluator role guidance must come from committed prompt/runtime surfaces, not from transient runtime `AGENTS.md` / `AGENTS.override.md` files under `.loop/**`
+- those committed role rules should keep delegated evaluator roles on bounded non-interactive probes by default instead of headed or long-lived interactive sessions
 - delegated evaluator roles must not leave auxiliary browser/server/watcher/helper processes running once decisive evidence for the current evaluation unit already exists
 - once decisive evidence exists for the current evaluation unit, delegated evaluator roles should emit terminal output instead of continuing open-ended exploration for nicer evidence
 - when a role workspace is copied from the source workspace, runtime-owned/generated directories such as `.loop/`, `.loop_runtime/`, `workspace/`, and `.uv-cache/` must stay excluded by default instead of being copied into the delegated evaluator workspace

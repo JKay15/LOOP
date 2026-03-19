@@ -6,7 +6,7 @@
 
 - The evaluator preserves an auditable evidence chain for every role run, including prompts, contexts, results, responses, invocation metadata, and execution spans.
 
-- Each evaluator AI role uses a dedicated role-specific `cwd`; that role workspace carries role-local `AGENTS.md` / `AGENTS.override.md`, per-run artifacts still live under `run_root/.loop/<role>/runs/`, launch must not override the default Codex home merely to select role rules, repo-shipped Python module role commands must still preserve repo importability from that `cwd` such as by prepending the product repo root to `PYTHONPATH`, and the nested run must not inherit parent `CODEX_*` session/transport env vars such as `CODEX_THREAD_ID` and `CODEX_INTERNAL_ORIGINATOR_OVERRIDE`.
+- Each evaluator AI role uses a dedicated role-specific `cwd`; per-run artifacts still live under `run_root/.loop/<role>/runs/`, role guidance stays on committed prompt/runtime surfaces instead of transient runtime `AGENTS.md` files, launch must not override the default Codex home merely to select role rules, repo-shipped Python module role commands must still preserve repo importability from that `cwd` such as by prepending the product repo root to `PYTHONPATH`, and the nested run must not inherit parent `CODEX_*` session/transport env vars such as `CODEX_THREAD_ID` and `CODEX_INTERNAL_ORIGINATOR_OVERRIDE`.
 
 - The evaluator preserves ordinary-test execution results, AI-as-User evidence, reviewer effect reviews, and a runtime-derived final evaluator status.
 
