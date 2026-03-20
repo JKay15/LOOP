@@ -9,10 +9,14 @@ from typing import Any
 
 from loop_product.dispatch.bootstrap import bootstrap_first_implementer_node as dispatch_bootstrap_first_implementer_node
 from loop_product.dispatch.bootstrap import bootstrap_first_implementer_from_endpoint as dispatch_bootstrap_first_implementer_from_endpoint
+from loop_product.dispatch.child_progress_snapshot import (
+    child_progress_snapshot_from_launch_result_ref as dispatch_child_progress_snapshot_from_launch_result_ref,
+)
 from loop_product.dispatch.launch_runtime import child_runtime_status_from_launch_result_ref as dispatch_child_runtime_status_from_launch_result_ref
 from loop_product.dispatch.launch_runtime import launch_child_from_result_ref as dispatch_launch_child_from_result_ref
 from loop_product.dispatch.publication import publish_external_from_implementer_result as dispatch_publish_external_from_implementer_result
 from loop_product.dispatch.recovery_bootstrap import recover_orphaned_active_node as dispatch_recover_orphaned_active_node
+from loop_product.dispatch.supervision import supervise_child_until_settled as dispatch_supervise_child_until_settled
 from loop_product.dispatch.child_dispatch import load_child_runtime_context, materialize_child
 from loop_product.kernel.authority import kernel_internal_authority
 from loop_product.kernel.policy import (
@@ -113,10 +117,45 @@ def child_runtime_status_from_launch_result_ref(
     )
 
 
+def child_progress_snapshot_from_launch_result_ref(
+    *,
+    result_ref: str | Path,
+    stall_threshold_s: float = 60.0,
+) -> dict[str, Any]:
+    """Public trusted surface for committed child progress snapshots."""
+
+    return dispatch_child_progress_snapshot_from_launch_result_ref(
+        result_ref=result_ref,
+        stall_threshold_s=stall_threshold_s,
+    )
+
+
 def publish_external_from_implementer_result(*, result_ref: str | Path) -> dict[str, Any]:
     """Public trusted surface for deterministic root-kernel external publication."""
 
     return dispatch_publish_external_from_implementer_result(result_ref=result_ref)
+
+
+def supervise_child_until_settled(
+    *,
+    launch_result_ref: str | Path,
+    poll_interval_s: float = 2.0,
+    stall_threshold_s: float = 60.0,
+    max_recoveries: int = 5,
+    max_wall_clock_s: float = 0.0,
+) -> dict[str, Any]:
+    """Public trusted surface for committed root-side child supervision."""
+
+    return dispatch_supervise_child_until_settled(
+        launch_result_ref=launch_result_ref,
+        poll_interval_s=poll_interval_s,
+        stall_threshold_s=stall_threshold_s,
+        max_recoveries=max_recoveries,
+        max_wall_clock_s=max_wall_clock_s,
+        runtime_status_reader=dispatch_child_runtime_status_from_launch_result_ref,
+        recovery_runner=dispatch_recover_orphaned_active_node,
+        launcher=dispatch_launch_child_from_result_ref,
+    )
 
 
 def initialize_evaluator_runtime(
@@ -224,6 +263,8 @@ def _build_parser() -> argparse.ArgumentParser:
     recovery.add_argument("--state-root", default="", help="Runtime state root for direct structured recovery")
     recovery.add_argument("--node-id", default="", help="Exact ACTIVE node id for direct structured recovery")
     recovery.add_argument("--workspace-root", default="", help="Optional exact workspace root guard for direct structured recovery")
+    recovery.add_argument("--confirmed-launch-result-ref", default="", help="Optional exact launch result ref already confirmed by the caller")
+    recovery.add_argument("--confirmed-runtime-status-ref", default="", help="Optional exact runtime status ref already confirmed by the caller")
     recovery.add_argument("--reason", default="", help="Recovery reason for direct structured recovery")
     recovery.add_argument("--self-attribution", default="", help="Self-attribution for direct structured recovery")
     recovery.add_argument("--self-repair", default="", help="Self-repair for direct structured recovery")
@@ -253,6 +294,26 @@ def _build_parser() -> argparse.ArgumentParser:
         default=60.0,
         help="Seconds of log silence before a still-live child is marked as stalled_hint",
     )
+    progress_snapshot = subparsers.add_parser(
+        "child-progress-snapshot",
+        help="Summarize current child progress, evaluator state, and observed document refs",
+    )
+    progress_snapshot.add_argument("--launch-result-ref", required=True, help="Path to a ChildLaunchResult.json")
+    progress_snapshot.add_argument(
+        "--stall-threshold-s",
+        type=float,
+        default=60.0,
+        help="Seconds of log silence before a still-live child is considered stalled in the underlying runtime status",
+    )
+    supervise = subparsers.add_parser(
+        "supervise-child",
+        help="Keep supervising a launched child until PASS, a confirmed non-retryable terminal result, or timeout",
+    )
+    supervise.add_argument("--launch-result-ref", required=True, help="Path to a ChildLaunchResult.json")
+    supervise.add_argument("--poll-interval-s", type=float, default=2.0, help="Polling interval between supervision checks")
+    supervise.add_argument("--stall-threshold-s", type=float, default=60.0, help="Seconds of log silence before a live child is considered stalled")
+    supervise.add_argument("--max-recoveries", type=int, default=5, help="Maximum committed recover/relaunch cycles before settling exhausted")
+    supervise.add_argument("--max-wall-clock-s", type=float, default=0.0, help="Optional supervision timeout in seconds; 0 disables timeout")
     publish = subparsers.add_parser(
         "publish-external-result",
         help="Publish the exact implementer workspace artifact to its frozen external target",
@@ -295,6 +356,8 @@ def _cmd_recover_orphaned_active(args: argparse.Namespace) -> int:
             "state_root": args.state_root,
             "node_id": args.node_id,
             "workspace_root": args.workspace_root,
+            "confirmed_launch_result_ref": args.confirmed_launch_result_ref,
+            "confirmed_runtime_status_ref": args.confirmed_runtime_status_ref,
             "reason": args.reason,
             "self_attribution": args.self_attribution,
             "self_repair": args.self_repair,
@@ -309,6 +372,18 @@ def _cmd_recover_orphaned_active(args: argparse.Namespace) -> int:
 
 def _cmd_publish_external_result(args: argparse.Namespace) -> int:
     result = publish_external_from_implementer_result(result_ref=args.result_ref)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def _cmd_supervise_child(args: argparse.Namespace) -> int:
+    result = supervise_child_until_settled(
+        launch_result_ref=args.launch_result_ref,
+        poll_interval_s=args.poll_interval_s,
+        stall_threshold_s=args.stall_threshold_s,
+        max_recoveries=args.max_recoveries,
+        max_wall_clock_s=args.max_wall_clock_s,
+    )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
@@ -332,6 +407,15 @@ def _cmd_child_runtime_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_child_progress_snapshot(args: argparse.Namespace) -> int:
+    result = child_progress_snapshot_from_launch_result_ref(
+        result_ref=args.launch_result_ref,
+        stall_threshold_s=args.stall_threshold_s,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -345,6 +429,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_launch_child(args)
     if args.command == "child-runtime-status":
         return _cmd_child_runtime_status(args)
+    if args.command == "child-progress-snapshot":
+        return _cmd_child_progress_snapshot(args)
+    if args.command == "supervise-child":
+        return _cmd_supervise_child(args)
     if args.command == "publish-external-result":
         return _cmd_publish_external_result(args)
     parser.print_help()

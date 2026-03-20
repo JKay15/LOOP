@@ -1,6 +1,7 @@
 """Child dispatch bridge for the wave-1 bootstrap."""
 
 from .bootstrap import bootstrap_first_implementer_node
+from .child_progress_snapshot import child_progress_snapshot_from_launch_result_ref
 from .heartbeat import build_child_dispatch_status, build_child_heartbeat
 from .launch_runtime import child_runtime_status_from_launch_result_ref, launch_child_from_result_ref
 from .launch_policy import LaunchPolicy, build_codex_cli_child_launch, codex_reasoning_effort_for_thinking_budget
@@ -12,6 +13,7 @@ __all__ = [
     "build_codex_cli_child_launch",
     "build_child_dispatch_status",
     "build_child_heartbeat",
+    "child_progress_snapshot_from_launch_result_ref",
     "child_runtime_status_from_launch_result_ref",
     "codex_reasoning_effort_for_thinking_budget",
     "launch_child_from_result_ref",

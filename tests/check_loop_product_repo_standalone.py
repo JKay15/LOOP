@@ -168,6 +168,7 @@ def main() -> int:
         "bootstrap_first_implementer_from_endpoint",
         "child_runtime_status_from_launch_result_ref",
         "recover_orphaned_active_node",
+        "supervise_child_until_settled",
     ):
         if not hasattr(loop_product_package, attr_name):
             return _fail(f"loop_product package root must expose formal alias `{attr_name}`")

@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopChildProgressSnapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "snapshot_ref",
+    "launch_result_ref",
+    "runtime_status_ref",
+    "node_id",
+    "workspace_root",
+    "state_root",
+    "pid_alive",
+    "lifecycle_status",
+    "runtime_attachment_state",
+    "recovery_eligible",
+    "recovery_reason",
+    "latest_log_ref",
+    "latest_log_age_s",
+    "recent_log_lines",
+    "terminal_result_present",
+    "implementer_result_ref",
+    "implementer_outcome",
+    "implementer_verdict",
+    "implementer_retryable",
+    "phase_hint",
+    "observed_doc_source_refs",
+    "observed_child_doc_refs",
+    "observed_doc_refs",
+    "observed_repo_doc_refs",
+    "observed_external_doc_refs",
+    "observed_evaluator_doc_source_refs",
+    "observed_evaluator_doc_refs",
+    "evaluator_run_state_ref",
+    "evaluator_status",
+    "evaluator_checker_status",
+    "evaluator_reviewer_status",
+    "evaluator_completed_unit_ids",
+    "evaluator_running_unit_ids",
+    "evaluator_blocked_retryable_unit_ids",
+    "evaluator_blocked_terminal_unit_ids",
+    "evaluator_pending_unit_ids"
+  ],
+  "properties": {
+    "version": { "type": "string", "minLength": 1 },
+    "snapshot_ref": { "type": "string", "minLength": 1 },
+    "launch_result_ref": { "type": "string", "minLength": 1 },
+    "runtime_status_ref": { "type": "string", "minLength": 1 },
+    "node_id": { "type": "string", "minLength": 1 },
+    "workspace_root": { "type": "string", "minLength": 1 },
+    "state_root": { "type": "string", "minLength": 1 },
+    "pid_alive": { "type": "boolean" },
+    "lifecycle_status": { "type": "string", "minLength": 1 },
+    "runtime_attachment_state": { "type": "string", "minLength": 1 },
+    "recovery_eligible": { "type": "boolean" },
+    "recovery_reason": { "type": "string" },
+    "latest_log_ref": { "type": "string", "minLength": 1 },
+    "latest_log_age_s": { "type": "number", "minimum": 0 },
+    "recent_log_lines": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "terminal_result_present": { "type": "boolean" },
+    "implementer_result_ref": { "type": "string" },
+    "implementer_outcome": { "type": "string" },
+    "implementer_verdict": { "type": "string" },
+    "implementer_retryable": { "type": "boolean" },
+    "phase_hint": {
+      "type": "string",
+      "enum": [
+        "IMPLEMENTING",
+        "EVALUATING",
+        "REPAIRING",
+        "RUNTIME_RECOVERY",
+        "REPORTED"
+      ]
+    },
+    "observed_doc_source_refs": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "observed_child_doc_refs": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "observed_doc_refs": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "observed_repo_doc_refs": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "observed_external_doc_refs": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "observed_evaluator_doc_source_refs": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "observed_evaluator_doc_refs": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "evaluator_run_state_ref": { "type": "string" },
+    "evaluator_status": { "type": "string" },
+    "evaluator_checker_status": { "type": "string" },
+    "evaluator_reviewer_status": { "type": "string" },
+    "evaluator_completed_unit_ids": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "evaluator_running_unit_ids": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "evaluator_blocked_retryable_unit_ids": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "evaluator_blocked_terminal_unit_ids": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "evaluator_pending_unit_ids": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  }
+}

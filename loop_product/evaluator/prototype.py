@@ -606,11 +606,15 @@ def _role_output_envelope_schema(role_id: str) -> dict[str, Any]:
     requirement_item = {
         "type": "object",
         "additionalProperties": False,
-        "required": ["requirement_id", "description", "blocking"],
+        "required": ["requirement_id", "description", "blocking", "requirement_kind"],
         "properties": {
             "requirement_id": {"minLength": 1, "type": "string"},
             "description": {"minLength": 1, "type": "string"},
             "blocking": {"type": "boolean"},
+            "requirement_kind": {
+                "type": "string",
+                "enum": ["product_effect", "runtime_closure"],
+            },
         },
     }
     evaluation_unit_item = {
@@ -1711,7 +1715,7 @@ def build_checker_prompt(
             "- Because the structured-output schema is strict, you must always include every checker result key on every run.",
             "- The JSON result file must contain:",
             "  - `status = OK | HUMAN_GATE`",
-            "  - if `status = OK`: `normalized_requirements = [{requirement_id, description, blocking}]`; if `status = HUMAN_GATE`, set `normalized_requirements = []`",
+            "  - if `status = OK`: `normalized_requirements = [{requirement_id, description, blocking, requirement_kind}]`; if `status = HUMAN_GATE`, set `normalized_requirements = []`",
             "  - if `status = OK`: `requirement_graph = {requirements, evaluation_units, dependency_edges}`; if `status = HUMAN_GATE`, set `requirement_graph = null`",
             "  - if `status = OK`: `requirement_graph.requirements` must be the full `normalized_requirements` objects, not bare requirement ids",
             "  - if `status = OK`: `requirement_graph.evaluation_units = [{unit_id, requirement_ids}]` and the field name must be exactly `unit_id` (not `evaluation_unit_id`)",
@@ -1719,9 +1723,10 @@ def build_checker_prompt(
             "  - if `status = OK`: `repair_actions = [{raw_item, action, emitted_requirement_ids}]`; if a repair/ledger item introduces no new normalized requirement ids, `emitted_requirement_ids` may be `[]`; if `status = HUMAN_GATE`, set `repair_actions = []`",
             "  - if `status = OK`: set `human_gate_reasons = []`; if `status = HUMAN_GATE`: `human_gate_reasons = [..]`",
             "  - `notes = [..]`",
+            "  - always include `requirement_kind`; use `product_effect` for ordinary reviewer-visible product checks and `runtime_closure` only when the requirement is satisfied by evaluator/runtime terminal closure itself (for example authoritative terminal-result/result-sink obligations)",
             "  - minimal valid `requirement_graph` example:",
             "    ```json",
-            '    {"requirements":[{"requirement_id":"REQ-001","description":"...","blocking":true}],"evaluation_units":[{"unit_id":"EU-001","requirement_ids":["REQ-001"]}],"dependency_edges":[]}',
+            '    {"requirements":[{"requirement_id":"REQ-001","description":"...","blocking":true,"requirement_kind":"product_effect"}],"evaluation_units":[{"unit_id":"EU-001","requirement_ids":["REQ-001"]}],"dependency_edges":[]}',
             "    ```",
             "",
             "## Final-Effects Text",
@@ -3612,6 +3617,27 @@ def _normalize_operation_log_labeled_ref(ref: str, *, operation_log_ref: str) ->
     return f"{operation_log_ref}#op{matches[0]}"
 
 
+_REQUIREMENT_KIND_PRODUCT_EFFECT = "product_effect"
+_REQUIREMENT_KIND_RUNTIME_CLOSURE = "runtime_closure"
+
+
+def _normalize_requirement_kind(*, requirement: Mapping[str, Any], description: str) -> str:
+    raw_kind = str(requirement.get("requirement_kind") or "").strip().lower()
+    if raw_kind in {_REQUIREMENT_KIND_PRODUCT_EFFECT, _REQUIREMENT_KIND_RUNTIME_CLOSURE}:
+        return raw_kind
+    lowered = description.lower()
+    if "terminal evaluator-backed result" in lowered:
+        return _REQUIREMENT_KIND_RUNTIME_CLOSURE
+    if "implementer_result.json" in lowered:
+        return _REQUIREMENT_KIND_RUNTIME_CLOSURE
+    return _REQUIREMENT_KIND_PRODUCT_EFFECT
+
+
+def requirement_kind(requirement: Mapping[str, Any]) -> str:
+    description = str(requirement.get("description") or "").strip()
+    return _normalize_requirement_kind(requirement=requirement, description=description)
+
+
 def _validate_final_effect_requirements(
     requirements: Sequence[Mapping[str, Any]],
     *,
@@ -3636,6 +3662,7 @@ def _validate_final_effect_requirements(
                 "requirement_id": requirement_id,
                 "description": description,
                 "blocking": bool(item.get("blocking", True)),
+                "requirement_kind": _normalize_requirement_kind(requirement=item, description=description),
             }
         )
     return normalized

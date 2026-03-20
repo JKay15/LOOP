@@ -62,6 +62,14 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="loop_first_child_bootstrap_") as td:
         temp_root = Path(td)
+        required_doc = temp_root / "required-doc.md"
+        required_doc.write_text("# required doc\n", encoding="utf-8")
+        required_wrapper = temp_root / "ensure_workspace_lake_packages.sh"
+        required_wrapper.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        required_wrapper.chmod(0o755)
+        ancestor_relative_ref = ROOT.parent / ".cache" / "loop_bootstrap_relative_context_ref_test.md"
+        ancestor_relative_ref.parent.mkdir(parents=True, exist_ok=True)
+        ancestor_relative_ref.write_text("relative context ref\n", encoding="utf-8")
         project_name = "test-first-child-bootstrap"
         workspace_root = ROOT / "workspace" / project_name
         state_root = ROOT / ".loop" / project_name
@@ -80,7 +88,11 @@ def main() -> int:
                         "latest_turn_ref": str((temp_root / "turns" / "0001" / "TurnResult.json").resolve()),
                         "mode": "VISION_COMPILER",
                         "status": "CLARIFIED",
-                        "original_user_prompt": "Create a Gon birthday poster HTML with offline music playback.",
+                        "original_user_prompt": (
+                            "Create a Gon birthday poster HTML with offline music playback. "
+                            f"Read `{required_doc.resolve()}`, use `{required_wrapper.resolve()}` before the first build, "
+                            f"and also keep `.cache/{ancestor_relative_ref.name}` as required local context."
+                        ),
                         "confirmed_requirements": [],
                         "denied_requirements": [],
                         "question_history": [],
@@ -96,7 +108,10 @@ def main() -> int:
                             ],
                             "hard_constraints": ["Output target is the desktop."],
                             "non_goals": ["Do not use streaming embeds."],
-                            "relevant_context": ["The task is already clarified."],
+                            "relevant_context": [
+                                "The task is already clarified.",
+                                str(required_doc.resolve()),
+                            ],
                             "open_questions": [],
                             "artifact_ready_for_persistence": True,
                         },
@@ -324,9 +339,22 @@ def main() -> int:
             derived_bootstrap_result = Path(str(derived.get("bootstrap_result_ref") or ""))
             derived_request_path = derived_bootstrap_result.parent / "FirstImplementerBootstrapRequest.json"
             derived_request = json.loads(derived_request_path.read_text(encoding="utf-8"))
-            if derived_request.get("context_refs") != [str(endpoint_artifact.resolve())]:
-                return _fail("endpoint-driven bootstrap must default context_refs to the endpoint artifact ref")
+            derived_context_refs = [str(item) for item in list(derived_request.get("context_refs") or [])]
+            expected_context_refs = {
+                str(endpoint_artifact.resolve()),
+                str(required_doc.resolve()),
+                str(required_wrapper.resolve()),
+                str(ancestor_relative_ref.resolve()),
+            }
+            if not expected_context_refs.issubset(set(derived_context_refs)):
+                return _fail("endpoint-driven bootstrap must preserve explicit existing local context refs from the endpoint artifact")
+            if derived_context_refs[0] != str(endpoint_artifact.resolve()):
+                return _fail("endpoint-driven bootstrap must keep the endpoint artifact as the first context ref")
+            derived_handoff_context_refs = {str(item) for item in list(derived_handoff_payload.get("context_refs") or [])}
+            if not expected_context_refs.issubset(derived_handoff_context_refs):
+                return _fail("endpoint-driven bootstrap must project explicit local context refs into the frozen handoff")
         finally:
+            ancestor_relative_ref.unlink(missing_ok=True)
             shutil.rmtree(workspace_root, ignore_errors=True)
             shutil.rmtree(state_root, ignore_errors=True)
             shutil.rmtree(ROOT / "workspace" / "test-first-child-bootstrap-from-endpoint", ignore_errors=True)

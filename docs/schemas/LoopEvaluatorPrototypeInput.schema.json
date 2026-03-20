@@ -46,6 +46,13 @@
           "minLength": 1,
           "type": "string"
         },
+        "requirement_kind": {
+          "enum": [
+            "product_effect",
+            "runtime_closure"
+          ],
+          "type": "string"
+        },
         "requirement_id": {
           "minLength": 1,
           "type": "string"

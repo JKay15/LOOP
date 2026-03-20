@@ -42,6 +42,7 @@ def _wait_dead(pid: int, timeout_s: float = 5.0) -> None:
 
 def main() -> int:
     from loop_product.runtime import bootstrap_first_implementer_node
+    from loop_product.dispatch import launch_runtime
 
     launch_result_schema = _load_schema("LoopChildLaunchResult.schema.json")
     status_result_schema = _load_schema("LoopChildRuntimeStatusResult.schema.json")
@@ -91,7 +92,12 @@ def main() -> int:
         workspace_root = ROOT / "workspace" / "test-child-runtime-status-helper"
         state_root = ROOT / ".loop" / "test-child-runtime-status-helper"
         live_pid = 0
+        zombie_parent_pid = 0
+        previous_runtime_status_mode = os.environ.get("LOOP_CHILD_RUNTIME_STATUS_MODE")
+        os.environ["LOOP_CHILD_RUNTIME_STATUS_MODE"] = "direct"
         try:
+            shutil.rmtree(workspace_root, ignore_errors=True)
+            shutil.rmtree(state_root, ignore_errors=True)
             bootstrap = bootstrap_first_implementer_node(
                 mode="fresh",
                 task_slug="test-child-runtime-status-helper",
@@ -172,6 +178,7 @@ def main() -> int:
                 cwd=str(ROOT),
                 text=True,
                 capture_output=True,
+                env={**dict(os.environ), "LOOP_CHILD_RUNTIME_STATUS_MODE": "direct"},
             )
             if live_status_proc.returncode != 0:
                 return _fail(f"child runtime status helper must accept a live launch result: {live_status_proc.stderr or live_status_proc.stdout}")
@@ -189,6 +196,125 @@ def main() -> int:
             if not status_result_ref.exists():
                 return _fail("child runtime status helper must persist a status result artifact next to the launch result")
 
+            original_kill = launch_runtime.os.kill
+
+            def _permission_denied_kill(pid: int, sig: int) -> None:
+                if int(pid) == live_pid and int(sig) == 0:
+                    raise PermissionError("simulated sandbox signal denial for live pid probe")
+                return original_kill(pid, sig)
+
+            launch_runtime.os.kill = _permission_denied_kill
+            try:
+                live_status_permission_fallback = launch_runtime.child_runtime_status_from_launch_result_ref(
+                    result_ref=str(Path(str(launch["launch_result_ref"])).resolve()),
+                    stall_threshold_s=0,
+                )
+            finally:
+                launch_runtime.os.kill = original_kill
+            Draft202012Validator(status_result_schema).validate(live_status_permission_fallback)
+            if not bool(live_status_permission_fallback.get("pid_alive")):
+                return _fail("child runtime status helper must fall back to ps when signal probing is permission-denied")
+            if str(live_status_permission_fallback.get("recovery_reason") or "") != "live_pid_still_attached":
+                return _fail("permission-denied pid probing must still keep the child under live supervision")
+
+            zombie_pid_path = temp_root / "zombie_pid.txt"
+            zombie_driver = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os, sys, time\n"
+                        "path = sys.argv[1]\n"
+                        "pid = os.fork()\n"
+                        "if pid == 0:\n"
+                        "    os._exit(0)\n"
+                        "with open(path, 'w', encoding='utf-8') as handle:\n"
+                        "    handle.write(str(pid))\n"
+                        "time.sleep(30)\n"
+                    ),
+                    str(zombie_pid_path),
+                ],
+                cwd=str(ROOT),
+                text=True,
+            )
+            zombie_parent_pid = int(zombie_driver.pid)
+            deadline = time.time() + 5.0
+            while not zombie_pid_path.exists() and time.time() < deadline:
+                time.sleep(0.05)
+            if not zombie_pid_path.exists():
+                return _fail("zombie runtime-status coverage must materialize a zombie pid")
+            zombie_pid = int(zombie_pid_path.read_text(encoding="utf-8").strip())
+            zombie_launch_result_ref = state_root / "artifacts" / "launches" / bootstrap["node_id"] / "attempt_zombie" / "ChildLaunchResult.json"
+            zombie_stdout = zombie_launch_result_ref.parent / "logs" / "zombie.stdout.txt"
+            zombie_stderr = zombie_launch_result_ref.parent / "logs" / "zombie.stderr.txt"
+            zombie_stdout.parent.mkdir(parents=True, exist_ok=True)
+            zombie_stdout.write_text("", encoding="utf-8")
+            zombie_stderr.write_text("", encoding="utf-8")
+            zombie_launch_result_ref.write_text(
+                json.dumps(
+                    {
+                        "launch_decision": "started",
+                        "source_result_ref": str(live_source_result.resolve()),
+                        "node_id": str(bootstrap["node_id"]),
+                        "workspace_root": str(workspace_root.resolve()),
+                        "state_root": str(state_root.resolve()),
+                        "startup_health_timeout_ms": 250,
+                        "startup_retry_limit": 0,
+                        "attempt_count": 1,
+                        "retryable_failure_kind": "",
+                        "attempts": [],
+                        "launch_request_ref": str((zombie_launch_result_ref.parent / "ChildLaunchRequest.json").resolve()),
+                        "launch_result_ref": str(zombie_launch_result_ref.resolve()),
+                        "launch_log_dir": str(zombie_stdout.parent.resolve()),
+                        "stdout_ref": str(zombie_stdout.resolve()),
+                        "stderr_ref": str(zombie_stderr.resolve()),
+                        "stdin_ref": str((workspace_root / "CHILD_PROMPT.md").resolve()),
+                        "wrapped_argv": [sys.executable, "-c", "import time; time.sleep(30)"],
+                        "wrapper_cmd": "",
+                        "pid": zombie_pid,
+                        "exit_code": None,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            zombie_status = launch_runtime.child_runtime_status_from_launch_result_ref(
+                result_ref=str(zombie_launch_result_ref.resolve()),
+                stall_threshold_s=0,
+            )
+            Draft202012Validator(status_result_schema).validate(zombie_status)
+            if bool(zombie_status.get("pid_alive")):
+                return _fail("child runtime status helper must treat zombie child pids as not alive")
+            if str(zombie_status.get("recovery_reason") or "") == "live_pid_still_attached":
+                return _fail("zombie child pids must not block orphaned-active recovery as if they were still live")
+
+            original_request = launch_runtime.request_host_child_runtime_status
+            original_should = launch_runtime.should_request_host_child_runtime_status
+            try:
+                def _fake_host_runtime_status(**_kwargs: object) -> dict[str, object]:
+                    payload = dict(zombie_status)
+                    payload["pid_alive"] = True
+                    payload["recovery_eligible"] = False
+                    payload["recovery_reason"] = "live_pid_still_attached"
+                    return payload
+
+                launch_runtime.request_host_child_runtime_status = _fake_host_runtime_status
+                launch_runtime.should_request_host_child_runtime_status = lambda: True
+                zombie_status_via_host = launch_runtime.child_runtime_status_from_launch_result_ref(
+                    result_ref=str(zombie_launch_result_ref.resolve()),
+                    stall_threshold_s=0,
+                )
+            finally:
+                launch_runtime.request_host_child_runtime_status = original_request
+                launch_runtime.should_request_host_child_runtime_status = original_should
+            Draft202012Validator(status_result_schema).validate(zombie_status_via_host)
+            if bool(zombie_status_via_host.get("pid_alive")):
+                return _fail("host-backed runtime status must correct zombie child pids to pid_alive=false")
+            if str(zombie_status_via_host.get("recovery_reason") or "") == "live_pid_still_attached":
+                return _fail("host-backed runtime status must not keep zombie child pids under live supervision")
+
             os.kill(live_pid, signal.SIGTERM)
             _wait_dead(live_pid)
 
@@ -203,6 +329,7 @@ def main() -> int:
                 cwd=str(ROOT),
                 text=True,
                 capture_output=True,
+                env={**dict(os.environ), "LOOP_CHILD_RUNTIME_STATUS_MODE": "direct"},
             )
             if dead_status_proc.returncode != 0:
                 return _fail(f"child runtime status helper must accept a dead launch result: {dead_status_proc.stderr or dead_status_proc.stdout}")
@@ -210,11 +337,54 @@ def main() -> int:
             Draft202012Validator(status_result_schema).validate(dead_status)
             if bool(dead_status.get("pid_alive")):
                 return _fail("child runtime status helper must report pid_alive=false after the child exits")
-            if not bool(dead_status.get("recovery_eligible")):
-                return _fail("an ACTIVE node with no live pid must become recovery-eligible")
-            if str(dead_status.get("recovery_reason") or "") != "active_without_live_pid":
-                return _fail("dead ACTIVE child must explain recovery eligibility through active_without_live_pid")
+            if bool(dead_status.get("recovery_eligible")):
+                return _fail("a freshly dead ACTIVE child must stay under supervision until runtime-loss is confirmed")
+            if str(dead_status.get("recovery_reason") or "") != "active_without_live_pid_unconfirmed":
+                return _fail("freshly dead ACTIVE child must explain that runtime-loss is not yet confirmed")
+
+            launch_result_ref = Path(str(launch["launch_result_ref"])).resolve()
+            stale_epoch = time.time() - 25.0
+            for path in (
+                launch_result_ref,
+                Path(str(launch["stdout_ref"])).resolve(),
+                Path(str(launch["stderr_ref"])).resolve(),
+            ):
+                os.utime(path, (stale_epoch, stale_epoch))
+
+            confirmed_dead_status_proc = subprocess.run(
+                [
+                    str(status_script),
+                    "--result-ref",
+                    str(launch_result_ref),
+                    "--stall-threshold-s",
+                    "0",
+                ],
+                cwd=str(ROOT),
+                text=True,
+                capture_output=True,
+                env={**dict(os.environ), "LOOP_CHILD_RUNTIME_STATUS_MODE": "direct"},
+            )
+            if confirmed_dead_status_proc.returncode != 0:
+                return _fail(
+                    f"child runtime status helper must still accept a stale dead launch result: {confirmed_dead_status_proc.stderr or confirmed_dead_status_proc.stdout}"
+                )
+            confirmed_dead_status = json.loads(confirmed_dead_status_proc.stdout)
+            Draft202012Validator(status_result_schema).validate(confirmed_dead_status)
+            if not bool(confirmed_dead_status.get("recovery_eligible")):
+                return _fail("a stale dead ACTIVE child must become recovery-eligible after runtime-loss confirmation")
+            if str(confirmed_dead_status.get("recovery_reason") or "") != "active_without_live_pid":
+                return _fail("confirmed dead ACTIVE child must explain recovery eligibility through active_without_live_pid")
         finally:
+            if previous_runtime_status_mode is None:
+                os.environ.pop("LOOP_CHILD_RUNTIME_STATUS_MODE", None)
+            else:
+                os.environ["LOOP_CHILD_RUNTIME_STATUS_MODE"] = previous_runtime_status_mode
+            if zombie_parent_pid > 0:
+                try:
+                    os.kill(zombie_parent_pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                _wait_dead(zombie_parent_pid)
             if live_pid > 0:
                 try:
                     os.kill(live_pid, signal.SIGTERM)

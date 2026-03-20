@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import sys
+import time
 from pathlib import Path
 
 
@@ -59,11 +60,13 @@ def _checker_endpoint_pass() -> dict[str, object]:
             "requirement_id": "REQ-001",
             "description": "The endpoint clarification product stays runnable and documented.",
             "blocking": True,
+            "requirement_kind": "product_effect",
         },
         {
             "requirement_id": "REQ-002",
             "description": "The host adapter remains a host adapter rather than product core.",
             "blocking": True,
+            "requirement_kind": "product_effect",
         },
     ]
     return {
@@ -174,6 +177,7 @@ def _checker_single_requirement() -> dict[str, object]:
         "requirement_id": "REQ-001",
         "description": "Synthetic failure classification probe.",
         "blocking": True,
+        "requirement_kind": "product_effect",
     }
     return {
         "status": "OK",
@@ -195,11 +199,13 @@ def _checker_simple_stdout_handoff() -> dict[str, object]:
             "requirement_id": "REQ-001",
             "description": "Observe the first split effect.",
             "blocking": True,
+            "requirement_kind": "product_effect",
         },
         {
             "requirement_id": "REQ-002",
             "description": "Observe the second split effect.",
             "blocking": True,
+            "requirement_kind": "product_effect",
         },
     ]
     return {
@@ -232,11 +238,13 @@ def _checker_lane_resume_same_run() -> dict[str, object]:
             "requirement_id": "REQ-001",
             "description": "Preserve completed first-lane work across same-run resume.",
             "blocking": True,
+            "requirement_kind": "product_effect",
         },
         {
             "requirement_id": "REQ-002",
             "description": "Resume only the unfinished second lane.",
             "blocking": True,
+            "requirement_kind": "product_effect",
         },
     ]
     return {
@@ -262,6 +270,63 @@ def _checker_lane_resume_same_run() -> dict[str, object]:
     }
 
 
+def _checker_runtime_closure_requirements() -> dict[str, object]:
+    requirements = [
+        {
+            "requirement_id": "REQ-001",
+            "description": "The workspace mirror report exists and truthfully summarizes the formalization gap.",
+            "blocking": True,
+            "requirement_kind": "product_effect",
+        },
+        {
+            "requirement_id": "REQ-002",
+            "description": "The implementer run reaches and returns a terminal evaluator-backed result.",
+            "blocking": True,
+            "requirement_kind": "runtime_closure",
+        },
+    ]
+    return {
+        "status": "OK",
+        "normalized_requirements": requirements,
+        "requirement_graph": {
+            "requirements": requirements,
+            "evaluation_units": [
+                {
+                    "unit_id": "EU-MIXED",
+                    "requirement_ids": ["REQ-001", "REQ-002"],
+                }
+            ],
+            "dependency_edges": [],
+        },
+        "repair_actions": [],
+        "human_gate_reasons": [],
+        "notes": ["fixture mixes one product-facing effect with one runtime-closure effect"],
+    }
+
+
+def _checker_runtime_closure_only_requirements() -> dict[str, object]:
+    requirements = [
+        {
+            "requirement_id": "REQ-RUNTIME-ONLY",
+            "description": "The implementer run reaches and returns a terminal evaluator-backed result.",
+            "blocking": True,
+            "requirement_kind": "runtime_closure",
+        }
+    ]
+    return {
+        "status": "OK",
+        "normalized_requirements": requirements,
+        "requirement_graph": {
+            "requirements": requirements,
+            "evaluation_units": [],
+            "dependency_edges": [],
+        },
+        "repair_actions": [],
+        "human_gate_reasons": [],
+        "notes": ["fixture emits only runtime-closure requirements so the evaluator must finish without delegated lanes"],
+    }
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Repo-shipped deterministic evaluator role agent")
     parser.add_argument(
@@ -271,9 +336,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "lane_failure",
             "transient_lane_failure_once",
             "lane_resume_same_run",
+            "terminal_fail",
+            "response_then_fail",
+            "pass_with_error_words",
             "unknown_reviewer",
             "simple_stdout_handoff",
             "recursive_reviewer",
+            "runtime_closure_requirements",
+            "runtime_closure_only_requirements",
+            "linger_after_response",
         ),
         required=True,
     )
@@ -536,9 +607,152 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         raise SystemExit(f"unexpected role: {role}")
 
-    if args.scenario in {"simple_stdout_handoff", "recursive_reviewer"}:
+    if args.scenario == "pass_with_error_words":
         if role == "checker":
-            _write_json(result_path, _checker_simple_stdout_handoff())
+            _write_json(result_path, _checker_single_requirement())
+            _write_text(response_path, "# Checker\n\nSynthetic checker completed.\n")
+            return 0
+        if role == "test_designer":
+            _write_json(result_path, {"status": "OK", "notes": ["ordinary test completed"]})
+            _write_text(response_path, "# Test Designer\n\nSynthetic lane completed.\n")
+            return 0
+        if role == "ai_user":
+            _write_json(
+                result_path,
+                {
+                    "status": "OK",
+                    "operation_log_ref": "",
+                    "effect_results": [
+                        {
+                            "requirement_id": "REQ-001",
+                            "outcome": "PASS",
+                            "summary": "Synthetic user lane completed.",
+                            "evidence_refs": [str(response_path)],
+                        }
+                    ],
+                    "notes": [],
+                },
+            )
+            _write_text(response_path, "# AI-as-User\n\nSynthetic lane completed.\n")
+            return 0
+        if role == "reviewer":
+            _write_json(
+                result_path,
+                {
+                    "status": "OK",
+                    "effect_reviews": [
+                        {
+                            "requirement_id": "REQ-001",
+                            "verdict": "PASS",
+                            "evidence_refs": [str(response_path)],
+                            "reproduction_steps": ["Synthetic reviewer returned PASS with bounded-gap wording."],
+                        }
+                    ],
+                },
+            )
+            _write_text(
+                response_path,
+                "PASS.\n\nThe bounded proof uses an explicit coefficient-error hypothesis, but the reviewer verdict remains PASS.\n",
+            )
+            return 0
+        raise SystemExit(f"unexpected role: {role}")
+
+    if args.scenario == "terminal_fail":
+        if role == "checker":
+            _write_json(result_path, _checker_single_requirement())
+            _write_text(response_path, "# Checker\n\nSynthetic checker completed.\n")
+            return 0
+        if role == "test_designer":
+            _write_json(result_path, {"status": "OK", "notes": ["ordinary test completed"]})
+            _write_text(response_path, "# Test Designer\n\nSynthetic lane completed.\n")
+            return 0
+        if role == "ai_user":
+            _write_json(
+                result_path,
+                {
+                    "status": "OK",
+                    "operation_log_ref": "",
+                    "effect_results": [
+                        {
+                            "requirement_id": "REQ-001",
+                            "outcome": "FAIL",
+                            "summary": "Synthetic user lane exposed a product-facing failure.",
+                            "evidence_refs": [str(response_path)],
+                        }
+                    ],
+                    "notes": [],
+                },
+            )
+            _write_text(response_path, "# AI-as-User\n\nSynthetic lane reported a product-facing failure.\n")
+            return 0
+        if role == "reviewer":
+            _write_json(
+                result_path,
+                {
+                    "status": "OK",
+                    "effect_reviews": [
+                        {
+                            "requirement_id": "REQ-001",
+                            "verdict": "FAIL",
+                            "evidence_refs": [str(response_path)],
+                            "reproduction_steps": ["Synthetic reviewer confirmed a product-facing failure."],
+                        }
+                    ],
+                },
+            )
+            _write_text(response_path, "VERDICT: FAIL\nsummary: synthetic reviewer confirmed a product-facing failure.\n")
+            return 0
+        raise SystemExit(f"unexpected role: {role}")
+
+    if args.scenario == "response_then_fail":
+        if role == "checker":
+            _write_json(result_path, _checker_single_requirement())
+            _write_text(response_path, "# Checker\n\nResponse-then-fail checker completed.\n")
+            return 0
+        if role == "test_designer":
+            _write_text(response_path, "RESPONSE THEN FAIL :: EU-001\n")
+            time.sleep(1.5)
+            sys.stderr.write("synthetic post-response failure after terminal artifact write\n")
+            sys.stderr.flush()
+            return 23
+        if role == "ai_user":
+            _write_text(response_path, "AI USER RAW OUTPUT :: EU-001\nresult=response-then-fail\n")
+            return 0
+        if role == "reviewer":
+            _write_text(response_path, "VERDICT: PASS\nsummary: response-then-fail reviewer should stay unreachable.\n")
+            return 0
+        raise SystemExit(f"unexpected role: {role}")
+
+    if args.scenario == "linger_after_response":
+        if role == "checker":
+            _write_json(result_path, _checker_single_requirement())
+            _write_text(response_path, "# Checker\n\nLinger-after-response checker completed.\n")
+            return 0
+        if role == "test_designer":
+            _write_text(response_path, "LINGER AFTER RESPONSE :: EU-001\n")
+            time.sleep(5.0)
+            return 0
+        if role == "ai_user":
+            _write_text(response_path, "AI USER RAW OUTPUT :: EU-001\nresult=linger-after-response\n")
+            return 0
+        if role == "reviewer":
+            _write_text(response_path, "VERDICT: PASS\nsummary: linger-after-response reviewer completed.\n")
+            return 0
+        raise SystemExit(f"unexpected role: {role}")
+
+    if args.scenario in {
+        "simple_stdout_handoff",
+        "recursive_reviewer",
+        "runtime_closure_requirements",
+        "runtime_closure_only_requirements",
+    }:
+        if role == "checker":
+            if args.scenario == "runtime_closure_requirements":
+                _write_json(result_path, _checker_runtime_closure_requirements())
+            elif args.scenario == "runtime_closure_only_requirements":
+                _write_json(result_path, _checker_runtime_closure_only_requirements())
+            else:
+                _write_json(result_path, _checker_simple_stdout_handoff())
             _write_text(response_path, "# Checker\n\nNormalized the final effects.\n")
             return 0
         if role == "test_designer":

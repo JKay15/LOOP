@@ -234,7 +234,7 @@ def _check_root_agents_surface() -> list[dict[str, str]]:
         "persist or update the clarification session",
         "`apply-decision`",
         "must not merely imitate clarification behavior in free-form conversation",
-        "ask whether to proceed now",
+        "same user turn already explicitly authorizes proceeding now",
         "switch into `kernel mode`",
         "must explicitly say that it is now in `kernel mode`",
         "docs/contracts/LOOP_SYSTEM_KERNEL_CONTRACT.md",

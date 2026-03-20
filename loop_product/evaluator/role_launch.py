@@ -141,6 +141,7 @@ def build_committed_role_launch_spec(
             "cwd": str(workspace_root),
             "stdin_path": "",
             "launch_mode": "parsed_agent_cmd",
+            "provider_id": "",
         }
 
     prompt_transport = str(getattr(resolved, "prompt_transport", "") or "stdin").strip() or "stdin"
@@ -165,6 +166,7 @@ def build_committed_role_launch_spec(
         "cwd": str(workspace_root),
         "stdin_path": str(prompt_path) if stdin_path is not None else "",
         "launch_mode": "provider_argv",
+        "provider_id": provider_id,
     }
 
 
@@ -175,6 +177,10 @@ def run_committed_role_launch(
     label: str,
     timeout_s: int,
     idle_timeout_s: int,
+    terminal_success_paths: list[str] | tuple[str, ...] | None = None,
+    terminal_success_stable_s: float | None = None,
+    terminal_success_streams: list[str] | tuple[str, ...] | None = None,
+    terminal_success_patterns: list[str] | tuple[str, ...] | None = None,
     reconnect_grace_s: int,
     reconnect_max_events: int,
 ) -> Any:
@@ -186,6 +192,10 @@ def run_committed_role_launch(
         label=label,
         timeout_s=timeout_s,
         idle_timeout_s=idle_timeout_s,
+        terminal_success_paths=terminal_success_paths,
+        terminal_success_stable_s=terminal_success_stable_s,
+        terminal_success_streams=terminal_success_streams,
+        terminal_success_patterns=terminal_success_patterns,
         reconnect_grace_s=reconnect_grace_s,
         reconnect_max_events=reconnect_max_events,
         capture_text=False,

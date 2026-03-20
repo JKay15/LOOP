@@ -18,8 +18,10 @@ def _fail(msg: str) -> int:
     return 2
 
 
-def _run_helper(*, slug: str, positional: bool = False) -> str:
+def _run_helper(*, slug: str, positional: bool = False, task_type: str | None = None) -> str:
     argv = [str(SCRIPT), slug] if positional else [str(SCRIPT), "--task-slug", slug]
+    if task_type is not None:
+        argv.extend(["--task-type", task_type])
     proc = subprocess.run(
         argv,
         cwd=ROOT,
@@ -41,16 +43,21 @@ def main() -> int:
     try:
         first_rel = _run_helper(slug="apple_anime_birthday_poster")
         second_rel = _run_helper(slug="apple_anime_birthday_poster", positional=True)
+        third_rel = _run_helper(slug="apple_anime_birthday_poster", task_type="paper_slice_loop")
         if not first_rel or not second_rel:
             return _fail("helper must print a session-root path")
+        if not third_rel:
+            return _fail("helper must tolerate unsupported --task-type hints and still print a session-root path")
         if first_rel == second_rel:
             return _fail("helper must allocate a new fresh session root on each call, even across flag and positional invocation styles")
         if first_rel == ".cache/endpoint_clarification/apple_anime_birthday_poster":
             return _fail("helper must not reuse the unsafe static session-root path for fresh tasks")
         if second_rel == ".cache/endpoint_clarification/apple_anime_birthday_poster":
             return _fail("helper must not reuse the unsafe static session-root path for fresh tasks")
+        if third_rel == ".cache/endpoint_clarification/apple_anime_birthday_poster":
+            return _fail("helper must not reuse the unsafe static session-root path when task-type hint is supplied")
 
-        for rel in (first_rel, second_rel):
+        for rel in (first_rel, second_rel, third_rel):
             if not rel.startswith(".cache/endpoint_clarification/"):
                 return _fail("helper must allocate under .cache/endpoint_clarification/")
             path = ROOT / rel

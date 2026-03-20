@@ -30,6 +30,16 @@ def _load_schema(name: str) -> dict:
     return json.loads((ROOT / "docs" / "schemas" / name).read_text(encoding="utf-8"))
 
 
+def _wait_dead(pid: int, timeout_s: float = 5.0) -> None:
+    deadline = time.time() + max(0.0, float(timeout_s))
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+
+
 def main() -> int:
     from loop_product.runtime import bootstrap_first_implementer_node
 
@@ -97,61 +107,6 @@ def main() -> int:
             )
 
             script = ROOT / "scripts" / "recover_orphaned_active.sh"
-            proc = subprocess.run(
-                [
-                    str(script),
-                    "--state-root",
-                    str(state_root),
-                    "--node-id",
-                    "test-orphaned-active-recovery-helper",
-                    "--workspace-root",
-                    str(workspace_root),
-                    "--reason",
-                    "the backing child transport disconnected before any evaluator-backed result",
-                    "--self-attribution",
-                    "child_runtime_detached_network_disconnect",
-                    "--self-repair",
-                    "restart the same implementer node from the latest durable checkpoint",
-                    "--observation-kind",
-                    "child_runtime_detached",
-                    "--summary",
-                    "authoritative state still showed ACTIVE but the backing child session disappeared",
-                    "--evidence-ref",
-                    "child_session:missing",
-                ],
-                cwd=str(ROOT),
-                text=True,
-                capture_output=True,
-            )
-            if proc.returncode != 0:
-                return _fail(f"recovery helper wrapper must accept direct structured flags: {proc.stderr or proc.stdout}")
-
-            recovery = json.loads(proc.stdout)
-            Draft202012Validator(result_schema).validate(recovery)
-
-            if recovery.get("recovery_decision") != "accepted":
-                return _fail(f"recovery helper must accept an orphaned-active retry, got {recovery.get('recovery_decision')!r}")
-            if recovery.get("node_id") != bootstrap["node_id"]:
-                return _fail("recovery helper must target the same node id")
-            if recovery.get("workspace_root") != str(workspace_root.resolve()):
-                return _fail("recovery helper must preserve the exact workspace_root")
-
-            launch_spec = recovery.get("launch_spec") or {}
-            argv = list(launch_spec.get("argv") or [])
-            if "-C" not in argv or str(workspace_root.resolve()) not in argv:
-                return _fail("recovery helper must relaunch through codex exec pinned to the same workspace root")
-            if launch_spec.get("stdin_path") != str((workspace_root / "CHILD_PROMPT.md").resolve()):
-                return _fail("recovery helper must relaunch the same child prompt")
-
-            request_ref = Path(str(recovery.get("recovery_request_ref") or ""))
-            result_ref = Path(str(recovery.get("recovery_result_ref") or ""))
-            if not request_ref.exists() or not result_ref.exists():
-                return _fail("recovery helper must persist both request and result artifacts")
-
-            runtime_state = json.loads((state_root / "state" / "test-orphaned-active-recovery-helper.json").read_text(encoding="utf-8")).get("runtime_state") or {}
-            if str(runtime_state.get("attachment_state") or "") != "UNOBSERVED":
-                return _fail("accepted retry must reset the node runtime attachment to UNOBSERVED")
-
             bad_proc = subprocess.run(
                 [
                     str(script),
@@ -233,6 +188,134 @@ def main() -> int:
             if live_pid <= 0:
                 return _fail("pre-existing recovery live launch must preserve a positive pid")
 
+            premature_recovery_proc = subprocess.run(
+                [
+                    str(script),
+                    "--state-root",
+                    str(state_root),
+                    "--node-id",
+                    "test-orphaned-active-recovery-helper",
+                    "--workspace-root",
+                    str(workspace_root),
+                    "--reason",
+                    "the backing child transport disconnected before any evaluator-backed result",
+                    "--self-attribution",
+                    "child_runtime_detached_network_disconnect",
+                    "--self-repair",
+                    "restart the same implementer node from the latest durable checkpoint",
+                    "--observation-kind",
+                    "child_runtime_detached",
+                    "--summary",
+                    "authoritative state still showed ACTIVE but the backing child session disappeared",
+                    "--evidence-ref",
+                    str(Path(str(live_launch.get("launch_result_ref") or "")).resolve()),
+                ],
+                cwd=str(ROOT),
+                text=True,
+                capture_output=True,
+            )
+            if premature_recovery_proc.returncode == 0:
+                return _fail("recovery helper must reject same-node retry while the latest child pid is still live")
+
+            os.kill(live_pid, signal.SIGTERM)
+            _wait_dead(live_pid)
+
+            stale_epoch = time.time() - 25.0
+            for path in (
+                Path(str(live_launch.get("launch_result_ref") or "")).resolve(),
+                Path(str(live_launch.get("stdout_ref") or "")).resolve(),
+                Path(str(live_launch.get("stderr_ref") or "")).resolve(),
+            ):
+                os.utime(path, (stale_epoch, stale_epoch))
+
+            live_status_proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "loop_product.runtime.lifecycle",
+                    "child-runtime-status",
+                    "--result-ref",
+                    str(Path(str(live_launch.get("launch_result_ref") or "")).resolve()),
+                ],
+                cwd=str(ROOT),
+                text=True,
+                capture_output=True,
+                env={**dict(os.environ), "LOOP_CHILD_RUNTIME_STATUS_MODE": "direct"},
+            )
+            if live_status_proc.returncode != 0:
+                return _fail(f"fresh runtime status query must succeed before direct structured recovery: {live_status_proc.stderr or live_status_proc.stdout}")
+            live_status = json.loads(live_status_proc.stdout)
+            live_status_ref = Path(str(live_status.get("status_result_ref") or "")).resolve()
+            if not live_status_ref.exists():
+                return _fail("fresh runtime status query must persist a status_result_ref before recovery")
+
+            proc = subprocess.run(
+                [
+                    str(script),
+                    "--state-root",
+                    str(state_root),
+                    "--node-id",
+                    "test-orphaned-active-recovery-helper",
+                    "--workspace-root",
+                    str(workspace_root),
+                    "--confirmed-launch-result-ref",
+                    str(Path(str(live_launch.get("launch_result_ref") or "")).resolve()),
+                    "--confirmed-runtime-status-ref",
+                    str(live_status_ref),
+                    "--reason",
+                    "the backing child transport disconnected before any evaluator-backed result",
+                    "--self-attribution",
+                    "child_runtime_detached_network_disconnect",
+                    "--self-repair",
+                    "restart the same implementer node from the latest durable checkpoint",
+                    "--observation-kind",
+                    "child_runtime_detached",
+                    "--summary",
+                    "authoritative state still showed ACTIVE but the backing child session disappeared",
+                    "--evidence-ref",
+                    str(Path(str(live_launch.get("launch_result_ref") or "")).resolve()),
+                ],
+                cwd=str(ROOT),
+                text=True,
+                capture_output=True,
+            )
+            if proc.returncode != 0:
+                return _fail(f"recovery helper wrapper must accept direct structured flags after confirmed runtime loss: {proc.stderr or proc.stdout}")
+
+            recovery = json.loads(proc.stdout)
+            Draft202012Validator(result_schema).validate(recovery)
+
+            if recovery.get("recovery_decision") != "accepted":
+                return _fail(f"recovery helper must accept an orphaned-active retry, got {recovery.get('recovery_decision')!r}")
+            if recovery.get("node_id") != bootstrap["node_id"]:
+                return _fail("recovery helper must target the same node id")
+            if recovery.get("workspace_root") != str(workspace_root.resolve()):
+                return _fail("recovery helper must preserve the exact workspace_root")
+
+            launch_spec = recovery.get("launch_spec") or {}
+            argv = list(launch_spec.get("argv") or [])
+            if "-C" not in argv or str(workspace_root.resolve()) not in argv:
+                return _fail("recovery helper must relaunch through codex exec pinned to the same workspace root")
+            if launch_spec.get("stdin_path") != str((workspace_root / "CHILD_PROMPT.md").resolve()):
+                return _fail("recovery helper must relaunch the same child prompt")
+
+            request_ref = Path(str(recovery.get("recovery_request_ref") or ""))
+            result_ref = Path(str(recovery.get("recovery_result_ref") or ""))
+            if not request_ref.exists() or not result_ref.exists():
+                return _fail("recovery helper must persist both request and result artifacts")
+
+            runtime_state = json.loads((state_root / "state" / "test-orphaned-active-recovery-helper.json").read_text(encoding="utf-8")).get("runtime_state") or {}
+            if str(runtime_state.get("attachment_state") or "") != "UNOBSERVED":
+                return _fail("accepted retry must reset the node runtime attachment to UNOBSERVED")
+
+            if Path(str(recovery.get("confirmed_launch_result_ref") or "")).resolve() != Path(str(live_launch.get("launch_result_ref") or "")).resolve():
+                return _fail("recovery helper must record which committed launch result was freshly rechecked")
+            confirmed_status_ref = Path(str(recovery.get("confirmed_runtime_status_ref") or ""))
+            if not confirmed_status_ref.exists():
+                return _fail("accepted orphaned-active recovery must persist the fresh runtime status it relied on")
+            if str(recovery.get("confirmed_runtime_recovery_reason") or "") != "active_without_live_pid":
+                return _fail("accepted orphaned-active recovery must explain the confirmed runtime-loss reason")
+
             reused_launch_proc = subprocess.run(
                 [
                     str(launch_script),
@@ -252,23 +335,54 @@ def main() -> int:
                 return _fail(f"launching from recovery result must still return structured reuse output: {reused_launch_proc.stderr or reused_launch_proc.stdout}")
             reused_launch = json.loads(reused_launch_proc.stdout)
             Draft202012Validator(launch_result_schema).validate(reused_launch)
-            if str(reused_launch.get("launch_decision") or "") != "started_existing":
-                return _fail("recovery launch must reuse an already-live same-node child instead of starting a duplicate process")
-            if int(reused_launch.get("pid") or 0) != live_pid:
-                return _fail("recovery reuse launch must point at the exact existing child pid")
+            if str(reused_launch.get("launch_decision") or "") != "started":
+                return _fail("launching from an accepted recovery result must start a replacement child once the original pid is gone")
+
+            reused_pid = int(reused_launch.get("pid") or 0)
+            if reused_pid <= 0:
+                return _fail("launching from an accepted recovery result must preserve a positive replacement pid")
+
+            reused_launch_again_proc = subprocess.run(
+                [
+                    str(launch_script),
+                    "--result-ref",
+                    str(result_ref.resolve()),
+                    "--startup-probe-ms",
+                    "50",
+                    "--startup-health-timeout-ms",
+                    "250",
+                ],
+                cwd=str(ROOT),
+                text=True,
+                capture_output=True,
+                env={**dict(os.environ), "LOOP_CHILD_LAUNCH_MODE": "direct"},
+            )
+            if reused_launch_again_proc.returncode != 0:
+                return _fail(
+                    f"launching again from the same recovery result must return structured reuse output: {reused_launch_again_proc.stderr or reused_launch_again_proc.stdout}"
+                )
+            reused_launch_again = json.loads(reused_launch_again_proc.stdout)
+            Draft202012Validator(launch_result_schema).validate(reused_launch_again)
+            if str(reused_launch_again.get("launch_decision") or "") != "started_existing":
+                return _fail("recovery launch must reuse the replacement child after it becomes the live same-node process")
+            if int(reused_launch_again.get("pid") or 0) != reused_pid:
+                return _fail("recovery reuse launch must point at the exact live replacement child pid")
         finally:
-            try:
-                if 'live_pid' in locals() and live_pid > 0:
-                    os.kill(live_pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            deadline = time.time() + 5.0
-            while 'live_pid' in locals() and live_pid > 0 and time.time() < deadline:
+            for pid_name in ("live_pid", "reused_pid"):
+                pid_value = locals().get(pid_name, 0)
+                if not isinstance(pid_value, int) or pid_value <= 0:
+                    continue
                 try:
-                    os.kill(live_pid, 0)
+                    os.kill(pid_value, signal.SIGTERM)
                 except ProcessLookupError:
-                    break
-                time.sleep(0.05)
+                    continue
+                deadline = time.time() + 5.0
+                while time.time() < deadline:
+                    try:
+                        os.kill(pid_value, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.05)
             shutil.rmtree(workspace_root, ignore_errors=True)
             shutil.rmtree(state_root, ignore_errors=True)
 

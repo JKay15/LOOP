@@ -37,6 +37,7 @@ Within this repository's Codex host environment:
 8. If front-half returns `BYPASS`, the conversation may continue into downstream work.
 9. If front-half enters an active clarification session, later ordinary conversation turns for the same task must continue against that same exact session root until clarification terminates or downstream handling takes over.
 10. If the default clarification policy path has trouble, the host should rely on the front-half built-in fallback before resorting to host-controlled policy injection.
+11. If the same user turn already explicitly authorizes immediate downstream execution and clarification becomes sufficient on that turn, the host should persist confirmation and continue directly instead of forcing a second proceed-now turn.
 
 ## Boundary
 

@@ -34,13 +34,17 @@ description: Run one bounded LOOP node round using the repo-local kernel, dispat
 - Attempt evaluator before you present a terminal blocked or incomplete round result.
 - A report whose effective meaning is `request_ref: none` and `evaluation_report_ref: none` is non-terminal by default.
 - If you discover a fixable product defect before evaluator starts, treat that as more implementation work, not as a blocked outcome; repair the fixable product defect and continue until you can attempt evaluator.
+- If evaluator reaches a terminal `FAIL` because the current artifact still misses product requirements, treat that as more implementation work by default; repair and rerun evaluator unless the failure is explicitly outside your authority or the frozen scope.
 - The only acceptable pre-attempt blocked case is an external prerequisite blocker outside your authority.
+- If bounded progress reveals a meaningful parallelizable gap, surface a split request upward with the proposed child slices, dependency reasoning, and why the current node should no longer own all remaining work alone.
+- Do not treat a possible split as local permission to spawn helpers or mutate topology yourself; split stays a kernel-reviewed fact until kernel accepts it.
 - If an evaluator in flight already exists, stay attached to the same evaluator attempt until a terminal evaluator result, confirmed `BUG`, confirmed `STUCK`, or explicit supersession backed by concrete failure evidence.
 - Treat a short `wait_agent` timeout as only a heartbeat window; ordinary waiting after evaluator launch should allow a `wait_agent` timeout of at least 600000 ms (10 minutes), so temporary silence is not permission to abandon the in-flight evaluator.
 - If an evaluator in flight already exists, do not open a simpler or lower-fidelity fallback or a second backup evaluator lane just because the current root poll window expired.
 - If the kernel sends a heartbeat ping, reply with a compact status packet containing `phase`, `evaluator_state`, `request_ref`, `evaluation_report_ref`, `same_attempt`, `stalled`, and `next_action`, then continue the same attempt.
 - before claiming completion, require a terminal evaluator result or an evaluator-owned blocked outcome.
 - If you do not have those evaluator refs, report the round as incomplete or blocked instead of presenting local spot checks as completion evidence.
+- In your terminal report, say whether split was proposed, accepted, rejected, or never requested so root closeout can report the split path truthfully.
 - Record roundbook entries and local control output.
 
 ## Not responsible for

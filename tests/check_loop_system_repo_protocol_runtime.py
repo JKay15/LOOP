@@ -397,6 +397,8 @@ def main() -> int:
             return _fail("loop_product.runtime must expose the endpoint-driven first-child bootstrap surface")
         if "child_runtime_status_from_launch_result_ref" not in runtime_exports:
             return _fail("loop_product.runtime must expose the committed child-runtime status surface")
+        if "supervise_child_until_settled" not in runtime_exports:
+            return _fail("loop_product.runtime must expose the committed root-side child supervision surface")
 
         routed = kernel_surface.route_user_requirements(
             state_root,

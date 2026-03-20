@@ -6,7 +6,9 @@ from datetime import datetime
 import json
 import os
 import re
+import signal
 import shlex
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -19,6 +21,10 @@ from loop_product.ai_launch import (
     terminate_ai_launch,
 )
 from loop_product.host_child_launch import request_host_child_launch, should_request_host_child_launch
+from loop_product.host_child_runtime_status import (
+    request_host_child_runtime_status,
+    should_request_host_child_runtime_status,
+)
 from loop_product.protocols.node import normalize_runtime_state
 from loop_product.protocols.schema import validate_repo_object
 from loop_product.runtime_paths import require_runtime_root
@@ -27,6 +33,7 @@ DEFAULT_STARTUP_RETRY_LIMIT = 1
 DEFAULT_STARTUP_HEALTH_TIMEOUT_MS = 12000
 _STARTUP_HEALTH_POLL_MS = 250
 _STARTUP_PROGRESS_RE = re.compile(r"(?m)^(thinking|codex|exec|assistant)$")
+RUNTIME_LOSS_CONFIRMATION_S = 20.0
 
 
 def _nonempty(value: Any) -> str:
@@ -40,6 +47,13 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _authoritative_result_ref(*, state_root: Path, node_id: str, node_payload: dict[str, Any]) -> Path:
+    sink = str(node_payload.get("result_sink_ref") or "").strip()
+    if not sink:
+        sink = f"artifacts/{node_id}/implementer_result.json"
+    return (state_root / sink).resolve()
 
 
 def _normalize_launch_request(
@@ -106,6 +120,19 @@ def _normalize_runtime_status_result(
     return normalized
 
 
+def _load_terminal_implementer_result(*, state_root: Path, node_id: str, node_payload: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
+    result_ref = _authoritative_result_ref(state_root=state_root, node_id=node_id, node_payload=node_payload)
+    if not result_ref.exists():
+        return result_ref, {}
+    try:
+        payload = _load_json(result_ref)
+    except Exception:
+        return result_ref, {}
+    if str(payload.get("status") or "").strip().upper() != "COMPLETED":
+        return result_ref, {}
+    return result_ref, payload
+
+
 def _next_launch_attempt_dir(state_root: Path, node_id: str) -> Path:
     base = state_root / "artifacts" / "launches" / node_id
     suffix = 1
@@ -118,10 +145,87 @@ def _next_launch_attempt_dir(state_root: Path, node_id: str) -> Path:
 
 def _pid_alive(pid: int) -> bool:
     try:
-        os.kill(int(pid), 0)
-    except (ProcessLookupError, PermissionError, ValueError, OSError):
+        candidate = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if candidate <= 0:
+        return False
+    try:
+        os.kill(candidate, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return _pid_visible_via_ps(candidate)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == 1:
+            return _pid_visible_via_ps(candidate)
+        return False
+    if _pid_is_zombie(candidate):
         return False
     return True
+
+
+def _pid_visible_via_ps(pid: int) -> bool:
+    for _ in range(3):
+        try:
+            proc = subprocess.run(
+                ["ps", "-p", str(int(pid)), "-o", "pid="],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        except Exception:
+            return False
+        if proc.returncode == 0 and str(pid) in {line.strip() for line in str(proc.stdout or "").splitlines() if line.strip()}:
+            return not _pid_is_zombie(pid)
+        time.sleep(0.1)
+    return False
+
+
+def _pid_is_zombie(pid: int) -> bool:
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(int(pid)), "-o", "stat="],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except Exception:
+        return False
+    if proc.returncode != 0:
+        return False
+    stat = str(proc.stdout or "").strip().upper()
+    return stat.startswith("Z") or " Z" in stat
+
+
+def _terminate_pid(pid: int, *, grace_s: float = 0.75) -> None:
+    if pid <= 0:
+        return
+    if not _pid_alive(pid):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError:
+        return
+    deadline = time.monotonic() + max(0.1, grace_s)
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.05)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except OSError:
+        return
+
+
+def _reap_runtime_owned_launch(launch_result: dict[str, Any]) -> None:
+    pid = int(launch_result.get("pid") or 0)
+    if pid > 0:
+        _terminate_pid(pid)
 
 
 def _existing_live_launch_result(*, state_root: Path, node_id: str, workspace_root: Path) -> dict[str, Any] | None:
@@ -198,6 +302,21 @@ def _wrapper_prefix() -> tuple[list[str], str]:
     if not prefix:
         return [], ""
     return prefix, raw
+
+
+def _child_launch_env_overrides() -> dict[str, str]:
+    sanitized_parent_codex_env = {
+        key: ""
+        for key in os.environ
+        if key.startswith("CODEX_") and key != "CODEX_HOME"
+    }
+    return {
+        **sanitized_parent_codex_env,
+        "OTEL_SDK_DISABLED": "true",
+        "OTEL_TRACES_EXPORTER": "none",
+        "OTEL_METRICS_EXPORTER": "none",
+        "OTEL_LOGS_EXPORTER": "none",
+    }
 
 
 def _classify_retryable_failure(*, stdout_path: Path, stderr_path: Path) -> str:
@@ -296,12 +415,16 @@ def _launch_once(
     _write_json(request_ref, request)
 
     argv = wrapper_prefix + list(launch_spec["argv"])
+    launch_env = {
+        **dict(launch_spec.get("env") or {}),
+        **_child_launch_env_overrides(),
+    }
     handle = start_ai_launch(
         cmd=argv,
         cwd=Path(launch_spec["cwd"]).expanduser().resolve(),
         log_dir=log_dir,
         label=request["node_id"],
-        env=dict(launch_spec.get("env") or {}),
+        env=launch_env,
         stdin_path=Path(launch_spec["stdin_path"]).expanduser().resolve(),
         start_new_session=False,
     )
@@ -343,44 +466,12 @@ def _launch_once(
     }
 
 
-def launch_child_from_result_ref(
+def _direct_launch_child_from_request(
     *,
-    result_ref: str | Path,
-    startup_probe_ms: int = 1500,
-    startup_health_timeout_ms: int = DEFAULT_STARTUP_HEALTH_TIMEOUT_MS,
+    request: dict[str, Any],
+    state_root: Path,
+    workspace_root: Path,
 ) -> dict[str, Any]:
-    """Launch a materialized child from a bootstrap/recovery result that carries launch_spec."""
-
-    result_path = Path(result_ref).expanduser().resolve()
-    payload = json.loads(result_path.read_text(encoding="utf-8"))
-    request = _normalize_launch_request(
-        source_result_ref=str(result_path),
-        payload=payload,
-        startup_probe_ms=startup_probe_ms,
-        startup_health_timeout_ms=startup_health_timeout_ms,
-    )
-    state_root = require_runtime_root(Path(request["state_root"]).expanduser().resolve())
-    workspace_root = Path(request["workspace_root"]).expanduser().resolve()
-    existing_live = _existing_live_launch_result(
-        state_root=state_root,
-        node_id=str(request["node_id"]),
-        workspace_root=workspace_root,
-    )
-    if existing_live is not None:
-        return _persist_reused_launch_result(
-            request=request,
-            state_root=state_root,
-            workspace_root=workspace_root,
-            existing=existing_live,
-        )
-    if should_request_host_child_launch():
-        return request_host_child_launch(
-            source_result_ref=request["source_result_ref"],
-            node_id=str(request["node_id"]),
-            state_root=state_root,
-            startup_probe_ms=int(request["startup_probe_ms"]),
-            startup_health_timeout_ms=int(request["startup_health_timeout_ms"]),
-        )
     wrapper_prefix, wrapper_cmd = _wrapper_prefix()
     attempts: list[dict[str, Any]] = []
     final_attempt: dict[str, Any] | None = None
@@ -437,13 +528,65 @@ def launch_child_from_result_ref(
     return result_payload
 
 
-def child_runtime_status_from_launch_result_ref(
+def launch_child_from_result_ref(
+    *,
+    result_ref: str | Path,
+    startup_probe_ms: int = 1500,
+    startup_health_timeout_ms: int = DEFAULT_STARTUP_HEALTH_TIMEOUT_MS,
+) -> dict[str, Any]:
+    """Launch a materialized child from a bootstrap/recovery result that carries launch_spec."""
+
+    result_path = Path(result_ref).expanduser().resolve()
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    request = _normalize_launch_request(
+        source_result_ref=str(result_path),
+        payload=payload,
+        startup_probe_ms=startup_probe_ms,
+        startup_health_timeout_ms=startup_health_timeout_ms,
+    )
+    state_root = require_runtime_root(Path(request["state_root"]).expanduser().resolve())
+    workspace_root = Path(request["workspace_root"]).expanduser().resolve()
+    existing_live = _existing_live_launch_result(
+        state_root=state_root,
+        node_id=str(request["node_id"]),
+        workspace_root=workspace_root,
+    )
+    if existing_live is not None:
+        return _persist_reused_launch_result(
+            request=request,
+            state_root=state_root,
+            workspace_root=workspace_root,
+            existing=existing_live,
+        )
+    if should_request_host_child_launch():
+        payload = request_host_child_launch(
+            source_result_ref=request["source_result_ref"],
+            node_id=str(request["node_id"]),
+            state_root=state_root,
+            startup_probe_ms=int(request["startup_probe_ms"]),
+            startup_health_timeout_ms=int(request["startup_health_timeout_ms"]),
+        )
+        pid = int(payload.get("pid") or 0)
+        launch_decision = str(payload.get("launch_decision") or "")
+        if launch_decision in {"started", "started_existing"} and pid > 0 and not _pid_alive(pid):
+            return _direct_launch_child_from_request(
+                request=request,
+                state_root=state_root,
+                workspace_root=workspace_root,
+            )
+        return payload
+    return _direct_launch_child_from_request(
+        request=request,
+        state_root=state_root,
+        workspace_root=workspace_root,
+    )
+
+
+def _direct_child_runtime_status_from_launch_result_ref(
     *,
     result_ref: str | Path,
     stall_threshold_s: float = 60.0,
 ) -> dict[str, Any]:
-    """Summarize current child-runtime status from a committed ChildLaunchResult."""
-
     result_path = Path(result_ref).expanduser().resolve()
     launch_result = _load_json(result_path)
     validate_repo_object("LoopChildLaunchResult.schema.json", launch_result)
@@ -453,6 +596,11 @@ def child_runtime_status_from_launch_result_ref(
     node_ref = state_root / "state" / f"{node_id}.json"
     node_payload = _load_json(node_ref) if node_ref.exists() else {}
     runtime_state = normalize_runtime_state(dict(node_payload.get("runtime_state") or {}))
+    terminal_result_ref, terminal_result_payload = _load_terminal_implementer_result(
+        state_root=state_root,
+        node_id=node_id,
+        node_payload=node_payload,
+    )
 
     pid = int(launch_result.get("pid") or 0)
     pid_alive = pid > 0 and _pid_alive(pid)
@@ -467,20 +615,53 @@ def child_runtime_status_from_launch_result_ref(
     latest_log_age_s = max(0.0, now - latest_log_epoch)
     launch_decision = str(launch_result.get("launch_decision") or "")
     lifecycle_status = str(node_payload.get("status") or "")
+    runtime_attachment_state = str(runtime_state.get("attachment_state") or "")
+    runtime_observed_at = str(runtime_state.get("observed_at") or "")
+    runtime_observation_kind = str(runtime_state.get("observation_kind") or "")
+    runtime_summary = str(runtime_state.get("summary") or "")
+    runtime_evidence_refs = list(runtime_state.get("evidence_refs") or [])
 
-    stalled_hint = bool(
-        pid_alive
-        and launch_decision in {"started", "started_existing"}
-        and lifecycle_status == "ACTIVE"
-        and latest_log_age_s >= max(0.0, float(stall_threshold_s))
-    )
-    recovery_eligible = bool(not pid_alive and lifecycle_status == "ACTIVE")
-    if pid_alive:
-        recovery_reason = "live_pid_still_attached"
-    elif lifecycle_status != "ACTIVE":
-        recovery_reason = f"node_status_{lifecycle_status.lower() or 'unknown'}"
+    if terminal_result_payload:
+        _reap_runtime_owned_launch(launch_result)
+        pid_alive = pid > 0 and _pid_alive(pid)
+        lifecycle_status = "COMPLETED"
+        runtime_attachment_state = "TERMINAL"
+        runtime_observed_at = str(terminal_result_payload.get("completed_at_utc") or runtime_observed_at)
+        runtime_observation_kind = "terminal_result"
+        runtime_summary = str(terminal_result_payload.get("summary") or runtime_summary or "authoritative terminal result present")
+        runtime_evidence_refs = [
+            str(terminal_result_ref.resolve()),
+            *[str(item) for item in runtime_evidence_refs],
+        ]
+        stalled_hint = False
+        recovery_eligible = False
+        recovery_reason = "authoritative_terminal_result"
     else:
-        recovery_reason = "active_without_live_pid"
+        runtime_loss_confirmed = bool(
+            not pid_alive
+            and lifecycle_status == "ACTIVE"
+            and (
+                launch_result.get("exit_code") not in (None, "")
+                or latest_log_age_s >= RUNTIME_LOSS_CONFIRMATION_S
+                or str(runtime_state.get("attachment_state") or "").upper() == "LOST"
+            )
+        )
+
+        stalled_hint = bool(
+            pid_alive
+            and launch_decision in {"started", "started_existing"}
+            and lifecycle_status == "ACTIVE"
+            and latest_log_age_s >= max(0.0, float(stall_threshold_s))
+        )
+        recovery_eligible = runtime_loss_confirmed
+        if pid_alive:
+            recovery_reason = "live_pid_still_attached"
+        elif lifecycle_status != "ACTIVE":
+            recovery_reason = f"node_status_{lifecycle_status.lower() or 'unknown'}"
+        elif not runtime_loss_confirmed:
+            recovery_reason = "active_without_live_pid_unconfirmed"
+        else:
+            recovery_reason = "active_without_live_pid"
 
     status_result_ref = result_path.parent / "ChildRuntimeStatusResult.json"
     payload = _normalize_runtime_status_result(
@@ -496,11 +677,11 @@ def child_runtime_status_from_launch_result_ref(
             "pid_alive": pid_alive,
             "exit_code": launch_result.get("exit_code"),
             "lifecycle_status": lifecycle_status,
-            "runtime_attachment_state": str(runtime_state.get("attachment_state") or ""),
-            "runtime_observed_at": str(runtime_state.get("observed_at") or ""),
-            "runtime_observation_kind": str(runtime_state.get("observation_kind") or ""),
-            "runtime_summary": str(runtime_state.get("summary") or ""),
-            "runtime_evidence_refs": list(runtime_state.get("evidence_refs") or []),
+            "runtime_attachment_state": runtime_attachment_state,
+            "runtime_observed_at": runtime_observed_at,
+            "runtime_observation_kind": runtime_observation_kind,
+            "runtime_summary": runtime_summary,
+            "runtime_evidence_refs": runtime_evidence_refs,
             "stdout_ref": str(stdout_path.resolve()),
             "stderr_ref": str(stderr_path.resolve()),
             "latest_log_ref": str(latest_log_ref.resolve()),
@@ -514,3 +695,29 @@ def child_runtime_status_from_launch_result_ref(
     )
     _write_json(status_result_ref, payload)
     return payload
+
+
+def child_runtime_status_from_launch_result_ref(
+    *,
+    result_ref: str | Path,
+    stall_threshold_s: float = 60.0,
+) -> dict[str, Any]:
+    """Summarize current child-runtime status from a committed ChildLaunchResult."""
+
+    if should_request_host_child_runtime_status():
+        payload = request_host_child_runtime_status(
+            launch_result_ref=str(Path(result_ref).expanduser().resolve()),
+            stall_threshold_s=float(stall_threshold_s),
+        )
+        pid = int(payload.get("pid") or 0)
+        if bool(payload.get("pid_alive")) and pid > 0 and not _pid_alive(pid):
+            return _direct_child_runtime_status_from_launch_result_ref(
+                result_ref=result_ref,
+                stall_threshold_s=stall_threshold_s,
+            )
+        return payload
+
+    return _direct_child_runtime_status_from_launch_result_ref(
+        result_ref=result_ref,
+        stall_threshold_s=stall_threshold_s,
+    )

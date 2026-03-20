@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 
@@ -28,11 +29,14 @@ def main() -> int:
 
     workspace_root = ROOT / "workspace" / "test-host-child-launch-supervisor"
     state_root = ROOT / ".loop" / "test-host-child-launch-supervisor"
+    idle_repo_root = ROOT / ".loop" / "test-host-child-launch-supervisor-idle-root"
     try:
         shutil.rmtree(workspace_root, ignore_errors=True)
         shutil.rmtree(state_root, ignore_errors=True)
+        shutil.rmtree(idle_repo_root, ignore_errors=True)
         shutil.rmtree(ROOT / ".loop" / "host_child_launch_requests", ignore_errors=True)
         workspace_root.mkdir(parents=True, exist_ok=True)
+        idle_repo_root.mkdir(parents=True, exist_ok=True)
         (state_root / "artifacts" / "bootstrap").mkdir(parents=True, exist_ok=True)
         prompt_path = workspace_root / "CHILD_PROMPT.md"
         prompt_path.write_text("PROMPT\n", encoding="utf-8")
@@ -100,11 +104,18 @@ def main() -> int:
 
         original_supervisor_launch = supervisor_module.launch_child_from_result_ref
         try:
-            supervisor_module.launch_child_from_result_ref = lambda **kwargs: {
-                "launch_decision": "started",
-                "node_id": "test-host-child-launch-supervisor",
-                "echo_source_result_ref": kwargs.get("result_ref"),
-            }
+            captured_env: dict[str, str] = {}
+
+            def _fake_supervisor_launch(**kwargs: object) -> dict[str, object]:
+                captured_env["launch_mode"] = str(os.environ.get("LOOP_CHILD_LAUNCH_MODE") or "")
+                captured_env["bridge_mode"] = str(os.environ.get("LOOP_CHILD_LAUNCH_BRIDGE_MODE") or "")
+                return {
+                    "launch_decision": "started",
+                    "node_id": "test-host-child-launch-supervisor",
+                    "echo_source_result_ref": kwargs.get("result_ref"),
+                }
+
+            supervisor_module.launch_child_from_result_ref = _fake_supervisor_launch
             processed = supervisor_module.process_pending_requests(repo_root=ROOT)
             if processed != 1:
                 return _fail("host child launch supervisor must process the pending request exactly once")
@@ -116,11 +127,34 @@ def main() -> int:
             child_result = dict(response_payload.get("child_launch_result") or {})
             if str(child_result.get("echo_source_result_ref") or "") != str(result_path.resolve()):
                 return _fail("host child launch supervisor must pass the exact source result ref into direct launch")
+            if captured_env.get("launch_mode") != "direct":
+                return _fail("host child launch supervisor must force direct child launch mode while consuming requests")
+            if captured_env.get("bridge_mode") != "direct":
+                return _fail("host child launch supervisor must force direct bridge mode while consuming requests")
         finally:
             supervisor_module.launch_child_from_result_ref = original_supervisor_launch
+
+        runtime_payload = supervisor_module.ensure_host_child_launch_supervisor_running(
+            repo_root=idle_repo_root,
+            poll_interval_s=0.05,
+            idle_exit_after_s=0.15,
+        )
+        runtime_ref = supervisor_module.supervisor_runtime_ref(repo_root=idle_repo_root)
+        if not runtime_ref.exists():
+            return _fail("auto-started host child launch supervisor must persist a runtime marker while it is live")
+        if int(runtime_payload.get("pid") or 0) <= 0:
+            return _fail("auto-started host child launch supervisor must report a live pid")
+        deadline = time.time() + 3.0
+        while runtime_ref.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        if runtime_ref.exists():
+            return _fail("idle host child launch supervisor must clean up its runtime marker after exiting")
+        if supervisor_module.live_supervisor_runtime(repo_root=idle_repo_root) is not None:
+            return _fail("idle host child launch supervisor must not remain reported as live after idle exit")
     finally:
         shutil.rmtree(workspace_root, ignore_errors=True)
         shutil.rmtree(state_root, ignore_errors=True)
+        shutil.rmtree(idle_repo_root, ignore_errors=True)
         shutil.rmtree(ROOT / ".loop" / "host_child_launch_requests", ignore_errors=True)
 
     print("[loop-system-host-child-launch-supervisor] OK")

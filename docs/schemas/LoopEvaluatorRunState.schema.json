@@ -146,6 +146,7 @@
             "PENDING",
             "RUNNING",
             "COMPLETED",
+            "SKIPPED",
             "BLOCKED_RETRYABLE",
             "BLOCKED_TERMINAL"
           ],
@@ -228,6 +229,7 @@
             "PENDING",
             "RUNNING",
             "COMPLETED",
+            "SKIPPED",
             "BLOCKED_RETRYABLE",
             "BLOCKED_TERMINAL"
           ],
@@ -350,6 +352,13 @@
       },
       "type": "array"
     },
+    "runtime_closure_requirements": {
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "type": "array"
+    },
     "final_effects_text_ref": {
       "minLength": 1,
       "type": "string"
@@ -425,6 +434,7 @@
     "status",
     "checker",
     "final_effect_requirements",
+    "runtime_closure_requirements",
     "lane_plan",
     "lanes_by_unit_id",
     "reviewer",

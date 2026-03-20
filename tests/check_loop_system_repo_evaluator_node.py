@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import json
 import inspect
+import os
 import shlex
 import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -216,6 +218,103 @@ def _write_stub_agent(path: Path) -> None:
                         "VERDICT: PASS\\nsummary: stub reviewer completed with reviewer-visible evidence.\\n",
                     )
                     return 0
+                raise SystemExit(f"unexpected role: {role}")
+
+
+            if __name__ == "__main__":
+                raise SystemExit(main())
+            """
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def _write_fake_codex_cli(path: Path) -> None:
+    path.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            from __future__ import annotations
+
+            import json
+            import os
+            import sys
+            import time
+            from pathlib import Path
+
+
+            def _write_json(path: Path, obj: object) -> None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\\n", encoding="utf-8")
+
+
+            def _write_text(path: Path, text: str) -> None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+
+
+            def main() -> int:
+                argv = sys.argv[1:]
+                if not argv or argv[0] != "exec":
+                    raise SystemExit(f"unexpected argv: {argv!r}")
+
+                role = str(os.environ["LOOP_PRODUCT_EVAL_ROLE"]).strip()
+                result_path = Path(os.environ["LOOP_PRODUCT_EVAL_RESULT_PATH"])
+                response_path = Path(os.environ["LOOP_PRODUCT_EVAL_RESPONSE_PATH"])
+                operation_log_raw = os.environ.get("LOOP_PRODUCT_EVAL_OPERATION_LOG_PATH", "").strip()
+                operation_log_path = Path(operation_log_raw) if operation_log_raw else None
+                test_designer_mode = str(os.environ.get("FAKE_CODEX_TEST_DESIGNER_MODE") or "").strip()
+
+                if role == "checker":
+                    requirement = {
+                        "requirement_id": "REQ-001",
+                        "description": "Synthetic provider linger coverage.",
+                        "blocking": True,
+                        "requirement_kind": "product_effect",
+                    }
+                    _write_json(
+                        result_path,
+                        {
+                            "status": "OK",
+                            "normalized_requirements": [requirement],
+                            "requirement_graph": {
+                                "requirements": [requirement],
+                                "evaluation_units": [{"unit_id": "EU-001", "requirement_ids": ["REQ-001"]}],
+                                "dependency_edges": [],
+                            },
+                            "repair_actions": [],
+                            "human_gate_reasons": [],
+                            "notes": [],
+                        },
+                    )
+                    _write_text(response_path, "# Checker\\n\\nProvider linger checker completed.\\n")
+                    sys.stderr.write("tokens used: 21\\n")
+                    sys.stderr.flush()
+                    return 0
+
+                if role == "test_designer":
+                    _write_text(response_path, "PROVIDER LINGER AFTER RESPONSE :: EU-001\\n")
+                    sys.stderr.write("tokens used: 42\\n")
+                    sys.stderr.flush()
+                    if test_designer_mode == "linger_after_response":
+                        time.sleep(5.0)
+                    return 0
+
+                if role == "ai_user":
+                    if operation_log_path is not None:
+                        _write_text(operation_log_path, "1. Ran the provider linger fixture.\\n")
+                    _write_text(response_path, "AI USER RAW OUTPUT :: EU-001\\nresult=provider-linger\\n")
+                    sys.stderr.write("tokens used: 43\\n")
+                    sys.stderr.flush()
+                    return 0
+
+                if role == "reviewer":
+                    _write_text(response_path, "VERDICT: PASS\\nsummary: provider linger reviewer completed.\\n")
+                    sys.stderr.write("tokens used: 44\\n")
+                    sys.stderr.flush()
+                    return 0
+
                 raise SystemExit(f"unexpected role: {role}")
 
 
@@ -836,6 +935,193 @@ def main() -> int:
             if path.exists():
                 return _fail(f"evaluator node runtime must not create runtime AGENTS file {path}")
 
+        fake_codex_root = temp_root / "fake_codex_bin"
+        fake_codex_root.mkdir(parents=True, exist_ok=True)
+        fake_codex = fake_codex_root / "codex"
+        _write_fake_codex_cli(fake_codex)
+        lingering_submission = build_evaluator_submission_for_endpoint_clarification(
+            target_node=child_node,
+            workspace_root=ROOT,
+            output_root=state_root / "artifacts" / "evaluator_node_lingering_runs",
+        )
+        previous_path = str(os.environ.get("PATH") or "")
+        os.environ["PATH"] = str(fake_codex_root) + os.pathsep + previous_path if previous_path else str(fake_codex_root)
+        os.environ["FAKE_CODEX_TEST_DESIGNER_MODE"] = "linger_after_response"
+        lingering_started = time.monotonic()
+        try:
+            lingering_result, lingering_refs = run_evaluator_node(
+                state_root=state_root,
+                submission=lingering_submission,
+            )
+        finally:
+            os.environ["PATH"] = previous_path
+            os.environ.pop("FAKE_CODEX_TEST_DESIGNER_MODE", None)
+        lingering_elapsed_s = time.monotonic() - lingering_started
+        if lingering_result.verdict is not EvaluatorVerdict.PASS:
+            return _fail("lingering delegated-response fixture must still translate to a terminal PASS")
+        if lingering_elapsed_s >= 3.0:
+            return _fail("evaluator node runtime must not wait for the full lingering provider exit after a delegated terminal response artifact already exists")
+        lingering_report = json.loads(Path(str(lingering_refs["evaluation_report_ref"])).read_text(encoding="utf-8"))
+        lingering_lanes = list(lingering_report.get("lanes") or [])
+        if len(lingering_lanes) != 1:
+            return _fail("lingering delegated-response fixture must preserve the single evaluation-unit lane")
+        lingering_test_ai = dict(lingering_lanes[0].get("test_ai") or {})
+        if str(lingering_test_ai.get("raw_output_source") or "") != "response_path":
+            return _fail("evaluator node runtime must preserve that the lingering delegated role closed through its response artifact")
+        if "PROVIDER LINGER AFTER RESPONSE" not in str(lingering_test_ai.get("raw_output_text") or ""):
+            return _fail("evaluator node runtime must preserve the terminal response artifact written before the natural provider exit")
+        lingering_exec_span = json.loads(Path(str(lingering_test_ai.get("exec_span_ref") or "")).read_text(encoding="utf-8"))
+        if int(lingering_exec_span.get("duration_ms") or 0) >= 3000:
+            return _fail("evaluator node delegated-role exec span must settle before the natural linger interval expires")
+        if lingering_exec_span.get("terminal_success") is not True:
+            return _fail("provider-backed lingering evaluator node lanes must record terminal_success in exec-span evidence")
+
+        pass_with_error_words_submission = build_evaluator_submission_for_endpoint_clarification(
+            target_node=child_node,
+            workspace_root=ROOT,
+            output_root=state_root / "artifacts" / "evaluator_node_pass_with_error_words_runs",
+            role_agent_cmd=_fixture_role_agent_cmd(scenario="pass_with_error_words"),
+        )
+        pass_with_error_words_result, pass_with_error_words_refs = run_evaluator_node(
+            state_root=state_root,
+            submission=pass_with_error_words_submission,
+        )
+        if pass_with_error_words_result.verdict is not EvaluatorVerdict.PASS:
+            return _fail(
+                "reviewer text that starts with PASS must not be downgraded to ERROR just because later prose mentions coefficient-error"
+            )
+        pass_with_error_words_impl_ref = Path(
+            str(
+                pass_with_error_words_refs.get("workspace_implementer_result_ref")
+                or pass_with_error_words_refs.get("implementer_result_ref")
+                or ""
+            )
+        )
+        if not pass_with_error_words_impl_ref.exists():
+            return _fail("terminal PASS-with-error-words fixture must materialize an authoritative implementer_result")
+        pass_with_error_words_impl = json.loads(pass_with_error_words_impl_ref.read_text(encoding="utf-8"))
+        if str(((pass_with_error_words_impl.get("evaluator_result") or {}).get("verdict")) or "") != "PASS":
+            return _fail(
+                "authoritative implementer_result must preserve PASS when reviewer prose contains bounded-gap phrases like coefficient-error"
+            )
+
+        response_then_fail_submission = build_evaluator_submission_for_endpoint_clarification(
+            target_node=child_node,
+            workspace_root=ROOT,
+            output_root=state_root / "artifacts" / "evaluator_node_response_then_fail_runs",
+            role_agent_cmd=_fixture_role_agent_cmd(scenario="response_then_fail"),
+        )
+        response_then_fail_result, response_then_fail_refs = run_evaluator_node(
+            state_root=state_root,
+            submission=response_then_fail_submission,
+        )
+        if response_then_fail_result.verdict is not EvaluatorVerdict.ERROR:
+            return _fail("delegated roles that fail after writing a terminal response artifact must translate to ERROR, not PASS")
+        response_then_fail_report = json.loads(
+            Path(str(response_then_fail_refs["evaluation_report_ref"])).read_text(encoding="utf-8")
+        )
+        if str(response_then_fail_report.get("status") or "") != "ERROR":
+            return _fail("response-then-fail evaluator reports must stay terminal ERROR")
+
+        runtime_closure_only_state_root = temp_root / ".loop" / "runtime_closure_only"
+        runtime_closure_only_workspace_root = temp_root / "runtime_closure_only_workspace"
+        runtime_closure_only_workspace_root.mkdir(parents=True, exist_ok=True)
+        ensure_runtime_tree(runtime_closure_only_state_root)
+        runtime_closure_only_root_node = NodeSpec(
+            node_id="runtime-closure-root",
+            node_kind="kernel",
+            goal_slice="exercise runtime-closure-only evaluator node closure",
+            parent_node_id=None,
+            generation=0,
+            round_id="R0",
+            execution_policy={"mode": "kernel"},
+            reasoning_profile={"role": "kernel", "thinking_budget": "medium"},
+            budget_profile={"max_rounds": 1},
+            allowed_actions=["dispatch", "submit", "audit"],
+            delegation_ref="",
+            result_sink_ref="artifacts/runtime_closure_only/root_summary.json",
+            lineage_ref="runtime-closure-root",
+            status=NodeStatus.ACTIVE,
+        )
+        runtime_closure_only_child_node = NodeSpec(
+            node_id="runtime-closure-child",
+            node_kind="implementer",
+            goal_slice="runtime_closure-only evaluator completion",
+            parent_node_id=runtime_closure_only_root_node.node_id,
+            generation=1,
+            round_id="R1",
+            execution_policy={"sandbox_mode": "danger-full-access"},
+            reasoning_profile={"role": "implementer", "thinking_budget": "high"},
+            budget_profile={"max_rounds": 1},
+            allowed_actions=["evaluate", "report"],
+            delegation_ref="state/delegations/runtime-closure-child.json",
+            result_sink_ref="artifacts/runtime_closure_only/implementer_result.json",
+            lineage_ref="runtime-closure-root->runtime-closure-child",
+            status=NodeStatus.ACTIVE,
+        )
+        runtime_closure_only_kernel_state = KernelState(
+            task_id="runtime-closure-only-evaluator-node",
+            root_goal="exercise runtime-closure-only evaluator translation",
+            root_node_id=runtime_closure_only_root_node.node_id,
+        )
+        runtime_closure_only_kernel_state.register_node(runtime_closure_only_root_node)
+        runtime_closure_only_kernel_state.register_node(runtime_closure_only_child_node)
+        persist_kernel_state(
+            runtime_closure_only_state_root,
+            runtime_closure_only_kernel_state,
+            authority=kernel_internal_authority(),
+        )
+        runtime_closure_only_submission = build_evaluator_submission_for_frozen_task(
+            target_node=runtime_closure_only_child_node,
+            workspace_root=runtime_closure_only_workspace_root,
+            output_root=runtime_closure_only_state_root / "artifacts" / "evaluator_node_runtime_closure_only_runs",
+            implementation_package_ref=ROOT / "loop_product" / "kernel" / "entry.py",
+            product_manual_ref=ROOT / "docs" / "contracts" / "LOOP_EVALUATOR_PROTOTYPE_PRODUCT_MANUAL.md",
+            final_effect_requirements=[
+                {
+                    "requirement_id": "REQ-RUNTIME-ONLY",
+                    "description": "Evaluator terminal completion is the only blocking requirement.",
+                    "blocking": True,
+                    "requirement_kind": "runtime_closure",
+                }
+            ],
+        )
+        runtime_closure_only_result, runtime_closure_only_refs = run_evaluator_node(
+            state_root=runtime_closure_only_state_root,
+            submission=runtime_closure_only_submission,
+        )
+        if runtime_closure_only_result.verdict is not EvaluatorVerdict.PASS:
+            return _fail(
+                "runtime-closure-only evaluator-node submissions must translate terminal completion into PASS without a delegated reviewer verdict"
+            )
+        if "reviewer_response_ref" in runtime_closure_only_refs:
+            return _fail("runtime-closure-only evaluator-node submissions must not fabricate reviewer_response_ref")
+        runtime_closure_only_report = json.loads(
+            Path(str(runtime_closure_only_refs["evaluation_report_ref"])).read_text(encoding="utf-8")
+        )
+        if str(runtime_closure_only_report.get("status") or "") != "COMPLETED":
+            return _fail("runtime-closure-only evaluator-node reports must remain terminal COMPLETED")
+        if list(runtime_closure_only_report.get("lanes") or []):
+            return _fail("runtime-closure-only evaluator-node reports must not materialize delegated lanes")
+        runtime_closure_only_requirement_ids = [
+            str(item.get("requirement_id") or "")
+            for item in list(runtime_closure_only_report.get("runtime_closure_requirements") or [])
+        ]
+        if runtime_closure_only_requirement_ids != ["REQ-RUNTIME-ONLY"]:
+            return _fail("runtime-closure-only evaluator-node reports must preserve runtime_closure_requirements")
+        runtime_closure_only_impl_ref = Path(
+            str(
+                runtime_closure_only_refs.get("workspace_implementer_result_ref")
+                or runtime_closure_only_refs.get("implementer_result_ref")
+                or ""
+            )
+        )
+        if not runtime_closure_only_impl_ref.exists():
+            return _fail("runtime-closure-only evaluator-node runs must still materialize authoritative implementer_result")
+        runtime_closure_only_impl = json.loads(runtime_closure_only_impl_ref.read_text(encoding="utf-8"))
+        if str(((runtime_closure_only_impl.get("evaluator_result") or {}).get("verdict")) or "") != "PASS":
+            return _fail("runtime-closure-only evaluator-node implementer_result must preserve PASS")
+
         invocation_expectations = (
             (
                 evaluator_run_root / ".loop" / "checker" / "runs" / "checker" / "exec_span.json",
@@ -989,8 +1275,8 @@ def main() -> int:
             state_root=state_root,
             submission=bug_submission,
         )
-        if bug_result.verdict is not EvaluatorVerdict.BUG:
-            return _fail(f"simple-evaluator delegated role failure must translate to BUG, got {bug_result.verdict.value}")
+        if bug_result.verdict is not EvaluatorVerdict.ERROR:
+            return _fail(f"simple-evaluator delegated role failure must translate to ERROR, got {bug_result.verdict.value}")
 
         issue_agents = {
             "uv": (
@@ -1305,6 +1591,103 @@ def main() -> int:
             return _fail("run_evaluator_node_until_terminal must preserve completed first-lane work")
         if str(dict(helper_lanes.get("EU-002") or {}).get("status") or "") != "COMPLETED":
             return _fail("run_evaluator_node_until_terminal must finish the resumed second lane before returning")
+        helper_kernel_result_ref = helper_state_root / helper_child_node.result_sink_ref
+        helper_workspace_result_ref = helper_workspace_root / helper_child_node.result_sink_ref
+        if not helper_kernel_result_ref.exists():
+            return _fail("terminal evaluator completion must materialize the authoritative implementer_result sink")
+        if not helper_workspace_result_ref.exists():
+            return _fail("terminal evaluator completion must mirror implementer_result into the workspace-local sink")
+        helper_result_payload = json.loads(helper_kernel_result_ref.read_text(encoding="utf-8"))
+        if str(((helper_result_payload.get("evaluator_result") or {}).get("verdict")) or "") != "PASS":
+            return _fail("materialized implementer_result must project the terminal evaluator PASS verdict")
+        if str(helper_result_payload.get("workspace_mirror_ref") or "") != helper_submission.implementation_package_ref:
+            return _fail("materialized implementer_result must preserve the evaluated workspace mirror ref")
+        if str(helper_result_payload.get("request_ref") or "") != str(helper_runtime_refs.get("request_ref") or ""):
+            return _fail("materialized implementer_result must preserve the evaluator request ref")
+        if str(helper_result_payload.get("evaluation_report_ref") or "") != str(helper_runtime_refs.get("evaluation_report_ref") or ""):
+            return _fail("materialized implementer_result must preserve the evaluator report ref")
+
+        fail_workspace_root = temp_root / "terminal_fail_workspace"
+        fail_workspace_root.mkdir(parents=True, exist_ok=True)
+        fail_state_root = temp_root / ".loop" / "terminal_fail_state"
+        ensure_runtime_tree(fail_state_root)
+        fail_child_node = NodeSpec(
+            node_id="child-terminal-fail-001",
+            node_kind="implementer",
+            parent_node_id="root-kernel",
+            goal_slice="exercise implementer_result materialization on terminal evaluator FAIL",
+            generation=1,
+            round_id="R1",
+            execution_policy={"sandbox_mode": "danger-full-access"},
+            reasoning_profile={"role": "implementer", "thinking_budget": "medium"},
+            budget_profile={"max_rounds": 2},
+            allowed_actions=["evaluate", "report"],
+            delegation_ref="state/delegations/child-terminal-fail-001.json",
+            result_sink_ref="artifacts/child-terminal-fail-001/implementer_result.json",
+            lineage_ref="root-kernel->child-terminal-fail-001",
+            status=NodeStatus.ACTIVE,
+        )
+        fail_kernel_state = KernelState(
+            task_id="terminal-fail-helper",
+            root_goal="exercise terminal evaluator fail materialization",
+            root_node_id=root_node.node_id,
+        )
+        fail_kernel_state.register_node(root_node)
+        fail_kernel_state.register_node(fail_child_node)
+        persist_kernel_state(fail_state_root, fail_kernel_state, authority=kernel_internal_authority())
+        fail_submission = EvaluatorNodeSubmission(
+            evaluation_id="terminal_fail_helper",
+            evaluator_node_id="child-terminal-fail-001__evaluator",
+            target_node_id=fail_child_node.node_id,
+            parent_node_id=fail_child_node.parent_node_id,
+            generation=fail_child_node.generation,
+            round_id=fail_child_node.round_id,
+            lineage_ref=fail_child_node.lineage_ref,
+            goal_slice="materialize terminal FAIL results to committed sinks",
+            workspace_root=str(fail_workspace_root),
+            output_root=str(temp_root / "terminal_fail_output"),
+            implementation_package_ref=str((ROOT / "docs" / "contracts" / "LOOP_EVALUATOR_PROTOTYPE_PRODUCT_MANUAL.md").resolve()),
+            product_manual_ref=str(
+                (ROOT / "docs" / "contracts" / "LOOP_EVALUATOR_PROTOTYPE_PRODUCT_MANUAL.md").resolve()
+            ),
+            final_effects_text_ref=str(
+                (ROOT / "docs" / "contracts" / "LOOP_EVALUATOR_PROTOTYPE_FINAL_EFFECTS.md").resolve()
+            ),
+            role_requirements={
+                "checker": "Normalize the bounded requirement for terminal FAIL sink coverage.",
+                "test_designer": "Stay on the documented evaluator product surface.",
+                "ai_user": "Behave like a faithful documented caller.",
+                "reviewer": "Return a terminal FAIL verdict backed by reviewer-visible evidence.",
+            },
+            agent_execution={
+                "default": {"agent_cmd": _fixture_role_agent_cmd(scenario="terminal_fail")},
+            },
+        )
+        fail_result, fail_runtime_refs = run_evaluator_node_until_terminal(
+            state_root=fail_state_root,
+            submission=fail_submission,
+            max_same_run_recovery_attempts=0,
+        )
+        if fail_result.verdict is not EvaluatorVerdict.FAIL:
+            return _fail("terminal FAIL fixture must return a terminal evaluator FAIL verdict")
+        fail_kernel_result_ref = fail_state_root / fail_child_node.result_sink_ref
+        fail_workspace_result_ref = fail_workspace_root / fail_child_node.result_sink_ref
+        if not fail_kernel_result_ref.exists():
+            return _fail("terminal evaluator FAIL must still materialize the authoritative implementer_result sink")
+        if not fail_workspace_result_ref.exists():
+            return _fail("terminal evaluator FAIL must still mirror implementer_result into the workspace-local sink")
+        fail_result_payload = json.loads(fail_kernel_result_ref.read_text(encoding="utf-8"))
+        if str(((fail_result_payload.get("evaluator_result") or {}).get("verdict")) or "") != "FAIL":
+            return _fail("materialized implementer_result must project the terminal evaluator FAIL verdict")
+        if str(fail_result_payload.get("evaluation_report_ref") or "") != str(fail_runtime_refs.get("evaluation_report_ref") or ""):
+            return _fail("terminal FAIL materialization must preserve the evaluator report ref")
+        if str(fail_result_payload.get("status") or "") != "COMPLETED":
+            return _fail("terminal FAIL materialization must still mark the implementer result as completed")
+        if str(fail_result_payload.get("outcome") or "") != "REPAIR_REQUIRED":
+            return _fail("retryable terminal FAIL materialization must mark the implementer result as unfinished repair work")
+        fail_diagnostics = dict((fail_result_payload.get("evaluator_result") or {}).get("diagnostics") or {})
+        if str(fail_diagnostics.get("self_repair") or "") == "":
+            return _fail("retryable terminal FAIL materialization must preserve a non-empty self_repair hint")
 
         rogue_agent = temp_root / "task_local_eval_agent.py"
         rogue_agent.write_text("#!/usr/bin/env python3\nprint('rogue')\n", encoding="utf-8")

@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopChildSupervisionResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "launch_result_ref",
+    "latest_launch_result_ref",
+    "node_id",
+    "state_root",
+    "workspace_root",
+    "settled",
+    "settled_reason",
+    "recoveries_used",
+    "implementer_result_ref",
+    "implementer_outcome",
+    "evaluator_verdict",
+    "status_result_ref",
+    "history"
+  ],
+  "properties": {
+    "launch_result_ref": { "type": "string", "minLength": 1 },
+    "latest_launch_result_ref": { "type": "string", "minLength": 1 },
+    "node_id": { "type": "string", "minLength": 1 },
+    "state_root": { "type": "string", "minLength": 1 },
+    "workspace_root": { "type": "string", "minLength": 1 },
+    "settled": { "type": "boolean" },
+    "settled_reason": {
+      "type": "string",
+      "enum": ["pass", "terminal_nonretryable", "retry_budget_exhausted", "timeout"]
+    },
+    "recoveries_used": { "type": "integer", "minimum": 0 },
+    "implementer_result_ref": { "type": "string" },
+    "implementer_outcome": { "type": "string" },
+    "evaluator_verdict": { "type": "string" },
+    "status_result_ref": { "type": "string" },
+    "history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "launch_result_ref",
+          "status_result_ref",
+          "pid_alive",
+          "recovery_eligible",
+          "result_ref",
+          "result_classification"
+        ],
+        "properties": {
+          "launch_result_ref": { "type": "string", "minLength": 1 },
+          "status_result_ref": { "type": "string" },
+          "pid_alive": { "type": "boolean" },
+          "recovery_eligible": { "type": "boolean" },
+          "result_ref": { "type": "string" },
+          "result_classification": {
+            "type": "string",
+            "enum": ["PASS", "RETRYABLE_TERMINAL", "TERMINAL_NONRETRYABLE", "MISSING"]
+          }
+        }
+      }
+    }
+  }
+}

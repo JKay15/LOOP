@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Validate the committed root-side child supervision helper."""
+
+from __future__ import annotations
+
+import json
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+from jsonschema import Draft202012Validator
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+
+def _fail(msg: str) -> int:
+    print(f"[loop-system-child-supervision-helper][FAIL] {msg}", file=sys.stderr)
+    return 2
+
+
+def _load_schema(name: str) -> dict:
+    path = ROOT / "docs" / "schemas" / name
+    data = json.loads(path.read_text(encoding="utf-8"))
+    Draft202012Validator.check_schema(data)
+    return data
+
+
+def main() -> int:
+    from loop_product.runtime import bootstrap_first_implementer_node
+    from loop_product.dispatch.supervision import supervise_child_until_settled
+
+    supervision_schema = _load_schema("LoopChildSupervisionResult.schema.json")
+
+    with tempfile.TemporaryDirectory(prefix="loop_system_child_supervision_helper_") as td:
+        temp_root = Path(td)
+        endpoint = temp_root / "EndpointArtifact.json"
+        endpoint.write_text(
+            json.dumps(
+                {
+                    "version": "1",
+                    "session_root": str((temp_root / "endpoint_session").resolve()),
+                    "artifact_ref": str(endpoint.resolve()),
+                    "latest_turn_ref": str((temp_root / "turns" / "0001" / "TurnResult.json").resolve()),
+                    "mode": "VISION_COMPILER",
+                    "status": "CLARIFIED",
+                    "original_user_prompt": "Deliver one local Lean formalization artifact.",
+                    "confirmed_requirements": [],
+                    "denied_requirements": [],
+                    "question_history": [],
+                    "turn_count": 1,
+                    "requirement_artifact": {
+                        "task_type": "formalization",
+                        "sufficient": True,
+                        "user_request_summary": "Deliver one local Lean formalization artifact.",
+                        "final_effect": "Deliver one local Lean formalization artifact.",
+                        "observable_success_criteria": ["A local Lean artifact exists."],
+                        "hard_constraints": ["Stay local."],
+                        "non_goals": [],
+                        "relevant_context": [],
+                        "open_questions": [],
+                        "artifact_ready_for_persistence": True,
+                    },
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        workspace_root = ROOT / "workspace" / "test-child-supervision-helper"
+        state_root = ROOT / ".loop" / "test-child-supervision-helper"
+        shutil.rmtree(workspace_root, ignore_errors=True)
+        shutil.rmtree(state_root, ignore_errors=True)
+        bootstrap = bootstrap_first_implementer_node(
+            mode="fresh",
+            task_slug="test-child-supervision-helper",
+            root_goal="bootstrap one implementer node for child supervision helper validation",
+            child_goal_slice="repair unmet evaluator requirements until the run settles",
+            endpoint_artifact_ref=str(endpoint.resolve()),
+            workspace_root=str(workspace_root),
+            state_root=str(state_root),
+            workspace_mirror_relpath="deliverables/out.txt",
+            external_publish_target=str((temp_root / "Desktop" / "out.txt").resolve()),
+            context_refs=[],
+        )
+
+        node_id = str(bootstrap["node_id"])
+        implementer_result_ref = state_root / "artifacts" / node_id / "implementer_result.json"
+        implementer_result_ref.parent.mkdir(parents=True, exist_ok=True)
+        implementer_result_ref.write_text(
+            json.dumps(
+                {
+                    "schema": "loop_product.implementer_result",
+                    "schema_version": "0.1.0",
+                    "node_id": node_id,
+                    "status": "COMPLETED",
+                    "outcome": "REPAIR_REQUIRED",
+                    "evaluator_result": {
+                        "verdict": "FAIL",
+                        "retryable": True,
+                        "summary": "simple evaluator reviewer verdict=FAIL",
+                        "diagnostics": {
+                            "self_attribution": "implementation_gap",
+                            "self_repair": "repair the unmet in-scope requirements and rerun evaluator",
+                        },
+                    },
+                    "evaluation_report_ref": str((temp_root / "EvaluationReport.json").resolve()),
+                    "reviewer_response_ref": str((temp_root / "reviewer.txt").resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        launch_result_ref_1 = state_root / "artifacts" / "launches" / node_id / "attempt_001" / "ChildLaunchResult.json"
+        launch_result_ref_1.parent.mkdir(parents=True, exist_ok=True)
+        launch_result_ref_1.write_text(
+            json.dumps(
+                {
+                    "launch_result_ref": str(launch_result_ref_1.resolve()),
+                    "node_id": node_id,
+                    "state_root": str(state_root.resolve()),
+                    "workspace_root": str(workspace_root.resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        launch_result_ref_2 = state_root / "artifacts" / "launches" / node_id / "attempt_002" / "ChildLaunchResult.json"
+        launch_result_ref_2.parent.mkdir(parents=True, exist_ok=True)
+        launch_result_ref_2.write_text(
+            json.dumps(
+                {
+                    "launch_result_ref": str(launch_result_ref_2.resolve()),
+                    "node_id": node_id,
+                    "state_root": str(state_root.resolve()),
+                    "workspace_root": str(workspace_root.resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        status_calls = {"count": 0}
+        recovery_calls: list[dict[str, object]] = []
+        launch_calls: list[str] = []
+
+        def _status_reader(*, result_ref: str | Path, stall_threshold_s: float = 60.0) -> dict[str, object]:
+            launch_result_ref = str(Path(result_ref).resolve())
+            status_calls["count"] += 1
+            status_ref = temp_root / f"status-{status_calls['count']}.json"
+            return {
+                "launch_result_ref": launch_result_ref,
+                "status_result_ref": str(status_ref.resolve()),
+                "node_id": node_id,
+                "state_root": str(state_root.resolve()),
+                "workspace_root": str(workspace_root.resolve()),
+                "pid_alive": False,
+                "recovery_eligible": True,
+                "stall_threshold_s": stall_threshold_s,
+                "recovery_reason": "active_without_live_pid",
+            }
+
+        def _recovery_runner(**payload):
+            recovery_calls.append(dict(payload))
+            recovery_result_ref = state_root / "artifacts" / "recovery" / node_id / "OrphanedActiveRecoveryResult.json"
+            recovery_result_ref.parent.mkdir(parents=True, exist_ok=True)
+            recovery_payload = {
+                "recovery_result_ref": str(recovery_result_ref.resolve()),
+                "node_id": node_id,
+                "state_root": str(state_root.resolve()),
+                "workspace_root": str(workspace_root.resolve()),
+                "recovery_decision": "accepted",
+            }
+            recovery_result_ref.write_text(json.dumps(recovery_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            return recovery_payload
+
+        def _launcher(*, result_ref: str | Path, startup_probe_ms: int = 1500, startup_health_timeout_ms: int = 12000):
+            del startup_probe_ms, startup_health_timeout_ms
+            launch_calls.append(str(result_ref))
+            implementer_result_ref.write_text(
+                json.dumps(
+                    {
+                        "schema": "loop_product.implementer_result",
+                        "schema_version": "0.1.0",
+                        "node_id": node_id,
+                        "status": "COMPLETED",
+                        "outcome": "COMPLETED",
+                        "evaluator_result": {
+                            "verdict": "PASS",
+                            "retryable": False,
+                            "summary": "simple evaluator reviewer verdict=PASS",
+                            "diagnostics": {"self_attribution": "", "self_repair": ""},
+                        },
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return {"launch_result_ref": str(launch_result_ref_2.resolve())}
+
+        result = supervise_child_until_settled(
+            launch_result_ref=launch_result_ref_1,
+            poll_interval_s=0.0,
+            stall_threshold_s=0.0,
+            max_recoveries=2,
+            max_wall_clock_s=0.0,
+            runtime_status_reader=_status_reader,
+            recovery_runner=_recovery_runner,
+            launcher=_launcher,
+            sleep_fn=lambda _: None,
+        )
+        Draft202012Validator(supervision_schema).validate(result)
+
+        if str(result.get("settled_reason") or "") != "pass":
+            return _fail("child supervision helper must settle as pass after successful repaired relaunch")
+        if int(result.get("recoveries_used") or 0) != 1:
+            return _fail("child supervision helper must count exactly one recover/relaunch cycle in the happy path")
+        if len(recovery_calls) != 1:
+            return _fail("child supervision helper must invoke same-node recovery once for a retryable terminal FAIL")
+        if len(launch_calls) != 1:
+            return _fail("child supervision helper must relaunch the same node once after accepted recovery")
+        if str(recovery_calls[0].get("reason") or "") != "retryable_terminal_result_after_child_stop":
+            return _fail("child supervision helper must classify retryable terminal FAILs with a generic retryable-terminal reason")
+        if str(recovery_calls[0].get("self_repair") or "") == "":
+            return _fail("child supervision helper must forward a non-empty self-repair hint into recovery")
+        if str(recovery_calls[0].get("confirmed_launch_result_ref") or "") != str(launch_result_ref_1.resolve()):
+            return _fail("child supervision helper must forward the exact confirmed launch result into recovery")
+        if str(recovery_calls[0].get("confirmed_runtime_status_ref") or "") == "":
+            return _fail("child supervision helper must forward the exact confirmed runtime status into recovery")
+        if str(result.get("latest_launch_result_ref") or "") != str(launch_result_ref_2.resolve()):
+            return _fail("child supervision helper must update the settled launch_result_ref after relaunch")
+
+    print("[loop-system-child-supervision-helper] OK")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

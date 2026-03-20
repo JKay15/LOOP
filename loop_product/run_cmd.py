@@ -146,6 +146,20 @@ def _semantic_activity_marker(path: Path) -> tuple[str, int, int, int]:
         return ("missing", 0, 0, 0)
 
 
+def _terminal_file_marker(path: Path) -> tuple[str, int, int]:
+    try:
+        if not path.exists() or not path.is_file():
+            return ("missing", 0, 0)
+        stat = path.stat()
+        return ("file", int(stat.st_size), int(stat.st_mtime_ns))
+    except FileNotFoundError:
+        return ("missing", 0, 0)
+
+
+def _marker_has_nonempty_file(marker: tuple[str, int, int]) -> bool:
+    return marker[0] == "file" and marker[1] > 0
+
+
 def _terminate_process_tree(
     proc: subprocess.Popen[Any],
     *,
@@ -335,6 +349,10 @@ def run_cmd(
     semantic_idle_timeout_s: Optional[int] = None,
     semantic_activity_streams: Optional[Sequence[str]] = None,
     semantic_activity_paths: Optional[Sequence[Union[str, Path]]] = None,
+    terminal_success_paths: Optional[Sequence[Union[str, Path]]] = None,
+    terminal_success_stable_s: Optional[float] = None,
+    terminal_success_streams: Optional[Sequence[str]] = None,
+    terminal_success_patterns: Optional[Sequence[str]] = None,
     reconnect_grace_s: Optional[int] = None,
     reconnect_max_events: int = 0,
     reconnect_pattern: str = r"\breconnect(?:ing|ed|ion)?\b",
@@ -365,6 +383,16 @@ def run_cmd(
       optional subset of {"stdout", "stderr"} counted as semantic progress when their files grow.
     semantic_activity_paths:
       optional extra file paths counted as semantic progress when their size increases.
+    terminal_success_paths:
+      optional file paths whose non-empty stable contents may authoritatively settle the command as success
+      once an explicit terminal marker is also observed in the configured terminal_success_streams.
+    terminal_success_stable_s:
+      optional stability window in seconds required before a terminal_success_path can settle the command.
+    terminal_success_streams:
+      optional subset of {"stdout", "stderr"} searched for terminal_success_patterns.
+    terminal_success_patterns:
+      optional regex patterns that must be observed on terminal_success_streams before a terminal_success_path
+      can settle the command.
     reconnect_grace_s:
       optional extra grace seconds granted when reconnect markers appear in output.
     reconnect_max_events:
@@ -401,6 +429,7 @@ def run_cmd(
     hard_timeout_s = _as_positive_timeout(timeout_s)
     idle_timeout_val_s = _as_positive_timeout(idle_timeout_s)
     semantic_idle_timeout_val_s = _as_positive_timeout(semantic_idle_timeout_s)
+    terminal_success_stable_val_s = _as_positive_timeout(terminal_success_stable_s)
     reconnect_grace_val_s = _as_positive_timeout(reconnect_grace_s)
     reconnect_max_events_val = _as_nonnegative_int(reconnect_max_events)
     reconnect_re: Optional[re.Pattern[str]] = None
@@ -413,6 +442,19 @@ def run_cmd(
     bad_streams = sorted(stream for stream in semantic_streams if stream not in {"stdout", "stderr"})
     if bad_streams:
         raise ValueError(f"semantic_activity_streams must only contain stdout/stderr; got: {', '.join(bad_streams)}")
+    terminal_streams = {
+        str(name).strip().lower() for name in (terminal_success_streams or ("stdout", "stderr")) if str(name).strip()
+    }
+    bad_terminal_streams = sorted(stream for stream in terminal_streams if stream not in {"stdout", "stderr"})
+    if bad_terminal_streams:
+        raise ValueError(
+            f"terminal_success_streams must only contain stdout/stderr; got: {', '.join(bad_terminal_streams)}"
+        )
+    terminal_success_res = [
+        re.compile(str(pattern), flags=re.IGNORECASE)
+        for pattern in (terminal_success_patterns or ())
+        if str(pattern).strip()
+    ]
     semantic_paths: list[Path] = []
     base_cwd = Path(cwd).resolve()
     for raw in semantic_activity_paths or ():
@@ -420,6 +462,12 @@ def run_cmd(
         if not p.is_absolute():
             p = base_cwd / p
         semantic_paths.append(p.resolve())
+    terminal_paths: list[Path] = []
+    for raw in terminal_success_paths or ():
+        p = Path(raw)
+        if not p.is_absolute():
+            p = base_cwd / p
+        terminal_paths.append(p.resolve())
 
     stdin_cm = (
         Path(stdin_path).expanduser().resolve().open("r", encoding="utf-8", errors="replace")
@@ -456,6 +504,21 @@ def run_cmd(
         scan_stderr_pos = 0
         reconnect_events_applied = 0
         rc: Optional[int] = None
+        terminal_success = False
+        terminal_success_path: Optional[Path] = None
+        terminal_success_observed_exit_code: Optional[int] = None
+        terminal_path_markers = {
+            path: _terminal_file_marker(path)
+            for path in terminal_paths
+        }
+        terminal_path_ready_since = {
+            path: None
+            for path in terminal_paths
+        }
+        terminal_scan_stdout_pos = 0
+        terminal_scan_stderr_pos = 0
+        terminal_stream_match_seen = False
+        terminal_success_enabled = bool(terminal_path_markers) and bool(terminal_success_res)
 
         while True:
             polled = p.poll()
@@ -531,6 +594,68 @@ def run_cmd(
             if semantic_progress:
                 last_semantic_activity_mono = now
 
+            if terminal_success_enabled:
+                if "stdout" in terminal_streams:
+                    if stdout_size < terminal_scan_stdout_pos:
+                        terminal_scan_stdout_pos = 0
+                    if stdout_size > terminal_scan_stdout_pos:
+                        read_start = terminal_scan_stdout_pos
+                        if (stdout_size - terminal_scan_stdout_pos) > 64 * 1024:
+                            read_start = stdout_size - 64 * 1024
+                        with stdout_path.open("rb") as sf:
+                            sf.seek(read_start)
+                            chunk = sf.read(stdout_size - read_start)
+                        terminal_scan_stdout_pos = stdout_size
+                        text = chunk.decode("utf-8", errors="replace")
+                        if any(pattern.search(text) for pattern in terminal_success_res):
+                            terminal_stream_match_seen = True
+                if "stderr" in terminal_streams:
+                    if stderr_size < terminal_scan_stderr_pos:
+                        terminal_scan_stderr_pos = 0
+                    if stderr_size > terminal_scan_stderr_pos:
+                        read_start = terminal_scan_stderr_pos
+                        if (stderr_size - terminal_scan_stderr_pos) > 64 * 1024:
+                            read_start = stderr_size - 64 * 1024
+                        with stderr_path.open("rb") as ef:
+                            ef.seek(read_start)
+                            chunk = ef.read(stderr_size - read_start)
+                        terminal_scan_stderr_pos = stderr_size
+                        text = chunk.decode("utf-8", errors="replace")
+                        if any(pattern.search(text) for pattern in terminal_success_res):
+                            terminal_stream_match_seen = True
+
+            if terminal_success_enabled and terminal_success_stable_val_s is not None and terminal_stream_match_seen:
+                for path, previous_marker in tuple(terminal_path_markers.items()):
+                    current_marker = _terminal_file_marker(path)
+                    if current_marker != previous_marker:
+                        terminal_path_markers[path] = current_marker
+                        terminal_path_ready_since[path] = now if _marker_has_nonempty_file(current_marker) else None
+                    ready_since = terminal_path_ready_since.get(path)
+                    if ready_since is None or not _marker_has_nonempty_file(current_marker):
+                        continue
+                    if (now - ready_since) < terminal_success_stable_val_s:
+                        continue
+                    if (now - last_activity_mono) < terminal_success_stable_val_s:
+                        continue
+                    pre_terminal_poll = p.poll()
+                    if pre_terminal_poll is not None:
+                        rc = int(pre_terminal_poll)
+                        break
+                    terminal_success = True
+                    terminal_success_path = path
+                    if p.poll() is None:
+                        _terminate_process_tree(p)
+                    observed_exit_code = p.poll()
+                    terminal_success_observed_exit_code = (
+                        int(observed_exit_code) if observed_exit_code is not None else None
+                    )
+                    rc = 0
+                    break
+                if terminal_success:
+                    break
+                if rc is not None:
+                    break
+
             if not should_timeout and semantic_idle_timeout_val_s is not None:
                 if (now - last_semantic_activity_mono) >= semantic_idle_timeout_val_s:
                     should_timeout = True
@@ -580,6 +705,15 @@ def run_cmd(
         span["timed_out"] = True
     if timeout_kind is not None:
         span["timeout_kind"] = timeout_kind
+    if terminal_success:
+        span["terminal_success"] = True
+        if terminal_success_path is not None:
+            try:
+                span["terminal_success_path"] = str(terminal_success_path.relative_to(base))
+            except Exception:
+                span["terminal_success_path"] = str(terminal_success_path)
+        if terminal_success_observed_exit_code is not None:
+            span["terminal_success_observed_exit_code"] = terminal_success_observed_exit_code
     uv_cache_dir = str(cmd_env.get("UV_CACHE_DIR") or "")
     if uv_cache_dir:
         span["uv_cache_dir"] = uv_cache_dir

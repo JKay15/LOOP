@@ -67,6 +67,9 @@ def request_host_child_launch(
         "response_ref": str(response_ref.resolve()),
     }
     _write_json(request_dir / "HostChildLaunchRequest.json", request_payload)
+    from loop_product import host_child_launch_supervisor as supervisor_module
+
+    supervisor_module.ensure_host_child_launch_supervisor_running(repo_root=repo_root)
     deadline = time.monotonic() + max(1.0, float(response_timeout_s))
     while time.monotonic() < deadline:
         if response_ref.exists():
@@ -83,12 +86,18 @@ def request_host_child_launch(
 
 @contextmanager
 def force_direct_child_launch_mode() -> Iterator[None]:
-    previous = os.environ.get("LOOP_CHILD_LAUNCH_MODE")
+    previous_launch_mode = os.environ.get("LOOP_CHILD_LAUNCH_MODE")
+    previous_bridge_mode = os.environ.get("LOOP_CHILD_LAUNCH_BRIDGE_MODE")
     os.environ["LOOP_CHILD_LAUNCH_MODE"] = "direct"
+    os.environ["LOOP_CHILD_LAUNCH_BRIDGE_MODE"] = "direct"
     try:
         yield
     finally:
-        if previous is None:
+        if previous_launch_mode is None:
             os.environ.pop("LOOP_CHILD_LAUNCH_MODE", None)
         else:
-            os.environ["LOOP_CHILD_LAUNCH_MODE"] = previous
+            os.environ["LOOP_CHILD_LAUNCH_MODE"] = previous_launch_mode
+        if previous_bridge_mode is None:
+            os.environ.pop("LOOP_CHILD_LAUNCH_BRIDGE_MODE", None)
+        else:
+            os.environ["LOOP_CHILD_LAUNCH_BRIDGE_MODE"] = previous_bridge_mode

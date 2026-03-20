@@ -64,6 +64,7 @@ def _checker_result(*, mode: str) -> dict[str, object]:
             f"reviewer verdict `{_expected_verdict(mode)}`."
         ),
         "blocking": True,
+        "requirement_kind": "product_effect",
     }
     return {
         "status": "OK",

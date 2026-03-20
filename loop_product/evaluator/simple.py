@@ -434,6 +434,14 @@ def _invoke_text_role(
     final_raw_output_source = "stdout"
     final_exit_code = -1
     final_attempt_count = 0
+    terminal_success_streams: list[str] | None = None
+    terminal_success_patterns: list[str] | None = None
+    if (
+        str(launch_spec.get("launch_mode") or "") == "provider_argv"
+        and str(launch_spec.get("provider_id") or "") == "codex_cli"
+    ):
+        terminal_success_streams = ["stderr"]
+        terminal_success_patterns = [r"\btokens used\b"]
     for attempt_index in range(1, 5):
         final_attempt_count = attempt_index
         for stale_path in (response_path, result_path, operation_log_path):
@@ -463,6 +471,10 @@ def _invoke_text_role(
             label=f"{safe_role_label}__{attempt_suffix}",
             timeout_s=3600,
             idle_timeout_s=600,
+            terminal_success_paths=[str(response_path)],
+            terminal_success_stable_s=1.0,
+            terminal_success_streams=terminal_success_streams,
+            terminal_success_patterns=terminal_success_patterns,
             reconnect_grace_s=30,
             reconnect_max_events=8,
         )
@@ -554,24 +566,53 @@ def _invoke_text_role(
     }
 
 
+def _runtime_closure_requirements(
+    requirements: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        dict(item)
+        for item in requirements
+        if _legacy.requirement_kind(dict(item)) == "runtime_closure"
+    ]
+
+
+def _product_effect_requirements(
+    requirements: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        dict(item)
+        for item in requirements
+        if _legacy.requirement_kind(dict(item)) != "runtime_closure"
+    ]
+
+
 def _build_lane_units(
     *,
     final_effect_requirements: Sequence[Mapping[str, Any]],
     checker_requirement_graph: Mapping[str, Any] | None,
 ) -> list[dict[str, Any]]:
     if checker_requirement_graph is None:
-        requirement_ids = [str(item.get("requirement_id") or "") for item in final_effect_requirements]
+        product_requirements = _product_effect_requirements(final_effect_requirements)
+        requirement_ids = [str(item.get("requirement_id") or "") for item in product_requirements]
+        if not requirement_ids:
+            return []
         return [
             {
                 "unit_id": "EU-001",
                 "requirement_ids": requirement_ids,
-                "requirements": [dict(item) for item in final_effect_requirements],
+                "requirements": [dict(item) for item in product_requirements],
             }
         ]
     requirement_by_id = {str(item["requirement_id"]): dict(item) for item in checker_requirement_graph["requirements"]}
     lane_units: list[dict[str, Any]] = []
     for item in checker_requirement_graph["evaluation_units"]:
-        requirement_ids = [str(ref) for ref in item.get("requirement_ids") or []]
+        requirement_ids = [
+            str(ref)
+            for ref in item.get("requirement_ids") or []
+            if _legacy.requirement_kind(dict(requirement_by_id.get(str(ref)) or {})) != "runtime_closure"
+        ]
+        if not requirement_ids:
+            continue
         lane_units.append(
             {
                 "unit_id": str(item["unit_id"]),
@@ -580,6 +621,24 @@ def _build_lane_units(
             }
         )
     return lane_units
+
+
+def _runtime_closure_notes(
+    requirements: Sequence[Mapping[str, Any]],
+    *,
+    terminal: bool,
+) -> list[str]:
+    closure_requirements = _runtime_closure_requirements(requirements)
+    if not closure_requirements:
+        return []
+    requirement_ids = ", ".join(str(item.get("requirement_id") or "") for item in closure_requirements)
+    if terminal:
+        return [
+            f"Runtime-closure requirements satisfied by evaluator terminal completion: {requirement_ids}.",
+        ]
+    return [
+        f"Runtime-closure requirements remain pending until evaluator terminal completion: {requirement_ids}.",
+    ]
 
 
 def _project_checker_result_from_state(state: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -874,8 +933,14 @@ def _error_report(
     recovery: Mapping[str, Any] | None = None,
     checker_result: Mapping[str, Any] | None = None,
     final_effect_requirements: Sequence[Mapping[str, Any]] | None = None,
+    runtime_closure_requirements: Sequence[Mapping[str, Any]] | None = None,
     lanes: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    runtime_closure_items = (
+        [dict(item) for item in runtime_closure_requirements]
+        if runtime_closure_requirements is not None
+        else _runtime_closure_requirements(final_effect_requirements or [])
+    )
     return _write_report(
         Path(str(context["run_root"])),
         {
@@ -907,8 +972,13 @@ def _error_report(
                 if final_effect_requirements is not None
                 else {}
             ),
+            **(
+                {"runtime_closure_requirements": runtime_closure_items}
+                if runtime_closure_items
+                else {}
+            ),
             **({"lanes": [dict(item) for item in lanes]} if lanes else {}),
-            "notes": [message],
+            "notes": [message, *_runtime_closure_notes(runtime_closure_items, terminal=False)],
         },
     )
 
@@ -923,6 +993,7 @@ def run_evaluator_simple_prototype(*, request: Mapping[str, Any] | str | Path) -
     stage = "preflight"
     checker_result: dict[str, Any] | None = None
     final_effect_requirements: list[dict[str, Any]] = []
+    runtime_closure_requirements: list[dict[str, Any]] = []
     lane_units: list[dict[str, Any]] = []
     lanes: list[dict[str, Any]] = []
     reviewer: dict[str, Any] | None = None
@@ -1097,6 +1168,7 @@ def run_evaluator_simple_prototype(*, request: Mapping[str, Any] | str | Path) -
                     validated_checker_result=checker_validated,
                 )
                 final_effect_requirements = [dict(item) for item in checker_validated["normalized_requirements"]]
+                runtime_closure_requirements = _runtime_closure_requirements(final_effect_requirements)
                 lane_units = _build_lane_units(
                     final_effect_requirements=final_effect_requirements,
                     checker_requirement_graph=dict(checker_validated["requirement_graph"]),
@@ -1113,12 +1185,17 @@ def run_evaluator_simple_prototype(*, request: Mapping[str, Any] | str | Path) -
                     "human_gate_reasons": [],
                 }
                 state["final_effect_requirements"] = [dict(item) for item in final_effect_requirements]
+                state["runtime_closure_requirements"] = [dict(item) for item in runtime_closure_requirements]
                 if not list(state.get("lane_plan") or []):
                     state["lane_plan"] = [dict(item) for item in lane_units]
                 state["status"] = "IN_PROGRESS"
                 _run_state.write_run_state(run_root=run_root, state=state)
             checker_result = _project_checker_result_from_state(state)
             final_effect_requirements = [dict(item) for item in list(state.get("final_effect_requirements") or [])]
+            runtime_closure_requirements = [dict(item) for item in list(state.get("runtime_closure_requirements") or [])]
+            if not runtime_closure_requirements and final_effect_requirements:
+                runtime_closure_requirements = _runtime_closure_requirements(final_effect_requirements)
+                state["runtime_closure_requirements"] = [dict(item) for item in runtime_closure_requirements]
             lane_units = [dict(item) for item in list(state.get("lane_plan") or [])]
         else:
             final_effect_requirements = [dict(item) for item in list(state.get("final_effect_requirements") or [])]
@@ -1128,6 +1205,10 @@ def run_evaluator_simple_prototype(*, request: Mapping[str, Any] | str | Path) -
                     label="evaluator final_effect_requirements",
                 )
                 state["final_effect_requirements"] = [dict(item) for item in final_effect_requirements]
+            runtime_closure_requirements = [dict(item) for item in list(state.get("runtime_closure_requirements") or [])]
+            if not runtime_closure_requirements and final_effect_requirements:
+                runtime_closure_requirements = _runtime_closure_requirements(final_effect_requirements)
+                state["runtime_closure_requirements"] = [dict(item) for item in runtime_closure_requirements]
             if not list(state.get("lane_plan") or []):
                 state["lane_plan"] = _build_lane_units(
                     final_effect_requirements=final_effect_requirements,
@@ -1196,6 +1277,7 @@ def run_evaluator_simple_prototype(*, request: Mapping[str, Any] | str | Path) -
                     ),
                     checker_result=_project_checker_result_from_state(state),
                     final_effect_requirements=[dict(item) for item in list(state.get("final_effect_requirements") or [])],
+                    runtime_closure_requirements=[dict(item) for item in list(state.get("runtime_closure_requirements") or [])],
                     lanes=_project_lanes_from_state(state),
                 )
             state["status"] = "ERROR"
@@ -1210,12 +1292,20 @@ def run_evaluator_simple_prototype(*, request: Mapping[str, Any] | str | Path) -
                 self_repair=str(blocked_issue["self_repair"]),
                 checker_result=_project_checker_result_from_state(state),
                 final_effect_requirements=[dict(item) for item in list(state.get("final_effect_requirements") or [])],
+                runtime_closure_requirements=[dict(item) for item in list(state.get("runtime_closure_requirements") or [])],
                 lanes=_project_lanes_from_state(state),
             )
 
         stage = "reviewer"
         reviewer_state = dict(state.get("reviewer") or {})
-        if str(reviewer_state.get("status") or "") != "COMPLETED":
+        if not lane_units:
+            state["reviewer"] = {
+                **reviewer_state,
+                "status": "SKIPPED",
+                "attempt_count": int(reviewer_state.get("attempt_count") or 0),
+            }
+            _run_state.write_run_state(run_root=run_root, state=state)
+        elif str(reviewer_state.get("status") or "") != "COMPLETED":
             reviewer_role_dir = _legacy._default_role_runtime_root(run_root=run_root, role_id="reviewer")
             reviewer_workspace_root = _materialize_simple_role_workspace(
                 request=normalized_request,
@@ -1338,12 +1428,14 @@ def run_evaluator_simple_prototype(*, request: Mapping[str, Any] | str | Path) -
                     ),
                     checker_result=checker_result,
                     final_effect_requirements=final_effect_requirements,
+                    runtime_closure_requirements=[dict(item) for item in list(state.get("runtime_closure_requirements") or [])],
                     lanes=lanes,
                 )
             state["status"] = "ERROR"
             _run_state.write_run_state(run_root=run_root, state=state)
             checker_result = _project_checker_result_from_state(state)
             final_effect_requirements = [dict(item) for item in list(state.get("final_effect_requirements") or [])]
+            runtime_closure_requirements = [dict(item) for item in list(state.get("runtime_closure_requirements") or [])]
             lanes = _project_lanes_from_state(state)
         return _error_report(
             context=context,
@@ -1355,6 +1447,7 @@ def run_evaluator_simple_prototype(*, request: Mapping[str, Any] | str | Path) -
             self_repair=str((issue or {}).get("self_repair") or ""),
             checker_result=checker_result,
             final_effect_requirements=final_effect_requirements,
+            runtime_closure_requirements=runtime_closure_requirements,
             lanes=lanes,
         )
     finally:
@@ -1365,6 +1458,7 @@ def run_evaluator_simple_prototype(*, request: Mapping[str, Any] | str | Path) -
         _run_state.write_run_state(run_root=run_root, state=state)
         checker_result = _project_checker_result_from_state(state)
         final_effect_requirements = [dict(item) for item in list(state.get("final_effect_requirements") or [])]
+        runtime_closure_requirements = [dict(item) for item in list(state.get("runtime_closure_requirements") or [])]
         lanes = _project_lanes_from_state(state)
         reviewer = _project_reviewer_from_state(state)
 
@@ -1386,9 +1480,14 @@ def run_evaluator_simple_prototype(*, request: Mapping[str, Any] | str | Path) -
             "status": "COMPLETED",
             **({"checker_result": checker_result} if checker_result is not None else {}),
             "final_effect_requirements": [dict(item) for item in final_effect_requirements],
+            **(
+                {"runtime_closure_requirements": [dict(item) for item in runtime_closure_requirements]}
+                if runtime_closure_requirements
+                else {}
+            ),
             "lanes": lanes,
             "reviewer": reviewer,
-            "notes": [],
+            "notes": _runtime_closure_notes(runtime_closure_requirements, terminal=True),
         },
     )
 

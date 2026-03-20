@@ -19,6 +19,8 @@ For the thin evaluator body and any richer compatibility path that resumes insid
 - persist a durable `EvaluatorRunState.json`
 - surface retryable same-run interruptions as `RECOVERY_REQUIRED` instead of terminal `ERROR`
 - freeze the checker-produced lane plan after checker normalization succeeds
+- allow checker-normalized requirements to mark evaluator-owned closure obligations as `runtime_closure`
+- keep `runtime_closure` requirements out of delegated reviewer/test_ai/ai_user lanes because those requirements are satisfied only by the evaluator run itself reaching terminal completion
 - preserve that frozen checker graph across recovery
 - skip already-completed lanes during same-run resume
 - run reviewer only after every lane is terminal
@@ -27,6 +29,9 @@ For delegated evaluator AI roles:
 - prefer the committed argv-based role-launch runtime over ad hoc `bash -c "codex exec ..."` reconstruction
 - keep role guidance on committed prompts/runtime metadata rather than transient runtime `AGENTS.md` / `AGENTS.override.md` files
 - keep that committed role guidance generic: prefer bounded non-interactive probes, clean up auxiliary browser/server/helper processes, and stop once decisive evidence exists for the current evaluation unit
+- if a delegated role has already produced a non-empty authoritative terminal response artifact and a committed provider terminal marker has also been observed on the configured launch streams, the runtime may settle the role from that artifact instead of waiting indefinitely for provider-side exit cleanup
+- response-file stability alone is not a success signal; post-response non-zero exits without that terminal marker must remain terminal `ERROR`
+- if no authoritative terminal response artifact exists, the runtime must still fail closed rather than inventing success from transport chatter alone
 - keep auth/config on the default host home instead of changing `CODEX_HOME` merely to select role-local rules
 - exclude runtime-owned/generated source directories such as `.loop/`, `.loop_runtime/`, `workspace/`, and `.uv-cache/` when copying staged evaluator role workspaces from the source workspace
 - generic evaluator submissions should default delegated evaluator reasoning to `high` unless the caller explicitly overrides it
@@ -162,17 +167,18 @@ Non-retryable upstream quota exhaustion must surface explicitly as `provider_quo
 Checker output contract:
 - `status = OK | HUMAN_GATE`
 - if `status = OK`:
-  - `normalized_requirements = [{requirement_id, description, blocking}]`
+  - `normalized_requirements = [{requirement_id, description, blocking, requirement_kind}]`
   - `requirement_graph = {requirements, evaluation_units, dependency_edges}`
   - `requirement_graph.requirements` must reuse the full `normalized_requirements` objects, not bare requirement ids
   - `requirement_graph.evaluation_units = [{unit_id, requirement_ids}]`; the field name must be exactly `unit_id`, not `evaluation_unit_id`
   - `requirement_graph.evaluation_units` should group co-testable requirements into as few evaluation units as the evidence surface supports; singleton units are only justified when separate user-facing probes or sequencing are actually needed
   - `requirement_graph.dependency_edges = [{from_unit_id, to_unit_id}]` and those ids must reference `evaluation_units[*].unit_id`
+  - always include `requirement_kind`; use `product_effect` for ordinary reviewer-visible product checks and `runtime_closure` only for evaluator-owned closure obligations such as authoritative terminal-result/result-sink completion
   - minimal valid example:
     ```json
     {
       "requirements": [
-        {"requirement_id": "REQ-001", "description": "...", "blocking": true}
+        {"requirement_id": "REQ-001", "description": "...", "blocking": true, "requirement_kind": "product_effect"}
       ],
       "evaluation_units": [
         {"unit_id": "EU-001", "requirement_ids": ["REQ-001"]}
@@ -338,6 +344,8 @@ The final report must preserve:
 - requirement graph
 - AI-as-User effect outcomes, grouped by evaluation unit
 - reviewer verdicts
+
+When every blocking requirement is evaluator-owned `runtime_closure`, the prototype may legitimately finish without delegated product-effect lanes and without a reviewer payload. In that case terminal evaluator completion itself satisfies those requirements, the durable run state may record `checker.status = SKIPPED` and `reviewer.status = SKIPPED`, and the terminal report must say so in notes instead of fabricating reviewer evidence.
 
 If the run reaches a terminal failure, including preflight request/manual validation failures before checker dispatch, the prototype must still write `EvaluationReport.json` with:
 - `status = ERROR`

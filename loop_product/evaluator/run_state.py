@@ -59,6 +59,7 @@ def build_initial_run_state(
             "human_gate_reasons": [],
         },
         "final_effect_requirements": [],
+        "runtime_closure_requirements": [],
         "lane_plan": [],
         "lanes_by_unit_id": {},
         "reviewer": {

@@ -17,6 +17,8 @@
     "state_root": { "type": "string", "minLength": 1 },
     "node_id": { "type": "string", "minLength": 1 },
     "workspace_root": { "type": "string" },
+    "confirmed_launch_result_ref": { "type": "string" },
+    "confirmed_runtime_status_ref": { "type": "string" },
     "reason": { "type": "string", "minLength": 1 },
     "self_attribution": { "type": "string", "minLength": 1 },
     "self_repair": { "type": "string", "minLength": 1 },

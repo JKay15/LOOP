@@ -12,8 +12,12 @@
     "delegation_ref",
     "child_prompt_ref",
     "launch_spec",
+    "confirmed_launch_result_ref",
+    "confirmed_runtime_status_ref",
+    "confirmed_runtime_recovery_reason",
     "accepted_envelope_id",
     "accepted_envelope_note",
+    "recovery_context_ref",
     "recovery_request_ref",
     "recovery_result_ref"
   ],
@@ -26,8 +30,13 @@
     "delegation_ref": { "type": "string", "minLength": 1 },
     "child_prompt_ref": { "type": "string", "minLength": 1 },
     "launch_spec": { "type": "object" },
+    "confirmed_launch_result_ref": { "type": "string", "minLength": 1 },
+    "confirmed_runtime_status_ref": { "type": "string", "minLength": 1 },
+    "confirmed_runtime_recovery_reason": { "type": "string", "minLength": 1 },
     "accepted_envelope_id": { "type": "string" },
     "accepted_envelope_note": { "type": "string" },
+    "latest_implementer_result_ref": { "type": "string" },
+    "recovery_context_ref": { "type": "string", "minLength": 1 },
     "recovery_request_ref": { "type": "string", "minLength": 1 },
     "recovery_result_ref": { "type": "string", "minLength": 1 }
   }

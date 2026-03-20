@@ -34,6 +34,7 @@ scripts/persist_clarification_confirmation.sh --session-root <session_dir> --use
 The returned assistant message becomes the next conversation turn shown to the user.
 Those committed wrappers own the repo-local shared `uv` cache setup for ordinary full-access execution, and `--task-type` is only a hint: unsupported or omitted values are normalized automatically.
 For fresh tasks, allocate the fresh clarification session root through `scripts/new_clarification_session_root.sh`. Reuse the exact same clarification session root only when that same clarification session is still active and already known.
+If the same ordinary user turn already explicitly authorizes immediate execution and the endpoint becomes sufficiently clear on that turn, persist confirmation and continue directly instead of forcing an extra proceed-now turn.
 
 Compatibility path:
 

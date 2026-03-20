@@ -39,6 +39,8 @@ description: Materialize frozen kernel delegation into child-local execution wit
 - The heartbeat ping should request a compact status packet with: `phase`, `evaluator_state`, `request_ref`, `evaluation_report_ref`, `same_attempt`, `stalled`, and `next_action`.
 - Once real evaluator lineage exists, do not ask `whether evaluator has started` as a loose yes/no; ask for `evaluator_state` plus refs in the status packet.
 - If the host supports interrupt flags, ordinary heartbeat follow-ups should stay on the non-interrupting path.
+- Only the current implementer may propose that the task should split; root/kernel may approve or reject that proposal, but must not invent extra child nodes as if split were already accepted fact.
+- Product closeout must say whether split was proposed, accepted, rejected, or never requested, and whether any accepted split changed the outcome.
 
 ## Not responsible for
 - Declaring topology changes accepted.

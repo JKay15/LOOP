@@ -13,11 +13,15 @@ Every LOOP execution unit is a `node`, and child materialization must pass throu
 - first-child bootstrap result schema: `docs/schemas/LoopFirstImplementerBootstrapResult.schema.json`
 - orphaned-active recovery request schema: `docs/schemas/LoopOrphanedActiveRecoveryRequest.schema.json`
 - orphaned-active recovery result schema: `docs/schemas/LoopOrphanedActiveRecoveryResult.schema.json`
+- child progress snapshot schema: `docs/schemas/LoopChildProgressSnapshot.schema.json`
 - child materialization: `loop_product/dispatch/child_dispatch.py`
 - first-child bootstrap helper: `loop_product.runtime.bootstrap_first_implementer_node(...)`
 - endpoint-driven first-child bootstrap helper: `loop_product.runtime.bootstrap_first_implementer_from_endpoint(...)`
 - orphaned-active recovery helper: `loop_product.runtime.recover_orphaned_active_node(...)`
 - child runtime status helper: `loop_product.runtime.child_runtime_status_from_launch_result_ref(...)`
+- child progress snapshot helper: `loop_product.runtime.child_progress_snapshot_from_launch_result_ref(...)`
+- child supervision result schema: `docs/schemas/LoopChildSupervisionResult.schema.json`
+- child supervision helper: `loop_product.runtime.supervise_child_until_settled(...)`
 - durable node state: `.loop/state/<node_id>.json`
 - frozen delegation artifact: `.loop/state/delegations/<node_id>.json`
 
@@ -47,6 +51,7 @@ Every LOOP execution unit is a `node`, and child materialization must pass throu
 - the serialized node protocol must carry execution-strategy data explicitly: `execution_policy.agent_provider`, `execution_policy.sandbox_mode`, and `reasoning_profile.thinking_budget` cannot stay only in prose
 - child-dispatch materializes the child from frozen inputs
 - the committed endpoint-driven first-child bootstrap helper and wrapper should derive the normal first-child bootstrap request from the clarified endpoint artifact so root-chat does not need to probe `--help`, inspect request schemas, rediscover helper internals, or pre-create guessed workspace folders during the ordinary path
+- when the clarified endpoint already names exact existing local files or directories, the committed endpoint-driven first-child bootstrap helper should preserve those explicit local refs in the derived `context_refs` instead of forcing the child to rediscover them from prose
 - the committed first-child bootstrap helper must deterministically render `FrozenHandoff.json`, `FROZEN_HANDOFF.md`, and `CHILD_PROMPT.md` from frozen inputs instead of relying on root-chat freeform prose
 - the committed first-child bootstrap helper must also pre-materialize a task-scoped exact evaluator submission artifact, task-scoped evaluator manual/final-effects refs, and an exact evaluator runner for that node instead of forcing the implementer to infer evaluator wrapper arguments in chat
 - implementer child nodes must materialize one explicit project folder under `workspace/` and serialize that folder as `workspace_root`
@@ -64,8 +69,13 @@ Every LOOP execution unit is a `node`, and child materialization must pass throu
 - implementer child nodes must carry recovery permissions needed for kernel-owned `resume`, `retry`, and `relaunch` instead of shipping as non-recoverable minimal workers
 - accepted `relaunch` must materialize a replacement child from durable delegation data under the original parent rather than mutating the source node in place and pretending no restart happened
 - accepted same-node orphaned-active retry must preserve the same `workspace_root`, reuse the existing `CHILD_PROMPT.md`, and rebuild the canonical launch spec from serialized node policy instead of inventing launch variants or hand-authored recovery request JSON in chat
+- accepted same-node orphaned-active retry must also record which committed child launch result and fresh runtime-status result justified the recovery, so later audit can distinguish a truly detached child from a patient supervision window
+- committed child runtime surfaces must also expose enough durable evidence for root-side progress snapshots to summarize live state without reconstructing status from chat memory alone
+- workspace-local relaunch context should be persisted through one committed `RECOVERY_CONTEXT.md` stop-point file so the resumed implementer can read the latest kernel-approved recovery reason without reconstructing state from chat
 - implementer handoff/prompt generation must keep the primary workspace layout and local-input discovery path explicit: durable implementation files normally belong inside the materialized workspace, while endpoint-required repo-local or user-local input discovery may inspect exact external paths when the needed file was not already materialized there
 - when endpoint-required repo-local or user-local file discovery is still needed, the committed handoff/prompt surface should prefer a repo-shipped filename/path discovery helper rather than nudging the implementer toward ad hoc content grep
+- child/evaluator document-observation for supervision should come from committed launch/evaluator logs and snapshot helpers, not from bespoke child-authored “I read these docs” side reports
+- implementer nodes must not end their own conversation or present unfinished recoverable work as done; they should continue the loop or leave explicit recovery evidence for same-node continuation
 - when the frozen endpoint requires local/offline user assets, the committed handoff/prompt surface should keep sourcing local-first: search canonical local roots such as Desktop, Music, and Downloads before inventing narrower ad hoc roots, and do not browse/download remote substitutes unless the frozen handoff explicitly allows remote sourcing
 - `execution_policy`, `reasoning_profile`, and `budget_profile` must be serialized in the node contract, not left only in prose
 - `workspace_root` must be serialized in the node contract, not left only in prose

@@ -7,11 +7,13 @@ import json
 import hashlib
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from loop_product import build_endpoint_clarification_part1_input, run_evaluator
 from loop_product.evaluator.agent_execution_policy import validate_evaluator_agent_execution, validate_repo_shipped_role_agent_cmd
+from loop_product.kernel.state import load_kernel_state
 from loop_product.kernel.submit import submit_control_envelope
 from loop_product.protocols.control_envelope import ControlEnvelope, EnvelopeStatus
 from loop_product.protocols.evaluator import EvaluatorNodeSubmission, EvaluatorResult, EvaluatorVerdict
@@ -81,17 +83,187 @@ _REVIEWER_VERDICT_RE = re.compile(
     r"VERDICT\s*:\s*(PASS|FAIL|STRUCTURED_EXCEPTION|BUG|STUCK|ERROR|INCONCLUSIVE|UNKNOWN)\b",
     re.IGNORECASE,
 )
+_LEADING_REVIEWER_VERDICT_RE = re.compile(
+    r"^(?:VERDICT\s*:\s*)?(PASS|FAIL|STRUCTURED_EXCEPTION|BUG|STUCK|ERROR|INCONCLUSIVE|UNKNOWN)\b",
+    re.IGNORECASE,
+)
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _load_optional_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _terminal_completed_at_utc() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _merge_terminal_implementer_result(*, existing: dict[str, Any], canonical: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(existing)
+    forced_keys = {
+        "schema",
+        "schema_version",
+        "node_id",
+        "parent_node_id",
+        "lineage_ref",
+        "round_id",
+        "workspace_root",
+        "status",
+        "outcome",
+        "result_kind",
+        "result_ref",
+        "workspace_result_sink_ref",
+        "kernel_result_sink_ref",
+        "request_ref",
+        "evaluation_report_ref",
+        "reviewer_response_ref",
+        "runtime_refs",
+        "evaluator",
+        "evaluator_result",
+        "delivered_artifact_ref",
+        "workspace_mirror_ref",
+        "delivered_artifact_exactly_evaluated",
+        "publish_ready_artifact_refs",
+        "external_publish_target",
+        "external_publication_owner",
+    }
+    for key, value in canonical.items():
+        if key in forced_keys or key not in merged or merged[key] in ("", None, [], {}):
+            merged[key] = value
+    return merged
+
+
+def materialize_terminal_implementer_result(
+    *,
+    state_root: Path,
+    submission: EvaluatorNodeSubmission,
+    evaluator_result: EvaluatorResult,
+    runtime_refs: Mapping[str, str],
+) -> dict[str, str]:
+    """Persist an authoritative implementer_result once evaluator reaches terminal closure."""
+
+    runtime_root = require_runtime_root(state_root)
+    node_path = runtime_root / "state" / f"{submission.target_node_id}.json"
+    node_payload: dict[str, Any] | None = None
+    if node_path.exists():
+        node_payload = json.loads(node_path.read_text(encoding="utf-8"))
+    else:
+        try:
+            node_payload = dict(load_kernel_state(runtime_root).nodes.get(submission.target_node_id) or {})
+        except Exception:
+            node_payload = None
+    if not node_payload:
+        return {}
+    node = NodeSpec.from_dict(node_payload)
+    if str(node.node_kind or "") != "implementer":
+        return {}
+
+    workspace_root = Path(submission.workspace_root).expanduser().resolve()
+    handoff = _load_optional_json(workspace_root / "FROZEN_HANDOFF.json")
+    kernel_result_ref = Path(
+        str(handoff.get("kernel_result_sink_ref") or (runtime_root / node.result_sink_ref))
+    ).expanduser().resolve()
+    workspace_result_ref = Path(
+        str(handoff.get("workspace_result_sink_ref") or (workspace_root / node.result_sink_ref))
+    ).expanduser().resolve()
+    delivered_artifact_ref = str(
+        handoff.get("workspace_mirror_ref") or handoff.get("delivered_artifact_ref") or submission.implementation_package_ref
+    ).strip()
+    reviewer_response_ref = str(runtime_refs.get("reviewer_response_ref") or "").strip()
+    terminal_reviewer_excerpt = ""
+    if reviewer_response_ref and Path(reviewer_response_ref).exists():
+        terminal_reviewer_excerpt = Path(reviewer_response_ref).read_text(encoding="utf-8", errors="replace").strip()
+
+    canonical_payload: dict[str, Any] = {
+        "schema": "loop_product.implementer_result",
+        "schema_version": "0.1.0",
+        "node_id": node.node_id,
+        "parent_node_id": node.parent_node_id,
+        "lineage_ref": node.lineage_ref,
+        "round_id": node.round_id,
+        "workspace_root": str(workspace_root),
+        "status": "COMPLETED",
+        "outcome": (
+            "REPAIR_REQUIRED"
+            if evaluator_result.retryable and evaluator_result.verdict.value != "PASS"
+            else "COMPLETED"
+        ),
+        "result_kind": "implementer_result",
+        "result_ref": str(kernel_result_ref),
+        "workspace_result_sink_ref": str(workspace_result_ref),
+        "kernel_result_sink_ref": str(kernel_result_ref),
+        "request_ref": str(runtime_refs.get("request_ref") or ""),
+        "evaluation_report_ref": str(runtime_refs.get("evaluation_report_ref") or ""),
+        "reviewer_response_ref": reviewer_response_ref,
+        "runtime_refs": dict(runtime_refs),
+        "evaluator": {
+            "verdict": evaluator_result.verdict.value,
+            "request_ref": str(runtime_refs.get("request_ref") or ""),
+            "evaluation_report_ref": str(runtime_refs.get("evaluation_report_ref") or ""),
+            "reviewer_response_ref": reviewer_response_ref,
+        },
+        "evaluator_result": evaluator_result.to_dict(),
+        "delivered_artifact_ref": delivered_artifact_ref,
+        "workspace_mirror_ref": str(handoff.get("workspace_mirror_ref") or delivered_artifact_ref),
+        "delivered_artifact_exactly_evaluated": bool(delivered_artifact_ref),
+        "publish_ready_artifact_refs": [delivered_artifact_ref] if delivered_artifact_ref else [],
+        "external_publish_target": str(handoff.get("external_publish_target") or ""),
+        "external_publication_owner": str(handoff.get("external_publication_owner") or ""),
+    }
+    if terminal_reviewer_excerpt:
+        canonical_payload["terminal_reviewer_excerpt"] = terminal_reviewer_excerpt
+    if evaluator_result.summary:
+        canonical_payload["summary"] = str(evaluator_result.summary)
+    canonical_payload["completed_at_utc"] = _terminal_completed_at_utc()
+
+    authoritative_existing = _load_optional_json(kernel_result_ref)
+    authoritative_payload = _merge_terminal_implementer_result(existing=authoritative_existing, canonical=canonical_payload)
+    _write_json(kernel_result_ref, authoritative_payload)
+
+    workspace_existing = _load_optional_json(workspace_result_ref)
+    workspace_payload = _merge_terminal_implementer_result(existing=workspace_existing, canonical=authoritative_payload)
+    _write_json(workspace_result_ref, workspace_payload)
+
+    return {
+        "implementer_result_ref": str(kernel_result_ref),
+        "workspace_implementer_result_ref": str(workspace_result_ref),
+    }
 
 
 def _parse_simple_reviewer_verdict(text: str) -> str:
     sample = str(text or "")
+    for line in [item.strip() for item in sample.splitlines() if item.strip()][:5]:
+        match = _LEADING_REVIEWER_VERDICT_RE.search(line)
+        if match:
+            return match.group(1).upper()
     match = _REVIEWER_VERDICT_RE.search(sample)
     if match:
         return match.group(1).upper()
-    for token in ("STRUCTURED_EXCEPTION", "ERROR", "BUG", "STUCK", "FAIL", "PASS", "INCONCLUSIVE"):
-        if re.search(rf"\b{token}\b", sample, flags=re.IGNORECASE):
-            return token
     return "UNKNOWN"
+
+
+def _is_runtime_closure_only_terminal_completion(report: Mapping[str, Any]) -> bool:
+    if str(report.get("status") or "").strip().upper() != "COMPLETED":
+        return False
+    lanes = [dict(item) for item in list(report.get("lanes") or [])]
+    if lanes:
+        return False
+    runtime_closure_requirements = [dict(item) for item in list(report.get("runtime_closure_requirements") or [])]
+    if not runtime_closure_requirements:
+        return False
+    final_effect_requirements = [dict(item) for item in list(report.get("final_effect_requirements") or [])]
+    if final_effect_requirements and any(
+        str(dict(item).get("requirement_kind") or "").strip() not in {"", "runtime_closure"}
+        for item in final_effect_requirements
+    ):
+        return False
+    return True
 
 
 def _override_agent_execution_with_cmd(agent_execution: dict[str, Any], *, agent_cmd: str) -> dict[str, Any]:
@@ -379,38 +551,49 @@ def run_evaluator_node(
 
     report_status = str(report.get("status") or "").strip().upper()
     if report_status == "COMPLETED":
-        reviewer_text = str(((report.get("reviewer") or {}).get("raw_output_text")) or "")
-        reviewer_verdict = _parse_simple_reviewer_verdict(reviewer_text)
-        summary = f"simple evaluator reviewer verdict={reviewer_verdict}"
-        if reviewer_verdict == "PASS":
+        if _is_runtime_closure_only_terminal_completion(report):
             verdict = EvaluatorVerdict.PASS
-        elif reviewer_verdict == "FAIL":
-            verdict = EvaluatorVerdict.FAIL
-            retryable = True
-        elif reviewer_verdict == "STRUCTURED_EXCEPTION":
-            verdict = EvaluatorVerdict.STRUCTURED_EXCEPTION
-            diagnostics = {
-                "self_attribution": "evaluator_structured_exception_terminal",
-                "self_repair": "inspect evaluator-side lane artifacts before blaming the implementation",
-            }
-        elif reviewer_verdict == "BUG":
-            verdict = EvaluatorVerdict.BUG
-            diagnostics = {
-                "self_attribution": "evaluator_reviewer_bug",
-                "self_repair": "inspect reviewer-visible lane artifacts before blaming the implementation",
-            }
-        elif reviewer_verdict == "ERROR" or reviewer_verdict == "UNKNOWN":
-            verdict = EvaluatorVerdict.ERROR
-            diagnostics = {
-                "self_attribution": "evaluator_unknown_terminal",
-                "self_repair": "repair the reviewer terminal output before treating the evaluator result as authoritative",
-            }
+            summary = "simple evaluator completed with runtime_closure-only requirements and no delegated reviewer lanes"
         else:
-            verdict = EvaluatorVerdict.STUCK
-            diagnostics = {
-                "self_attribution": "evaluator_uncertain",
-                "self_repair": "narrow the acceptance surface or gather more visible evidence before retrying",
-            }
+            reviewer_text = str(((report.get("reviewer") or {}).get("raw_output_text")) or "")
+            reviewer_verdict = _parse_simple_reviewer_verdict(reviewer_text)
+            summary = f"simple evaluator reviewer verdict={reviewer_verdict}"
+            if reviewer_verdict == "PASS":
+                verdict = EvaluatorVerdict.PASS
+            elif reviewer_verdict == "FAIL":
+                verdict = EvaluatorVerdict.FAIL
+                retryable = True
+                diagnostics = {
+                    "self_attribution": "implementation_gap",
+                    "self_repair": (
+                        "repair the in-scope product requirements named by the evaluator lanes "
+                        "and rerun the evaluator instead of treating this FAIL as completed closeout"
+                    ),
+                }
+            elif reviewer_verdict == "STRUCTURED_EXCEPTION":
+                verdict = EvaluatorVerdict.STRUCTURED_EXCEPTION
+                diagnostics = {
+                    "self_attribution": "evaluator_structured_exception_terminal",
+                    "self_repair": "inspect evaluator-side lane artifacts before blaming the implementation",
+                }
+            elif reviewer_verdict == "BUG":
+                verdict = EvaluatorVerdict.BUG
+                diagnostics = {
+                    "self_attribution": "evaluator_reviewer_bug",
+                    "self_repair": "inspect reviewer-visible lane artifacts before blaming the implementation",
+                }
+            elif reviewer_verdict == "ERROR" or reviewer_verdict == "UNKNOWN":
+                verdict = EvaluatorVerdict.ERROR
+                diagnostics = {
+                    "self_attribution": "evaluator_unknown_terminal",
+                    "self_repair": "repair the reviewer terminal output before treating the evaluator result as authoritative",
+                }
+            else:
+                verdict = EvaluatorVerdict.STUCK
+                diagnostics = {
+                    "self_attribution": "evaluator_uncertain",
+                    "self_repair": "narrow the acceptance surface or gather more visible evidence before retrying",
+                }
     elif report_status == "HUMAN_GATE":
         verdict = EvaluatorVerdict.STUCK
         summary = "simple evaluator reached a human gate"
@@ -433,6 +616,33 @@ def run_evaluator_node(
             ),
             "issue_kind": str(error_obj.get("issue_kind") or ""),
         }
+    elif report_status == "ERROR":
+        error_obj = dict(report.get("error") or {})
+        stage = str(error_obj.get("stage") or "runtime")
+        message = str(error_obj.get("message") or "simple evaluator error")
+        error_kind = str(error_obj.get("kind") or "").strip().upper()
+        issue_kind = str(error_obj.get("issue_kind") or "").strip()
+        if error_kind == "STRUCTURED_EXCEPTION":
+            verdict = EvaluatorVerdict.STRUCTURED_EXCEPTION
+            summary = f"simple evaluator structured exception ({issue_kind or 'runtime'}) at {stage}: {message}"
+            diagnostics = {
+                "self_attribution": str(error_obj.get("self_attribution") or f"evaluator_{stage}"),
+                "self_repair": str(
+                    error_obj.get("self_repair")
+                    or "repair the evaluator-side execution path before blaming the implementation"
+                ),
+            }
+        else:
+            verdict = EvaluatorVerdict.ERROR
+            summary = f"simple evaluator error at {stage}: {message}"
+            diagnostics = {
+                "self_attribution": str(error_obj.get("self_attribution") or f"evaluator_{stage}"),
+                "self_repair": str(
+                    error_obj.get("self_repair")
+                    or "repair the evaluator-side execution path before blaming the implementation"
+                ),
+                "issue_kind": issue_kind,
+            }
     else:
         error_obj = dict(report.get("error") or {})
         stage = str(error_obj.get("stage") or "runtime")
@@ -494,6 +704,15 @@ def run_evaluator_node(
             ),
             runtime_refs,
     )
+    if report_status != "RECOVERY_REQUIRED":
+        runtime_refs.update(
+            materialize_terminal_implementer_result(
+                state_root=state_root,
+                submission=submission,
+                evaluator_result=evaluator_result,
+                runtime_refs=runtime_refs,
+            )
+        )
     return evaluator_result, runtime_refs
 
 

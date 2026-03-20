@@ -153,6 +153,70 @@ def main() -> int:
         if "DONE" not in stdout_ref.read_text(encoding="utf-8", errors="replace"):
             return _fail("launch helper must preserve child stdout in the structured log ref")
 
+        sanitized_env_result_path = state_root / "artifacts" / "bootstrap" / "SanitizedEnvBootstrapResult.json"
+        sanitized_env_result_path.write_text(
+            json.dumps(
+                {
+                    "node_id": "test-child-launch-helper",
+                    "workspace_root": str(workspace_root.resolve()),
+                    "state_root": str(state_root.resolve()),
+                    "launch_spec": {
+                        "argv": [
+                            "/bin/sh",
+                            "-lc",
+                            (
+                                "printf 'THREAD=%s\\n' \"${CODEX_THREAD_ID-}\"; "
+                                "printf 'SANDBOX=%s\\n' \"${CODEX_SANDBOX_NETWORK_DISABLED-}\"; "
+                                "printf 'OTEL_SDK=%s\\n' \"${OTEL_SDK_DISABLED-}\"; "
+                                "printf 'OTEL_TRACES=%s\\n' \"${OTEL_TRACES_EXPORTER-}\"; "
+                                "printf 'HTTP_PROXY=%s\\n' \"${http_proxy-}\""
+                            ),
+                        ],
+                        "env": {},
+                        "cwd": str(workspace_root.resolve()),
+                        "stdin_path": str(prompt_path.resolve()),
+                    },
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        os.environ["CODEX_THREAD_ID"] = "test-thread"
+        os.environ["CODEX_SANDBOX_NETWORK_DISABLED"] = "1"
+        os.environ["OTEL_SDK_DISABLED"] = "false"
+        os.environ["OTEL_TRACES_EXPORTER"] = "otlp"
+        os.environ["http_proxy"] = "http://127.0.0.1:7890"
+        try:
+            sanitized_env_proc = _run_helper(script=script, result_ref=sanitized_env_result_path, wrapper_path=wrapper_path)
+        finally:
+            os.environ.pop("CODEX_THREAD_ID", None)
+            os.environ.pop("CODEX_SANDBOX_NETWORK_DISABLED", None)
+            os.environ.pop("OTEL_SDK_DISABLED", None)
+            os.environ.pop("OTEL_TRACES_EXPORTER", None)
+            os.environ.pop("http_proxy", None)
+        if sanitized_env_proc.returncode != 0:
+            detail = sanitized_env_proc.stderr.strip() or sanitized_env_proc.stdout.strip()
+            return _fail(f"sanitized-env child launch should still return structured output: {detail}")
+        sanitized_env_result = json.loads(sanitized_env_proc.stdout)
+        Draft202012Validator(result_schema).validate(sanitized_env_result)
+        sanitized_env_stdout = Path(str(sanitized_env_result.get("stdout_ref") or "")).read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
+        if "THREAD=\n" not in sanitized_env_stdout:
+            return _fail("child launch helper must scrub parent CODEX_THREAD_ID from direct Codex child env")
+        if "SANDBOX=\n" not in sanitized_env_stdout:
+            return _fail("child launch helper must scrub parent CODEX_SANDBOX_NETWORK_DISABLED from direct Codex child env")
+        if "OTEL_SDK=true\n" not in sanitized_env_stdout:
+            return _fail("child launch helper must force-disable OTEL SDK in direct Codex child env")
+        if "OTEL_TRACES=none\n" not in sanitized_env_stdout:
+            return _fail("child launch helper must disable OTEL trace exporter in direct Codex child env")
+        if "HTTP_PROXY=http://127.0.0.1:7890\n" not in sanitized_env_stdout:
+            return _fail("child launch helper must preserve parent proxy env needed for Codex transport")
+
         retry_counter = workspace_root / "retry.counter"
         retry_result_path = state_root / "artifacts" / "bootstrap" / "RetryImplementerBootstrapResult.json"
         retry_result_path.write_text(
@@ -364,6 +428,104 @@ def main() -> int:
 
         from loop_product import ai_launch as ai_launch_module
         from loop_product.dispatch import launch_runtime as launch_runtime_module
+
+        host_zombie_node_id = "test-child-launch-helper-host-zombie"
+        host_zombie_result_path = state_root / "artifacts" / "bootstrap" / "HostZombieBootstrapResult.json"
+        host_zombie_result_path.write_text(
+            json.dumps(
+                {
+                    "node_id": host_zombie_node_id,
+                    "workspace_root": str(workspace_root.resolve()),
+                    "state_root": str(state_root.resolve()),
+                    "launch_spec": {
+                        "argv": ["/bin/sh", "-lc", "cat > host.zombie.stdin.txt; printf HOST_ZOMBIE_OK"],
+                        "env": {},
+                        "cwd": str(workspace_root.resolve()),
+                        "stdin_path": str(prompt_path.resolve()),
+                    },
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        zombie_pid_path = workspace_root / "host.zombie.pid"
+        zombie_driver = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os, sys, time\n"
+                    "path = sys.argv[1]\n"
+                    "pid = os.fork()\n"
+                    "if pid == 0:\n"
+                    "    os._exit(0)\n"
+                    "with open(path, 'w', encoding='utf-8') as handle:\n"
+                    "    handle.write(str(pid))\n"
+                    "time.sleep(30)\n"
+                ),
+                str(zombie_pid_path),
+            ],
+            cwd=str(ROOT),
+            text=True,
+        )
+        try:
+            deadline = time.time() + 5.0
+            while not zombie_pid_path.exists() and time.time() < deadline:
+                time.sleep(0.05)
+            if not zombie_pid_path.exists():
+                return _fail("host-backed launch zombie coverage must materialize a zombie pid")
+            zombie_pid = int(zombie_pid_path.read_text(encoding="utf-8").strip())
+            original_request = launch_runtime_module.request_host_child_launch
+            original_should = launch_runtime_module.should_request_host_child_launch
+            try:
+                def _fake_host_launch(**_kwargs: object) -> dict[str, object]:
+                    return {
+                        "launch_decision": "started_existing",
+                        "source_result_ref": str(host_zombie_result_path.resolve()),
+                        "node_id": host_zombie_node_id,
+                        "workspace_root": str(workspace_root.resolve()),
+                        "state_root": str(state_root.resolve()),
+                        "startup_health_timeout_ms": 250,
+                        "startup_retry_limit": 1,
+                        "attempt_count": 0,
+                        "retryable_failure_kind": "",
+                        "attempts": [],
+                        "launch_request_ref": str((state_root / "artifacts" / "launches" / host_zombie_node_id / "attempt_zombie_host" / "ChildLaunchRequest.json").resolve()),
+                        "launch_result_ref": str((state_root / "artifacts" / "launches" / host_zombie_node_id / "attempt_zombie_host" / "ChildLaunchResult.json").resolve()),
+                        "launch_log_dir": str((state_root / "artifacts" / "launches" / host_zombie_node_id / "attempt_zombie_host" / "logs").resolve()),
+                        "stdout_ref": str((state_root / "artifacts" / "launches" / host_zombie_node_id / "attempt_zombie_host" / "logs" / "stdout.txt").resolve()),
+                        "stderr_ref": str((state_root / "artifacts" / "launches" / host_zombie_node_id / "attempt_zombie_host" / "logs" / "stderr.txt").resolve()),
+                        "stdin_ref": str(prompt_path.resolve()),
+                        "wrapped_argv": ["codex", "exec", "-"],
+                        "wrapper_cmd": "",
+                        "pid": zombie_pid,
+                        "exit_code": None,
+                        "reuse_launch_result_ref": str((state_root / "artifacts" / "launches" / host_zombie_node_id / "attempt_zombie_host" / "ChildLaunchResult.json").resolve()),
+                    }
+
+                launch_runtime_module.request_host_child_launch = _fake_host_launch
+                launch_runtime_module.should_request_host_child_launch = lambda: True
+                zombie_corrected = launch_runtime_module.launch_child_from_result_ref(
+                    result_ref=host_zombie_result_path,
+                    startup_probe_ms=50,
+                    startup_health_timeout_ms=250,
+                )
+            finally:
+                launch_runtime_module.request_host_child_launch = original_request
+                launch_runtime_module.should_request_host_child_launch = original_should
+            Draft202012Validator(result_schema).validate(zombie_corrected)
+            if str(zombie_corrected.get("launch_decision") or "") == "started_existing":
+                return _fail("host-backed child launch must not reuse a zombie pid as started_existing")
+            if int(zombie_corrected.get("pid") or 0) == zombie_pid:
+                return _fail("host-backed child launch must replace zombie reuse results with a fresh direct launch result")
+        finally:
+            try:
+                zombie_driver.terminate()
+            except ProcessLookupError:
+                pass
+            zombie_driver.wait(timeout=5)
 
         original_tmux_available = ai_launch_module._tmux_available
         original_resolve_tmux_target_session = ai_launch_module._resolve_tmux_target_session

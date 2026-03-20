@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,10 @@ def _nonempty(value: Any) -> str:
     return str(value or "").strip()
 
 
+_ABSOLUTE_PATH_RE = re.compile(r"/[A-Za-z0-9._~%+=:@,/-]+")
+_RELATIVE_PATH_RE = re.compile(r"(?:\.\./|\./)?[A-Za-z0-9._-]+(?:/[A-Za-z0-9._~%+=:@,-]+)+")
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -45,6 +50,73 @@ def _write_text(path: Path, text: str) -> None:
 def _write_executable_text(path: Path, text: str) -> None:
     _write_text(path, text)
     path.chmod(0o755)
+
+
+def _dedupe_refs(items: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in items:
+        value = _nonempty(raw)
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _existing_absolute_path_refs(texts: list[str]) -> list[str]:
+    refs: list[str] = []
+    for text in texts:
+        normalized = _nonempty(text)
+        if not normalized:
+            continue
+        for match in _ABSOLUTE_PATH_RE.finditer(normalized):
+            candidate = match.group(0).rstrip(".,;:)]}")
+            path = Path(candidate).expanduser()
+            if path.exists():
+                refs.append(str(path.resolve()))
+    return _dedupe_refs(refs)
+
+
+def _existing_relative_path_refs(*, texts: list[str], search_roots: list[Path]) -> list[str]:
+    refs: list[str] = []
+    for text in texts:
+        normalized = _nonempty(text)
+        if not normalized:
+            continue
+        for match in _RELATIVE_PATH_RE.finditer(normalized):
+            candidate = match.group(0).rstrip(".,;:)]}")
+            if "://" in candidate:
+                continue
+            relative_path = Path(candidate)
+            if relative_path.is_absolute():
+                continue
+            for root in search_roots:
+                resolved = (root / relative_path).resolve()
+                if resolved.exists():
+                    refs.append(str(resolved))
+                    break
+    return _dedupe_refs(refs)
+
+
+def _derive_endpoint_context_refs(
+    *,
+    artifact_path: Path,
+    artifact_payload: dict[str, Any],
+    explicit_context_refs: list[str],
+) -> list[str]:
+    requirement_artifact = dict(artifact_payload.get("requirement_artifact") or {})
+    textual_context: list[str] = []
+    textual_context.extend(str(item or "") for item in list(requirement_artifact.get("relevant_context") or []))
+    textual_context.extend(str(item.get("text") or "") for item in list(artifact_payload.get("confirmed_requirements") or []))
+    textual_context.append(str(artifact_payload.get("original_user_prompt") or ""))
+    path_refs = _existing_absolute_path_refs(textual_context)
+    repo_root = product_repo_root().resolve()
+    relative_refs = _existing_relative_path_refs(
+        texts=textual_context,
+        search_roots=[repo_root, *repo_root.parents],
+    )
+    return _dedupe_refs([str(artifact_path.resolve()), *list(explicit_context_refs), *path_refs, *relative_refs])
 
 
 def _path_missing_or_empty(path: Path) -> bool:
@@ -240,6 +312,8 @@ def _render_child_prompt(
             "For non-trivial content transforms, prefer committed helpers or Python over brittle shell quoting or in-place one-liners on the primary deliverable.",
             "Build primary deliverable updates through a temp path and atomic replace instead of clobbering the live output in place.",
             "Do not publish directly to the external publish target from this node unless the frozen handoff explicitly makes publication implementer-owned; the normal owner is root-kernel.",
+            "If bounded progress reveals a meaningful parallelizable gap, surface a split request upward to the root kernel with the proposed child slices and why the current node should no longer own all remaining work alone.",
+            "Do not directly materialize child nodes yourself or mutate topology fact from implementer context; split remains kernel-owned until an explicit acceptance decision exists.",
             "For the repo-root reads required by `workspace/AGENTS.md`, use these exact refs instead of guessing relative paths from the project folder:",
             "",
             f"- `{loop_runner_skill}`",
@@ -259,6 +333,8 @@ def _render_child_prompt(
             "If useful for local debugging or mirror evidence, you may also update the workspace-local mirror result sink:",
             "",
             f"- `{workspace_result_sink_abs.resolve()}`",
+            "",
+            "In your final implementer report, report whether split was proposed or accepted so root closeout can describe the split path truthfully.",
         ]
     )
 
@@ -658,6 +734,11 @@ def bootstrap_first_implementer_from_endpoint(*, authority: KernelMutationAuthor
     workspace_mirror_relpath = _nonempty(payload.get("workspace_mirror_relpath"))
     artifact_path, artifact_payload = _load_endpoint_artifact_payload(endpoint_artifact_ref)
     root_goal, child_goal_slice = _render_goal_from_endpoint_artifact(artifact_payload)
+    context_refs = _derive_endpoint_context_refs(
+        artifact_path=artifact_path,
+        artifact_payload=artifact_payload,
+        explicit_context_refs=[str(item) for item in (payload.get("context_refs") or [])],
+    )
     task_slug = _nonempty(payload.get("task_slug")) or _default_task_slug(
         artifact_payload=artifact_payload,
         artifact_path=artifact_path,
@@ -675,7 +756,7 @@ def bootstrap_first_implementer_from_endpoint(*, authority: KernelMutationAuthor
         "round_id": _nonempty(payload.get("round_id") or "R1") or "R1",
         "workspace_mirror_relpath": workspace_mirror_relpath or _default_workspace_mirror_relpath(external_publish_target),
         "external_publish_target": external_publish_target,
-        "context_refs": [str(item) for item in (payload.get("context_refs") or [str(artifact_path)])],
+        "context_refs": context_refs,
         "result_sink_ref": _nonempty(payload.get("result_sink_ref")),
     }
     return bootstrap_first_implementer_node(authority=authority, **request)

@@ -8,6 +8,13 @@ task_slug=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --task-type)
+      if [[ $# -lt 2 ]]; then
+        echo "new_clarification_session_root.sh: --task-type requires a value" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
     --task-slug)
       if [[ $# -lt 2 ]]; then
         echo "new_clarification_session_root.sh: --task-slug requires a value" >&2

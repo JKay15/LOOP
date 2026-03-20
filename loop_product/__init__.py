@@ -9,6 +9,7 @@ _LAZY_EXPORTS = {
     "child_runtime_status_from_launch_result_ref": (".runtime", "child_runtime_status_from_launch_result_ref"),
     "publish_external_from_implementer_result": (".runtime", "publish_external_from_implementer_result"),
     "recover_orphaned_active_node": (".runtime", "recover_orphaned_active_node"),
+    "supervise_child_until_settled": (".runtime", "supervise_child_until_settled"),
     "apply_endpoint_clarification_decision": (
         ".endpoint.clarification",
         "apply_endpoint_clarification_decision",
@@ -65,6 +66,7 @@ __all__ = [
     "child_runtime_status_from_launch_result_ref",
     "publish_external_from_implementer_result",
     "recover_orphaned_active_node",
+    "supervise_child_until_settled",
     "build_ai_user_prompt",
     "build_checker_prompt",
     "build_endpoint_clarification_part1_input",
