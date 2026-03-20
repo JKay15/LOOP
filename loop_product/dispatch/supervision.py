@@ -20,6 +20,15 @@ def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _load_optional_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return _load_json(path)
+    except Exception:
+        return {}
+
+
 def _authoritative_result_ref(*, state_root: Path, node_id: str) -> Path:
     try:
         node_payload = dict(load_kernel_state(state_root).nodes.get(node_id) or {})
@@ -86,6 +95,30 @@ def _build_recovery_payload(
         ),
         "evidence_refs": evidence_refs,
     }
+
+
+def _retryable_issue_kind(
+    *,
+    status: Mapping[str, Any],
+    result_payload: Mapping[str, Any] | None,
+) -> str:
+    evaluator_result = dict((result_payload or {}).get("evaluator_result") or {})
+    diagnostics = dict(evaluator_result.get("diagnostics") or {})
+    issue_kind = str(diagnostics.get("issue_kind") or "").strip().lower()
+    if issue_kind:
+        return issue_kind
+    launch_result_ref = _absolute(str(status.get("launch_result_ref") or ""))
+    launch_payload = _load_optional_json(launch_result_ref)
+    return str(launch_payload.get("retryable_failure_kind") or "").strip().lower()
+
+
+def _recovery_delay_s(*, issue_kind: str, recovery_count: int) -> float:
+    normalized = str(issue_kind or "").strip().lower()
+    if normalized == "provider_capacity":
+        return min(3.0, 0.75 * max(1, recovery_count))
+    if normalized in {"provider_transport", "provider_runtime"}:
+        return min(2.0, 0.5 * max(1, recovery_count))
+    return 0.0
 
 
 def supervise_child_until_settled(
@@ -185,6 +218,12 @@ def supervise_child_until_settled(
                 }
                 validate_repo_object("LoopChildSupervisionResult.schema.json", result)
                 return result
+            delay_s = _recovery_delay_s(
+                issue_kind=_retryable_issue_kind(status=status, result_payload=result_payload),
+                recovery_count=recoveries_used + 1,
+            )
+            if delay_s > 0.0:
+                sleep_fn(delay_s)
             recovery_payload = _build_recovery_payload(
                 status=status,
                 result_ref=result_ref if result_ref.exists() else None,

@@ -244,6 +244,165 @@ def main() -> int:
         if str(result.get("latest_launch_result_ref") or "") != str(launch_result_ref_2.resolve()):
             return _fail("child supervision helper must update the settled launch_result_ref after relaunch")
 
+        workspace_root = ROOT / "workspace" / "test-child-supervision-provider-capacity"
+        state_root = ROOT / ".loop" / "test-child-supervision-provider-capacity"
+        shutil.rmtree(workspace_root, ignore_errors=True)
+        shutil.rmtree(state_root, ignore_errors=True)
+        bootstrap = bootstrap_first_implementer_node(
+            mode="fresh",
+            task_slug="test-child-supervision-provider-capacity",
+            root_goal="bootstrap one implementer node for provider-capacity cooldown validation",
+            child_goal_slice="continue after transient provider-capacity launch failure until the run settles",
+            endpoint_artifact_ref=str(endpoint.resolve()),
+            workspace_root=str(workspace_root),
+            state_root=str(state_root),
+            workspace_mirror_relpath="deliverables/out.txt",
+            external_publish_target=str((temp_root / "Desktop" / "out-capacity.txt").resolve()),
+            context_refs=[],
+        )
+
+        node_id = str(bootstrap["node_id"])
+        implementer_result_ref = state_root / "artifacts" / node_id / "implementer_result.json"
+        implementer_result_ref.parent.mkdir(parents=True, exist_ok=True)
+        launch_result_ref_1 = state_root / "artifacts" / "launches" / node_id / "attempt_001" / "ChildLaunchResult.json"
+        launch_result_ref_1.parent.mkdir(parents=True, exist_ok=True)
+        launch_result_ref_1.write_text(
+            json.dumps(
+                {
+                    "launch_result_ref": str(launch_result_ref_1.resolve()),
+                    "launch_decision": "retry_exhausted",
+                    "node_id": node_id,
+                    "state_root": str(state_root.resolve()),
+                    "workspace_root": str(workspace_root.resolve()),
+                    "attempt_count": 2,
+                    "startup_retry_limit": 1,
+                    "retryable_failure_kind": "provider_capacity",
+                    "attempts": [
+                        {"attempt_index": 1, "retryable_failure_kind": "provider_capacity", "exit_code": 1},
+                        {"attempt_index": 2, "retryable_failure_kind": "provider_capacity", "exit_code": 1},
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        launch_result_ref_2 = state_root / "artifacts" / "launches" / node_id / "attempt_002" / "ChildLaunchResult.json"
+        launch_result_ref_2.parent.mkdir(parents=True, exist_ok=True)
+        launch_result_ref_2.write_text(
+            json.dumps(
+                {
+                    "launch_result_ref": str(launch_result_ref_2.resolve()),
+                    "launch_decision": "started",
+                    "node_id": node_id,
+                    "state_root": str(state_root.resolve()),
+                    "workspace_root": str(workspace_root.resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        capacity_status_calls = {"count": 0}
+        capacity_recovery_calls: list[dict[str, object]] = []
+        capacity_launch_calls: list[str] = []
+        capacity_sleep_calls: list[float] = []
+
+        def _capacity_status_reader(*, result_ref: str | Path, stall_threshold_s: float = 60.0) -> dict[str, object]:
+            launch_result_ref = str(Path(result_ref).resolve())
+            capacity_status_calls["count"] += 1
+            status_ref = temp_root / f"capacity-status-{capacity_status_calls['count']}.json"
+            if capacity_status_calls["count"] == 1:
+                return {
+                    "launch_result_ref": launch_result_ref,
+                    "status_result_ref": str(status_ref.resolve()),
+                    "node_id": node_id,
+                    "state_root": str(state_root.resolve()),
+                    "workspace_root": str(workspace_root.resolve()),
+                    "pid_alive": False,
+                    "recovery_eligible": True,
+                    "stall_threshold_s": stall_threshold_s,
+                    "recovery_reason": "active_without_live_pid",
+                }
+            return {
+                "launch_result_ref": launch_result_ref,
+                "status_result_ref": str(status_ref.resolve()),
+                "node_id": node_id,
+                "state_root": str(state_root.resolve()),
+                "workspace_root": str(workspace_root.resolve()),
+                "pid_alive": False,
+                "recovery_eligible": False,
+                "stall_threshold_s": stall_threshold_s,
+                "recovery_reason": "",
+            }
+
+        def _capacity_recovery_runner(**payload):
+            capacity_recovery_calls.append(dict(payload))
+            recovery_result_ref = state_root / "artifacts" / "recovery" / node_id / "OrphanedActiveRecoveryResult.json"
+            recovery_result_ref.parent.mkdir(parents=True, exist_ok=True)
+            recovery_payload = {
+                "recovery_result_ref": str(recovery_result_ref.resolve()),
+                "node_id": node_id,
+                "state_root": str(state_root.resolve()),
+                "workspace_root": str(workspace_root.resolve()),
+                "recovery_decision": "accepted",
+            }
+            recovery_result_ref.write_text(json.dumps(recovery_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            return recovery_payload
+
+        def _capacity_launcher(*, result_ref: str | Path, startup_probe_ms: int = 1500, startup_health_timeout_ms: int = 12000):
+            del startup_probe_ms, startup_health_timeout_ms
+            capacity_launch_calls.append(str(result_ref))
+            implementer_result_ref.write_text(
+                json.dumps(
+                    {
+                        "schema": "loop_product.implementer_result",
+                        "schema_version": "0.1.0",
+                        "node_id": node_id,
+                        "status": "COMPLETED",
+                        "outcome": "COMPLETED",
+                        "evaluator_result": {
+                            "verdict": "PASS",
+                            "retryable": False,
+                            "summary": "simple evaluator reviewer verdict=PASS",
+                            "diagnostics": {"self_attribution": "", "self_repair": ""},
+                        },
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return {"launch_result_ref": str(launch_result_ref_2.resolve())}
+
+        capacity_result = supervise_child_until_settled(
+            launch_result_ref=launch_result_ref_1,
+            poll_interval_s=0.0,
+            stall_threshold_s=0.0,
+            max_recoveries=2,
+            max_wall_clock_s=0.0,
+            runtime_status_reader=_capacity_status_reader,
+            recovery_runner=_capacity_recovery_runner,
+            launcher=_capacity_launcher,
+            sleep_fn=capacity_sleep_calls.append,
+        )
+        Draft202012Validator(supervision_schema).validate(capacity_result)
+
+        if str(capacity_result.get("settled_reason") or "") != "pass":
+            return _fail("provider-capacity recovery path must still settle as pass after successful relaunch")
+        if len(capacity_recovery_calls) != 1 or len(capacity_launch_calls) != 1:
+            return _fail("provider-capacity path must still perform exactly one recovery/relaunch cycle in this fixture")
+        if not capacity_sleep_calls:
+            return _fail("child supervision helper must apply a bounded cooldown before recovering from provider-capacity launch churn")
+        if abs(float(capacity_sleep_calls[0]) - 0.75) > 1e-9:
+            return _fail("child supervision helper must apply the expected first provider-capacity cooldown before relaunch")
+        if str(capacity_result.get("latest_launch_result_ref") or "") != str(launch_result_ref_2.resolve()):
+            return _fail("provider-capacity recovery path must still update the settled launch_result_ref after relaunch")
+
     print("[loop-system-child-supervision-helper] OK")
     return 0
 
