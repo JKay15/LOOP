@@ -4885,6 +4885,7 @@ def _run_ai_user_effect(
         dest=stage_visible_ai_user_dir / "operation_log.md",
     )
     exec_span = _load_json(Path(str(role_run["exec_span_ref"])))
+    canonical_runtime_id = _safe_role_runtime_id(str(role_run.get("role_instance_id") or role_instance_id))
     for key in ("stdout_path", "stderr_path"):
         raw_log_path = _resolve_role_exec_log_ref(
             artifact_root=Path(str(role_run["exec_span_ref"])).parent,
@@ -4896,7 +4897,12 @@ def _run_ai_user_effect(
         source_path = Path(raw_log_path)
         if not source_path.exists():
             continue
-        _copy_file_if_needed(source=source_path, dest=stage_visible_ai_user_dir / source_path.name)
+        suffix = "stdout.txt" if key == "stdout_path" else "stderr.txt"
+        for dest in (
+            stage_visible_ai_user_dir / source_path.name,
+            stage_visible_ai_user_dir / f"{canonical_runtime_id}.{suffix}",
+        ):
+            _copy_file_if_needed(source=source_path, dest=dest)
     return {
         "unit_id": unit_id,
         "target_evaluation_unit": dict(target_unit),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import sys
 import time
@@ -52,6 +53,19 @@ def _target_unit_and_requirements(context: dict[str, object]) -> tuple[dict[str,
             [requirement],
         )
     return {"unit_id": "EU-UNKNOWN", "requirement_ids": [], "requirements": []}, []
+
+
+def _wave_token_from_context(context: dict[str, object]) -> str:
+    evaluation_id = str(context.get("evaluation_id") or "")
+    match = re.search(r"(wave\d+)", evaluation_id)
+    if match:
+        return match.group(1)
+    requirement = dict(context.get("requirement") or {})
+    requirement_id = str(requirement.get("requirement_id") or "")
+    match = re.search(r"(wave\d+)", requirement_id)
+    if match:
+        return match.group(1)
+    return "wave_unknown"
 
 
 def _checker_endpoint_pass() -> dict[str, object]:
@@ -345,6 +359,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "runtime_closure_requirements",
             "runtime_closure_only_requirements",
             "linger_after_response",
+            "wave_sequence",
         ),
         required=True,
     )
@@ -481,6 +496,97 @@ def main(argv: list[str] | None = None) -> int:
                 },
             )
             _write_text(response_path, "VERDICT: PASS\nsummary: synthetic reviewer completed after transient lane retry.\n")
+            return 0
+        raise SystemExit(f"unexpected role: {role}")
+
+    if args.scenario == "wave_sequence":
+        wave = _wave_token_from_context(context)
+        fail_wave = str(os.environ.get("LOOP_FIXTURE_FAIL_WAVE") or "").strip()
+        transient_wave = str(os.environ.get("LOOP_FIXTURE_TRANSIENT_WAVE") or "").strip()
+        transient_role = str(os.environ.get("LOOP_FIXTURE_TRANSIENT_ROLE") or "reviewer").strip()
+        transient_message = str(
+            os.environ.get("LOOP_FIXTURE_TRANSIENT_MESSAGE") or "unexpected status 502 Bad Gateway"
+        ).strip()
+        transient_dir = Path(os.environ.get("LOOP_FIXTURE_TRANSIENT_DIR") or context["workspace_root"])
+        if role == "checker":
+            requirement = {
+                "requirement_id": f"{wave}_REQ_001",
+                "description": f"{wave} final effect remains real and minimal.",
+                "blocking": True,
+                "requirement_kind": "product_effect",
+            }
+            _write_json(
+                result_path,
+                {
+                    "status": "OK",
+                    "normalized_requirements": [requirement],
+                    "requirement_graph": {
+                        "requirements": [requirement],
+                        "evaluation_units": [
+                            {
+                                "unit_id": f"{wave}_EU_001",
+                                "requirement_ids": [requirement["requirement_id"]],
+                            }
+                        ],
+                        "dependency_edges": [],
+                    },
+                    "repair_actions": [],
+                    "human_gate_reasons": [],
+                    "notes": [f"normalized one requirement for {wave}"],
+                },
+            )
+            _write_text(response_path, f"# Checker\n\nFixture checker normalized {wave}.\n")
+            return 0
+        if role == "test_designer":
+            _write_json(result_path, {"status": "OK", "notes": [f"test designer completed {wave}"]})
+            _write_text(response_path, f"# Test Designer\n\nFixture test designer completed {wave}.\n")
+            return 0
+        if role in {"ai_user", "reviewer"} and transient_wave == wave and transient_role == role:
+            marker = transient_dir / ".loop_fixture_state" / f"{wave}.{role}.transient_once"
+            if not marker.exists():
+                _write_text(marker, "transient\n")
+                print(transient_message, file=sys.stderr)
+                return 1
+        if role == "ai_user":
+            requirement_id = f"{wave}_REQ_001"
+            _write_json(
+                result_path,
+                {
+                    "status": "OK",
+                    "operation_log_ref": str(operation_log_path) if operation_log_path is not None else "",
+                    "effect_results": [
+                        {
+                            "requirement_id": requirement_id,
+                            "outcome": "PASS",
+                            "summary": f"AI-as-User completed {wave}.",
+                            "evidence_refs": [str(response_path)],
+                        }
+                    ],
+                    "notes": [f"ai_user completed {wave}"],
+                },
+            )
+            _write_text(response_path, f"# AI-as-User\n\nFixture AI-as-User completed {wave}.\n")
+            return 0
+        if role == "reviewer":
+            verdict = "FAIL" if fail_wave == wave else "PASS"
+            _write_json(
+                result_path,
+                {
+                    "status": "OK",
+                    "effect_reviews": [
+                        {
+                            "requirement_id": f"{wave}_REQ_001",
+                            "verdict": verdict,
+                            "evidence_refs": [str(response_path)],
+                            "reproduction_steps": [f"Review the synthetic {wave} fixture evidence."],
+                        }
+                    ],
+                },
+            )
+            _write_text(
+                response_path,
+                f"VERDICT: {verdict}\nwave: {wave}\nsummary: reviewer saw deterministic repo-shipped fixture outputs.\n",
+            )
             return 0
         raise SystemExit(f"unexpected role: {role}")
 
