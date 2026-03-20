@@ -1264,6 +1264,100 @@ def main() -> int:
             if not path.exists():
                 return _fail(f"public runtime bootstrap must materialize ordinary-caller artifact {path}")
 
+        artifact_workspace_root = temp_root / "artifact_workspace"
+        artifact_root = artifact_workspace_root / "deliverables" / "primary_artifact"
+        (artifact_root / "LinearlyBiasedPredictorChain").mkdir(parents=True, exist_ok=True)
+        (artifact_workspace_root / "artifacts").mkdir(parents=True, exist_ok=True)
+        (artifact_workspace_root / "workspace").mkdir(parents=True, exist_ok=True)
+        (artifact_root / "README.md").write_text("# README\n", encoding="utf-8")
+        (artifact_root / "TRACEABILITY.md").write_text("# TRACEABILITY\n", encoding="utf-8")
+        (artifact_root / "BUILD.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (artifact_root / "LinearlyBiasedPredictorChain" / "Core.lean").write_text("def stub : Nat := 0\n", encoding="utf-8")
+        (artifact_root / ".lake" / "packages" / "mathlib").mkdir(parents=True, exist_ok=True)
+        (artifact_root / ".lake" / "packages" / "mathlib" / "dummy.txt").write_text("cached\n", encoding="utf-8")
+        (artifact_root / ".git").mkdir(parents=True, exist_ok=True)
+        (artifact_root / ".git" / "config").write_text("[core]\n\trepositoryformatversion = 0\n", encoding="utf-8")
+        (artifact_root / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+        (artifact_root / ".venv" / "bin" / "python").write_text("# stub\n", encoding="utf-8")
+        (artifact_root / ".uv-cache").mkdir(parents=True, exist_ok=True)
+        (artifact_root / ".uv-cache" / "cache.txt").write_text("cache\n", encoding="utf-8")
+        artifact_manual_ref = artifact_workspace_root / "PRODUCT_MANUAL.md"
+        artifact_manual_ref.write_text("# Manual\n\nInspect the staged deliverable only.\n", encoding="utf-8")
+        if not (artifact_root / ".lake").exists():
+            return _fail("nested-heavy-tree regression fixture must materialize source deliverable .lake")
+        if not (artifact_root / ".git").exists():
+            return _fail("nested-heavy-tree regression fixture must materialize source deliverable .git")
+
+        artifact_kernel_state = load_kernel_state(state_root)
+        artifact_child_node = NodeSpec(
+            node_id="child-artifact-copy-001",
+            node_kind="implementer",
+            goal_slice="validate evaluator workspace staging excludes nested heavyweight trees",
+            parent_node_id=root_node.node_id,
+            generation=1,
+            round_id="R1",
+            execution_policy={"sandbox_mode": "danger-full-access"},
+            reasoning_profile={"role": "implementer", "thinking_budget": "high"},
+            budget_profile={"max_rounds": 2},
+            allowed_actions=["evaluate", "report"],
+            delegation_ref="state/delegations/child-artifact-copy-001.json",
+            result_sink_ref="artifacts/child-artifact-copy-001/implementer_result.json",
+            lineage_ref="root-kernel->child-artifact-copy-001",
+            status=NodeStatus.ACTIVE,
+        )
+        artifact_kernel_state.register_node(artifact_child_node)
+        persist_kernel_state(state_root, artifact_kernel_state, authority=kernel_internal_authority())
+
+        artifact_copy_submission = build_evaluator_submission_for_frozen_task(
+            target_node=artifact_child_node,
+            workspace_root=artifact_workspace_root,
+            output_root=state_root / "artifacts" / "evaluator_node_artifact_copy_runs",
+            implementation_package_ref=artifact_root,
+            product_manual_ref=artifact_manual_ref,
+            final_effect_requirements=[
+                {
+                    "requirement_id": "REQ-ARTIFACT",
+                    "description": "Reviewer-visible artifact remains available from staged role workspaces.",
+                    "blocking": True,
+                }
+            ],
+            role_agent_cmd=fixture_agent_cmd,
+        )
+        artifact_copy_result, artifact_copy_refs = run_evaluator_node(
+            state_root=state_root,
+            submission=artifact_copy_submission,
+        )
+        if artifact_copy_result.verdict is not EvaluatorVerdict.PASS:
+            return _fail("nested-heavy-tree fixture must still reach PASS through the evaluator-node path")
+        artifact_copy_run_root = Path(str(artifact_copy_refs["evaluation_report_ref"])).resolve().parent
+        for expected_workspace in (
+            artifact_copy_run_root / ".loop" / "test_ai" / "workspaces" / "test_ai__EU-001" / "workspace",
+            artifact_copy_run_root / ".loop" / "ai_user" / "workspaces" / "ai_user__EU-001" / "workspace",
+        ):
+            copied_artifact_root = expected_workspace / "deliverables" / "primary_artifact"
+            for reviewer_visible_relpath in (
+                Path("README.md"),
+                Path("TRACEABILITY.md"),
+                Path("BUILD.sh"),
+                Path("LinearlyBiasedPredictorChain") / "Core.lean",
+            ):
+                if not (copied_artifact_root / reviewer_visible_relpath).exists():
+                    return _fail(
+                        "evaluator role workspace staging must preserve reviewer-visible deliverable files "
+                        f"such as {reviewer_visible_relpath}"
+                    )
+            for heavyweight_relpath in (
+                Path(".lake"),
+                Path(".git"),
+                Path(".venv"),
+                Path(".uv-cache"),
+            ):
+                if (copied_artifact_root / heavyweight_relpath).exists():
+                    return _fail(
+                        "evaluator role workspace staging must exclude nested heavyweight deliverable tree "
+                        f"{heavyweight_relpath}"
+                    )
+
         failing_agent_cmd = _fixture_role_agent_cmd(scenario="lane_failure", failing_role="checker", failure_message="synthetic checker failure")
         bug_submission = build_evaluator_submission_for_endpoint_clarification(
             target_node=child_node,
@@ -1278,9 +1372,20 @@ def main() -> int:
         if bug_result.verdict is not EvaluatorVerdict.ERROR:
             return _fail(f"simple-evaluator delegated role failure must translate to ERROR, got {bug_result.verdict.value}")
 
+        composite_provider_capacity_failure = "\n".join(
+            [
+                "2026-03-20T17:08:48.425852Z ERROR codex_core::models_manager::manager: failed to refresh available models: timeout waiting for child process to exit",
+                "2026-03-20T17:08:48.437999Z WARN codex_state::runtime: failed to open state db at /Users/xiongjiangkai/.codex/state_5.sqlite: migration 20 was previously applied but is missing in the resolved migrations",
+                "2026-03-20T17:08:48.438303Z WARN codex_core::state_db: failed to initialize state runtime at /Users/xiongjiangkai/.codex: migration 20 was previously applied but is missing in the resolved migrations",
+                "2026-03-20T17:08:50.133306Z WARN codex_core::rollout::list: state db discrepancy during find_thread_path_by_id_str_in_subdir: falling_back",
+                "2026-03-20T17:08:55.267441Z WARN codex_core::codex: stream disconnected - retrying sampling request (1/5 in 181ms)...",
+                "Reconnecting... 1/5 (We're currently experiencing high demand, which may cause temporary errors.)",
+            ]
+        )
         issue_agents = {
             "uv": (
                 "uv run --project . started creating a virtual environment and failed before touching the product surface",
+                "uv",
                 "STRUCTURED_EXCEPTION",
                 False,
                 "evaluator_exec_uv",
@@ -1288,6 +1393,7 @@ def main() -> int:
             ),
             "path": (
                 "python: can't open file '/tmp/missing_product_entry.py': [Errno 2] No such file or directory",
+                "path",
                 "STRUCTURED_EXCEPTION",
                 False,
                 "evaluator_exec_path",
@@ -1295,6 +1401,7 @@ def main() -> int:
             ),
             "repo_structure": (
                 "pyproject.toml not found from the current repo root; workspace layout assumption was wrong",
+                "repo_structure",
                 "STRUCTURED_EXCEPTION",
                 False,
                 "evaluator_exec_repo_structure",
@@ -1302,6 +1409,7 @@ def main() -> int:
             ),
             "command_sequence": (
                 "zsh:1: parse error near `fi' while executing the generated command sequence",
+                "command_sequence",
                 "STRUCTURED_EXCEPTION",
                 False,
                 "evaluator_exec_command_sequence",
@@ -1309,6 +1417,7 @@ def main() -> int:
             ),
             "provider_transport": (
                 "failed to connect to websocket: IO error: Connection reset by peer (os error 54)\nstream disconnected before completion",
+                "provider_transport",
                 "STUCK",
                 True,
                 "evaluator_exec_provider_transport",
@@ -1316,6 +1425,7 @@ def main() -> int:
             ),
             "provider_capacity": (
                 "We're currently experiencing high demand, which may cause temporary errors.",
+                "provider_capacity",
                 "STUCK",
                 True,
                 "evaluator_exec_provider_capacity",
@@ -1323,6 +1433,7 @@ def main() -> int:
             ),
             "provider_quota": (
                 "ERROR: You've hit your usage limit. Please try again later.",
+                "provider_quota",
                 "STUCK",
                 True,
                 "evaluator_exec_provider_quota",
@@ -1330,14 +1441,24 @@ def main() -> int:
             ),
             "provider_runtime": (
                 "thread 'main' panicked at system-configuration dynamic_store.rs: Attempted to create a NULL object.",
+                "provider_runtime",
                 "STUCK",
                 True,
                 "evaluator_exec_provider_runtime",
                 "retry the same evaluator lane with bounded backoff",
             ),
+            "provider_capacity_composite": (
+                composite_provider_capacity_failure,
+                "provider_capacity",
+                "STUCK",
+                True,
+                "evaluator_exec_provider_capacity",
+                "retry the same evaluator lane after a short bounded backoff",
+            ),
         }
         for issue_name, (
             failure_message,
+            expected_issue_kind,
             expected_verdict,
             expected_retryable,
             expected_self_attribution,
@@ -1374,9 +1495,9 @@ def main() -> int:
             issue_error = dict(issue_report.get("error") or {})
             if str(issue_error.get("kind") or "") != "STRUCTURED_EXCEPTION":
                 return _fail("structured evaluator-exec failures must be persisted as structured exceptions")
-            if str(issue_error.get("issue_kind") or "") != issue_name:
-                return _fail(f"structured evaluator-exec failures must preserve issue_kind={issue_name!r}")
-            if issue_name.startswith("provider_"):
+            if str(issue_error.get("issue_kind") or "") != expected_issue_kind:
+                return _fail(f"structured evaluator-exec failures must preserve issue_kind={expected_issue_kind!r}")
+            if expected_issue_kind.startswith("provider_"):
                 if str(issue_report.get("status") or "") != "RECOVERY_REQUIRED":
                     return _fail("retryable provider failures must surface RECOVERY_REQUIRED instead of terminal ERROR")
                 issue_recovery = dict(issue_report.get("recovery") or {})
@@ -1606,6 +1727,18 @@ def main() -> int:
             return _fail("materialized implementer_result must preserve the evaluator request ref")
         if str(helper_result_payload.get("evaluation_report_ref") or "") != str(helper_runtime_refs.get("evaluation_report_ref") or ""):
             return _fail("materialized implementer_result must preserve the evaluator report ref")
+        helper_kernel_state_after = load_kernel_state(helper_state_root)
+        helper_kernel_node_after = dict(helper_kernel_state_after.nodes.get(helper_child_node.node_id) or {})
+        if str(helper_kernel_node_after.get("status") or "") != "COMPLETED":
+            return _fail("terminal evaluator PASS must normalize kernel node status to COMPLETED")
+        if str(dict(helper_kernel_node_after.get("runtime_state") or {}).get("attachment_state") or "") != "TERMINAL":
+            return _fail("terminal evaluator PASS must mark kernel runtime attachment as TERMINAL")
+        helper_node_snapshot_ref = helper_state_root / "state" / f"{helper_child_node.node_id}.json"
+        helper_node_snapshot = json.loads(helper_node_snapshot_ref.read_text(encoding="utf-8"))
+        if str(helper_node_snapshot.get("status") or "") != "COMPLETED":
+            return _fail("terminal evaluator PASS must persist the per-node snapshot as COMPLETED")
+        if str(dict(helper_node_snapshot.get("runtime_state") or {}).get("attachment_state") or "") != "TERMINAL":
+            return _fail("terminal evaluator PASS must persist terminal runtime attachment into the per-node snapshot")
 
         fail_workspace_root = temp_root / "terminal_fail_workspace"
         fail_workspace_root.mkdir(parents=True, exist_ok=True)
@@ -1688,6 +1821,18 @@ def main() -> int:
         fail_diagnostics = dict((fail_result_payload.get("evaluator_result") or {}).get("diagnostics") or {})
         if str(fail_diagnostics.get("self_repair") or "") == "":
             return _fail("retryable terminal FAIL materialization must preserve a non-empty self_repair hint")
+        fail_kernel_state_after = load_kernel_state(fail_state_root)
+        fail_kernel_node_after = dict(fail_kernel_state_after.nodes.get(fail_child_node.node_id) or {})
+        if str(fail_kernel_node_after.get("status") or "") != "FAILED":
+            return _fail("terminal evaluator FAIL must normalize kernel node status to FAILED")
+        if str(dict(fail_kernel_node_after.get("runtime_state") or {}).get("attachment_state") or "") != "TERMINAL":
+            return _fail("terminal evaluator FAIL must mark kernel runtime attachment as TERMINAL")
+        fail_node_snapshot_ref = fail_state_root / "state" / f"{fail_child_node.node_id}.json"
+        fail_node_snapshot = json.loads(fail_node_snapshot_ref.read_text(encoding="utf-8"))
+        if str(fail_node_snapshot.get("status") or "") != "FAILED":
+            return _fail("terminal evaluator FAIL must persist the per-node snapshot as FAILED")
+        if str(dict(fail_node_snapshot.get("runtime_state") or {}).get("attachment_state") or "") != "TERMINAL":
+            return _fail("terminal evaluator FAIL must persist terminal runtime attachment into the per-node snapshot")
 
         rogue_agent = temp_root / "task_local_eval_agent.py"
         rogue_agent.write_text("#!/usr/bin/env python3\nprint('rogue')\n", encoding="utf-8")

@@ -11,7 +11,7 @@ import shlex
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from loop_product.ai_launch import (
     ai_launch_exit_code,
@@ -128,9 +128,36 @@ def _load_terminal_implementer_result(*, state_root: Path, node_id: str, node_pa
         payload = _load_json(result_ref)
     except Exception:
         return result_ref, {}
-    if str(payload.get("status") or "").strip().upper() != "COMPLETED":
+    if not _has_evaluator_backed_terminal_closure(payload):
         return result_ref, {}
     return result_ref, payload
+
+
+def _terminal_evaluation_report_ref(payload: Mapping[str, Any]) -> Path | None:
+    runtime_refs = dict(payload.get("runtime_refs") or {})
+    evaluator = dict(payload.get("evaluator") or {})
+    for candidate in (
+        payload.get("evaluation_report_ref"),
+        runtime_refs.get("evaluation_report_ref"),
+        evaluator.get("evaluation_report_ref"),
+    ):
+        ref = str(candidate or "").strip()
+        if ref:
+            return Path(ref).expanduser().resolve()
+    return None
+
+
+def _has_evaluator_backed_terminal_closure(payload: Mapping[str, Any]) -> bool:
+    if str(payload.get("status") or "").strip().upper() != "COMPLETED":
+        return False
+    evaluator_result = dict(payload.get("evaluator_result") or {})
+    verdict = str(evaluator_result.get("verdict") or "").strip().upper()
+    if not verdict:
+        return False
+    report_ref = _terminal_evaluation_report_ref(payload)
+    if report_ref is None or not report_ref.exists():
+        return False
+    return True
 
 
 def _next_launch_attempt_dir(state_root: Path, node_id: str) -> Path:
@@ -637,9 +664,10 @@ def _direct_child_runtime_status_from_launch_result_ref(
         recovery_eligible = False
         recovery_reason = "authoritative_terminal_result"
     else:
+        lifecycle_active_like = lifecycle_status in {"", "ACTIVE"}
         runtime_loss_confirmed = bool(
             not pid_alive
-            and lifecycle_status == "ACTIVE"
+            and lifecycle_active_like
             and (
                 launch_result.get("exit_code") not in (None, "")
                 or latest_log_age_s >= RUNTIME_LOSS_CONFIRMATION_S
@@ -656,7 +684,7 @@ def _direct_child_runtime_status_from_launch_result_ref(
         recovery_eligible = runtime_loss_confirmed
         if pid_alive:
             recovery_reason = "live_pid_still_attached"
-        elif lifecycle_status != "ACTIVE":
+        elif lifecycle_status not in {"", "ACTIVE"}:
             recovery_reason = f"node_status_{lifecycle_status.lower() or 'unknown'}"
         elif not runtime_loss_confirmed:
             recovery_reason = "active_without_live_pid_unconfirmed"

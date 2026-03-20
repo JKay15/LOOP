@@ -129,8 +129,8 @@ def main() -> int:
                 return _fail("host child launch supervisor must pass the exact source result ref into direct launch")
             if captured_env.get("launch_mode") != "direct":
                 return _fail("host child launch supervisor must force direct child launch mode while consuming requests")
-            if captured_env.get("bridge_mode") != "direct":
-                return _fail("host child launch supervisor must force direct bridge mode while consuming requests")
+            if captured_env.get("bridge_mode") == "direct":
+                return _fail("host child launch supervisor must not force direct bridge mode while consuming requests")
         finally:
             supervisor_module.launch_child_from_result_ref = original_supervisor_launch
 

@@ -16,6 +16,7 @@ from loop_product.evaluator.agent_execution_policy import validate_evaluator_age
 from loop_product.kernel.state import load_kernel_state
 from loop_product.kernel.submit import submit_control_envelope
 from loop_product.protocols.control_envelope import ControlEnvelope, EnvelopeStatus
+from loop_product.protocols.control_objects import NodeTerminalOutcome, NodeTerminalResult
 from loop_product.protocols.evaluator import EvaluatorNodeSubmission, EvaluatorResult, EvaluatorVerdict
 from loop_product.protocols.node import NodeSpec
 from loop_product.runtime_paths import (
@@ -246,6 +247,67 @@ def _parse_simple_reviewer_verdict(text: str) -> str:
     if match:
         return match.group(1).upper()
     return "UNKNOWN"
+
+
+def _terminal_outcome_for_evaluator_result(result: EvaluatorResult) -> NodeTerminalOutcome:
+    verdict = result.verdict
+    if verdict is EvaluatorVerdict.PASS:
+        return NodeTerminalOutcome.PASS
+    if verdict is EvaluatorVerdict.FAIL:
+        return NodeTerminalOutcome.FAIL
+    if verdict is EvaluatorVerdict.STUCK:
+        return NodeTerminalOutcome.STUCK
+    if verdict is EvaluatorVerdict.BUG:
+        return NodeTerminalOutcome.BUG
+    return NodeTerminalOutcome.FAIL_CLOSED
+
+
+def _node_status_for_terminal_outcome(outcome: NodeTerminalOutcome) -> str:
+    if outcome is NodeTerminalOutcome.PASS:
+        return "COMPLETED"
+    if outcome is NodeTerminalOutcome.STUCK:
+        return "BLOCKED"
+    return "FAILED"
+
+
+def _submit_terminal_node_result(
+    *,
+    state_root: Path,
+    submission: EvaluatorNodeSubmission,
+    evaluator_result: EvaluatorResult,
+    runtime_refs: Mapping[str, str],
+) -> None:
+    terminal_evidence_refs = []
+    for candidate in (
+        str(runtime_refs.get("request_ref") or "").strip(),
+        str(runtime_refs.get("evaluation_report_ref") or "").strip(),
+        str(runtime_refs.get("reviewer_response_ref") or "").strip(),
+        str(runtime_refs.get("implementer_result_ref") or "").strip(),
+        str(runtime_refs.get("workspace_implementer_result_ref") or "").strip(),
+    ):
+        if candidate and candidate not in terminal_evidence_refs:
+            terminal_evidence_refs.append(candidate)
+    diagnostics = dict(evaluator_result.diagnostics or {})
+    outcome = _terminal_outcome_for_evaluator_result(evaluator_result)
+    terminal_result = NodeTerminalResult(
+        node_id=submission.target_node_id,
+        round_id=submission.round_id,
+        generation=submission.generation,
+        outcome=outcome,
+        node_status=_node_status_for_terminal_outcome(outcome),
+        summary=str(evaluator_result.summary or ""),
+        evidence_refs=terminal_evidence_refs,
+        self_attribution=str(diagnostics.get("self_attribution") or ""),
+        self_repair=str(diagnostics.get("self_repair") or ""),
+    )
+    submit_control_envelope(
+        state_root,
+        terminal_result.to_envelope(
+            round_id=submission.round_id,
+            generation=submission.generation,
+            status=EnvelopeStatus.REPORT,
+        ),
+    )
 
 
 def _is_runtime_closure_only_terminal_completion(report: Mapping[str, Any]) -> bool:
@@ -712,6 +774,12 @@ def run_evaluator_node(
                 evaluator_result=evaluator_result,
                 runtime_refs=runtime_refs,
             )
+        )
+        _submit_terminal_node_result(
+            state_root=state_root,
+            submission=submission,
+            evaluator_result=evaluator_result,
+            runtime_refs=runtime_refs,
         )
     return evaluator_result, runtime_refs
 

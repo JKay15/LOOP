@@ -80,6 +80,7 @@ _AI_USER_DEFAULT_EXCLUDED_RELPATHS = (
     Path(".cache") / "loop_evaluator_self_eval" / "fixture_output",
     Path(".cache") / "loop_evaluator_self_eval" / "generated_tests",
 )
+_NESTED_HEAVYWEIGHT_DIR_NAMES = frozenset({".lake", ".git", ".venv", ".uv-cache"})
 _OPERATION_LOG_TEXT_STOPWORDS = {
     "a",
     "an",
@@ -968,7 +969,48 @@ def _default_ai_user_excluded_paths(*, source_workspace_root: Path, output_root:
             candidate = (child_resolved / relpath).resolve()
             if candidate.exists() and _is_within(candidate, source_workspace_root):
                 excluded.append(candidate)
+    excluded.extend(
+        _nested_heavyweight_excluded_paths(
+            source_workspace_root=source_workspace_root,
+            excluded_paths=excluded,
+        )
+    )
     return excluded
+
+
+def _nested_heavyweight_excluded_paths(
+    *,
+    source_workspace_root: Path,
+    excluded_paths: Sequence[Path],
+) -> list[Path]:
+    source_workspace_root = source_workspace_root.resolve()
+    blocked_paths = [
+        path.resolve()
+        for path in excluded_paths
+        if _is_within(path.resolve(), source_workspace_root)
+    ]
+    seen_blocked = {path for path in blocked_paths}
+    discovered: list[Path] = []
+    for dirpath, dirnames, _filenames in os.walk(source_workspace_root, topdown=True):
+        current = Path(dirpath).resolve()
+        if any(current == blocked or _is_within(current, blocked) for blocked in blocked_paths):
+            dirnames[:] = []
+            continue
+        dirnames.sort()
+        retained: list[str] = []
+        for name in dirnames:
+            candidate = (current / name).resolve()
+            if any(candidate == blocked or _is_within(candidate, blocked) for blocked in blocked_paths):
+                continue
+            if name in _NESTED_HEAVYWEIGHT_DIR_NAMES:
+                if candidate not in seen_blocked:
+                    blocked_paths.append(candidate)
+                    seen_blocked.add(candidate)
+                    discovered.append(candidate)
+                continue
+            retained.append(name)
+        dirnames[:] = retained
+    return discovered
 
 
 def _materialize_ai_user_workspace(
@@ -2142,6 +2184,34 @@ def _combined_exec_log_text(exec_span: Mapping[str, Any], *, base_dir: Path | No
 
 def _classify_provider_issue_text(message: str) -> dict[str, str] | None:
     lowered = str(message or "").lower()
+    if "issue_kind=provider_quota" in lowered or "upstream provider_quota blocker" in lowered:
+        return {
+            "kind": "STRUCTURED_EXCEPTION",
+            "issue_kind": "provider_quota",
+            "self_attribution": "evaluator_exec_provider_quota",
+            "self_repair": "retry after the provider quota window resets or switch to an authorized account with available quota.",
+        }
+    if "issue_kind=provider_capacity" in lowered or "upstream provider_capacity blocker" in lowered:
+        return {
+            "kind": "STRUCTURED_EXCEPTION",
+            "issue_kind": "provider_capacity",
+            "self_attribution": "evaluator_exec_provider_capacity",
+            "self_repair": "retry the same evaluator lane after a short bounded backoff because the provider reported temporary high demand.",
+        }
+    if "issue_kind=provider_transport" in lowered or "upstream provider_transport blocker" in lowered:
+        return {
+            "kind": "STRUCTURED_EXCEPTION",
+            "issue_kind": "provider_transport",
+            "self_attribution": "evaluator_exec_provider_transport",
+            "self_repair": "retry the same evaluator lane with bounded backoff because provider transport disconnected before completion.",
+        }
+    if "issue_kind=provider_runtime" in lowered or "upstream provider_runtime blocker" in lowered:
+        return {
+            "kind": "STRUCTURED_EXCEPTION",
+            "issue_kind": "provider_runtime",
+            "self_attribution": "evaluator_exec_provider_runtime",
+            "self_repair": "retry the same evaluator lane with bounded backoff because the provider CLI failed during startup before producing structured output.",
+        }
     if "usage limit" in lowered:
         return {
             "kind": "STRUCTURED_EXCEPTION",

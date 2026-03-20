@@ -33,6 +33,7 @@ def main() -> int:
     child_dispatch_skill = (ROOT / ".agents" / "skills" / "child-dispatch" / "SKILL.md").read_text(encoding="utf-8")
     loop_runner_skill = (ROOT / ".agents" / "skills" / "loop-runner" / "SKILL.md").read_text(encoding="utf-8")
     kernel_contract = (ROOT / "docs" / "contracts" / "LOOP_SYSTEM_KERNEL_CONTRACT.md").read_text(encoding="utf-8")
+    node_contract = (ROOT / "docs" / "contracts" / "LOOP_SYSTEM_NODE_CONTRACT.md").read_text(encoding="utf-8")
 
     try:
         _require_contains(
@@ -76,6 +77,16 @@ def main() -> int:
             context="loop-runner skill",
         )
         _require_contains(
+            loop_runner_skill,
+            "Treat exact frozen refs as authoritative",
+            context="loop-runner skill",
+        )
+        _require_contains(
+            loop_runner_skill,
+            "fresh workspace with no deliverable yet",
+            context="loop-runner skill",
+        )
+        _require_contains(
             kernel_contract,
             "the kernel may materialize additional child nodes only after an implementer-authored split proposal passes kernel review",
             context="kernel contract",
@@ -84,6 +95,16 @@ def main() -> int:
             kernel_contract,
             "product closeout for an auto-split-capable run must state whether split was proposed, accepted, and useful",
             context="kernel contract",
+        )
+        _require_contains(
+            node_contract,
+            "treat exact frozen refs as authoritative during startup",
+            context="node contract",
+        )
+        _require_contains(
+            node_contract,
+            "first concrete workspace action before broad reconnaissance",
+            context="node contract",
         )
     except AssertionError as exc:
         return _fail(str(exc))
@@ -123,6 +144,10 @@ def main() -> int:
             return _fail("bootstrap child prompt must forbid self-materializing child nodes from implementer context")
         if "report whether split was proposed or accepted" not in prompt_text:
             return _fail("bootstrap child prompt must require split/outcome reporting in the implementer closeout")
+        if "exact frozen refs in the handoff/prompt as authoritative" not in prompt_text:
+            return _fail("bootstrap child prompt must treat exact frozen refs as authoritative during startup")
+        if "one concrete workspace-local action" not in prompt_text:
+            return _fail("bootstrap child prompt must require one concrete startup action before broad reconnaissance")
 
     print("[loop-system-split-instruction-chain] OK")
     return 0

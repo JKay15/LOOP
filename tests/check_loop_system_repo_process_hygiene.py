@@ -149,14 +149,49 @@ def main() -> int:
 
         implementer_result_ref = state_root / "artifacts" / node.node_id / "implementer_result.json"
         implementer_result_ref.parent.mkdir(parents=True, exist_ok=True)
+        incomplete_result_payload = {
+            "schema": "loop_product.implementer_result",
+            "schema_version": "0.1.0",
+            "node_id": node.node_id,
+            "status": "COMPLETED",
+            "outcome": "COMPLETED",
+            "delivered_artifact_exactly_evaluated": True,
+        }
+        implementer_result_ref.write_text(
+            json.dumps(incomplete_result_payload, indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        previous_runtime_status_mode = os.environ.get("LOOP_CHILD_RUNTIME_STATUS_MODE")
+        os.environ["LOOP_CHILD_RUNTIME_STATUS_MODE"] = "direct"
+        try:
+            status_payload = launch_runtime_module.child_runtime_status_from_launch_result_ref(
+                result_ref=launch_result_ref,
+                stall_threshold_s=0.0,
+            )
+        finally:
+            if previous_runtime_status_mode is None:
+                os.environ.pop("LOOP_CHILD_RUNTIME_STATUS_MODE", None)
+            else:
+                os.environ["LOOP_CHILD_RUNTIME_STATUS_MODE"] = previous_runtime_status_mode
+        if not bool(status_payload.get("recovery_eligible")):
+            return _fail("completed implementer_result without evaluator-backed evidence must remain recovery-eligible")
+        if str(status_payload.get("recovery_reason") or "") == "authoritative_terminal_result":
+            return _fail("incomplete/manual implementer_result must not be accepted as authoritative terminal closure")
+        if str(status_payload.get("lifecycle_status") or "") == "COMPLETED":
+            return _fail("incomplete/manual implementer_result must not force lifecycle_status=COMPLETED")
+
+        evaluation_report_ref = temp_root / "EvaluationReport.json"
+        evaluation_report_ref.write_text(
+            json.dumps({"status": "COMPLETED", "verdict": "PASS"}, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         implementer_result_ref.write_text(
             json.dumps(
                 {
-                    "schema": "loop_product.implementer_result",
-                    "schema_version": "0.1.0",
-                    "node_id": node.node_id,
-                    "status": "COMPLETED",
-                    "outcome": "COMPLETED",
+                    **incomplete_result_payload,
+                    "evaluation_report_ref": str(evaluation_report_ref.resolve()),
                     "evaluator_result": {"verdict": "PASS", "retryable": False},
                 },
                 indent=2,
@@ -165,7 +200,6 @@ def main() -> int:
             + "\n",
             encoding="utf-8",
         )
-
         previous_runtime_status_mode = os.environ.get("LOOP_CHILD_RUNTIME_STATUS_MODE")
         os.environ["LOOP_CHILD_RUNTIME_STATUS_MODE"] = "direct"
         try:

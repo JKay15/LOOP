@@ -16,6 +16,21 @@ from loop_product.runtime_paths import (
 )
 
 
+def _default_allowed_actions_for_node_kind(node_kind: str) -> list[str]:
+    normalized = str(node_kind or "implementer").strip().lower() or "implementer"
+    if normalized == "implementer":
+        return [
+            "implement",
+            "evaluate",
+            "report",
+            "split_request",
+            "resume_request",
+            "retry_request",
+            "relaunch_request",
+        ]
+    return ["implement", "evaluate", "report", "resume_request", "retry_request", "relaunch_request"]
+
+
 def materialize_child(
     *,
     state_root: Path,
@@ -48,9 +63,7 @@ def materialize_child(
     delegation_rel = Path("state") / "delegations" / f"{node_id}.json"
     parent_snapshot = dict(kernel_state.nodes.get(parent_node_id) or {})
     resolved_generation = int(generation) if generation is not None else int(parent_snapshot.get("generation") or 0) + 1
-    resolved_allowed_actions = list(
-        allowed_actions or ["implement", "evaluate", "report", "resume_request", "retry_request", "relaunch_request"]
-    )
+    resolved_allowed_actions = list(allowed_actions or _default_allowed_actions_for_node_kind(node_kind))
     resolved_depends_on = [str(item).strip() for item in (depends_on_node_ids or []) if str(item).strip()]
     resolved_result_sink_ref = result_sink_ref or f"artifacts/{node_id}/result.json"
     resolved_lineage_ref = lineage_ref or f"{parent_snapshot.get('lineage_ref') or parent_node_id}->{node_id}"

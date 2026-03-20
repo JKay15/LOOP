@@ -8,7 +8,7 @@ from pathlib import Path
 from loop_product.gateway import accept_control_envelope, normalize_control_envelope
 from loop_product.kernel.authority import kernel_internal_authority
 from loop_product.kernel.topology import apply_accepted_topology_mutation, review_topology_mutation
-from loop_product.kernel.state import load_kernel_state, persist_kernel_state
+from loop_product.kernel.state import load_kernel_state, persist_kernel_state, persist_node_snapshot
 from loop_product.protocols.control_envelope import ControlEnvelope, EnvelopeStatus
 from loop_product.protocols.topology import TopologyMutation
 
@@ -52,6 +52,11 @@ def submit_control_envelope(state_root: Path, envelope: ControlEnvelope) -> Cont
     kernel_state.apply_accepted_envelope(accepted)
     if accepted.classification == "topology":
         apply_accepted_topology_mutation(state_root, kernel_state, accepted, authority=authority)
+    elif accepted.classification in {"dispatch", "terminal"}:
+        payload = dict(accepted.payload or {})
+        node_id = str(payload.get("node_id") or accepted.source or "").strip()
+        if node_id and node_id in kernel_state.nodes:
+            persist_node_snapshot(state_root, kernel_state.nodes[node_id], authority=authority)
     persist_kernel_state(state_root, kernel_state, authority=authority)
     return accepted
 

@@ -220,6 +220,16 @@ def main() -> int:
                 str((ROOT / "scripts" / "find_local_input_candidates.sh").resolve()),
                 expected_kernel_sink_ref,
                 expected_workspace_sink_ref,
+                "fresh workspace-local Lean package",
+                "shared-cache helper named in the frozen handoff context refs",
+                "before the first `lake build`",
+                "live `git clone`, `lake update`, or `lake exe cache get`",
+                "artifact-local `.lake/packages`",
+                "exact frozen refs in the handoff/prompt as authoritative",
+                "do not guess alternate repo-root or lookalike paths",
+                "fresh workspace with no deliverable or artifact yet",
+                "one concrete workspace-local action",
+                "opening phase on broad repo scans",
             ):
                 if needle not in prompt_text:
                     return _fail(f"child prompt must mention {needle!r}")
@@ -261,9 +271,14 @@ def main() -> int:
             node = NodeSpec.from_dict(json.loads(node_ref.read_text(encoding="utf-8")))
             if node.node_id != str(result.get("node_id") or ""):
                 return _fail("bootstrap result node_id must match the materialized node snapshot")
+            if "split_request" not in set(node.allowed_actions or []):
+                return _fail("ordinary implementer bootstrap must materialize split_request on the child node")
             runtime_context = load_child_runtime_context(state_root, node.node_id)
             if Path(str(runtime_context.get("workspace_root") or "")).resolve() != workspace_root.resolve():
                 return _fail("child runtime context must point at the materialized workspace root")
+            delegation_payload = dict(runtime_context.get("delegation") or {})
+            if "split_request" not in set(delegation_payload.get("allowed_actions") or []):
+                return _fail("ordinary implementer bootstrap must persist split_request in the frozen delegation artifact")
 
             launch_spec = dict(result.get("launch_spec") or {})
             argv = list(launch_spec.get("argv") or [])

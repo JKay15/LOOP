@@ -59,6 +59,7 @@ Every LOOP execution unit is a `node`, and child materialization must pass throu
 - child-dispatch must expose child-local context as the materialized node snapshot plus the frozen delegation artifact, without requiring the raw parent transcript
 - child reports heartbeat, local control, and terminal status upward
 - if a node proposes a split, that proposal must remain a proposal until kernel accepts it; only then may child-dispatch materialize the accepted split children from frozen delegation data
+- fresh implementer child nodes must materialize `split_request` in `allowed_actions` by default so the documented autosplit-capable path is actually invokable from the persisted node/delegation surface
 - accepted split children must match the reviewed `target_node_ids` exactly and must inherit the kernel-owned `parent generation + 1` step rather than proposer-supplied generation drift
 - accepted deferred split children must persist `depends_on_node_ids` and `activation_condition` in both node state and frozen delegation, and must land as `PLANNED` rather than `ACTIVE`
 - accepted deferred activation must promote the already-materialized `PLANNED` child in place to `ACTIVE` without rewriting its frozen dependency metadata or rematerializing a duplicate node
@@ -74,6 +75,8 @@ Every LOOP execution unit is a `node`, and child materialization must pass throu
 - workspace-local relaunch context should be persisted through one committed `RECOVERY_CONTEXT.md` stop-point file so the resumed implementer can read the latest kernel-approved recovery reason without reconstructing state from chat
 - implementer handoff/prompt generation must keep the primary workspace layout and local-input discovery path explicit: durable implementation files normally belong inside the materialized workspace, while endpoint-required repo-local or user-local input discovery may inspect exact external paths when the needed file was not already materialized there
 - when endpoint-required repo-local or user-local file discovery is still needed, the committed handoff/prompt surface should prefer a repo-shipped filename/path discovery helper rather than nudging the implementer toward ad hoc content grep
+- the committed handoff/prompt surface should treat exact frozen refs as authoritative during startup so implementers use the named evaluator/helper/baseline paths before guessing alternate lookalikes or broad-scanning the repo
+- fresh implementer startup should require a first concrete workspace action before broad reconnaissance once the frozen prompt/handoff already names the critical refs needed to begin
 - child/evaluator document-observation for supervision should come from committed launch/evaluator logs and snapshot helpers, not from bespoke child-authored “I read these docs” side reports
 - implementer nodes must not end their own conversation or present unfinished recoverable work as done; they should continue the loop or leave explicit recovery evidence for same-node continuation
 - when the frozen endpoint requires local/offline user assets, the committed handoff/prompt surface should keep sourcing local-first: search canonical local roots such as Desktop, Music, and Downloads before inventing narrower ad hoc roots, and do not browse/download remote substitutes unless the frozen handoff explicitly allows remote sourcing

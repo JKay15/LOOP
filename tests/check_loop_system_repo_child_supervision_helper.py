@@ -403,6 +403,164 @@ def main() -> int:
         if str(capacity_result.get("latest_launch_result_ref") or "") != str(launch_result_ref_2.resolve()):
             return _fail("provider-capacity recovery path must still update the settled launch_result_ref after relaunch")
 
+        workspace_root = ROOT / "workspace" / "test-child-supervision-incomplete-terminal"
+        state_root = ROOT / ".loop" / "test-child-supervision-incomplete-terminal"
+        shutil.rmtree(workspace_root, ignore_errors=True)
+        shutil.rmtree(state_root, ignore_errors=True)
+        bootstrap = bootstrap_first_implementer_node(
+            mode="fresh",
+            task_slug="test-child-supervision-incomplete-terminal",
+            root_goal="bootstrap one implementer node for incomplete-terminal-result supervision validation",
+            child_goal_slice="recover when a stopped child leaves a completed-looking result without evaluator-backed closure",
+            endpoint_artifact_ref=str(endpoint.resolve()),
+            workspace_root=str(workspace_root),
+            state_root=str(state_root),
+            workspace_mirror_relpath="deliverables/out.txt",
+            external_publish_target=str((temp_root / "Desktop" / "out-incomplete.txt").resolve()),
+            context_refs=[],
+        )
+
+        node_id = str(bootstrap["node_id"])
+        implementer_result_ref = state_root / "artifacts" / node_id / "implementer_result.json"
+        implementer_result_ref.parent.mkdir(parents=True, exist_ok=True)
+        implementer_result_ref.write_text(
+            json.dumps(
+                {
+                    "schema": "loop_product.implementer_result",
+                    "schema_version": "0.1.0",
+                    "node_id": node_id,
+                    "status": "COMPLETED",
+                    "outcome": "COMPLETED",
+                    "delivered_artifact_exactly_evaluated": True,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        launch_result_ref_1 = state_root / "artifacts" / "launches" / node_id / "attempt_001" / "ChildLaunchResult.json"
+        launch_result_ref_1.parent.mkdir(parents=True, exist_ok=True)
+        launch_result_ref_1.write_text(
+            json.dumps(
+                {
+                    "launch_result_ref": str(launch_result_ref_1.resolve()),
+                    "launch_decision": "started",
+                    "node_id": node_id,
+                    "state_root": str(state_root.resolve()),
+                    "workspace_root": str(workspace_root.resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        launch_result_ref_2 = state_root / "artifacts" / "launches" / node_id / "attempt_002" / "ChildLaunchResult.json"
+        launch_result_ref_2.parent.mkdir(parents=True, exist_ok=True)
+        launch_result_ref_2.write_text(
+            json.dumps(
+                {
+                    "launch_result_ref": str(launch_result_ref_2.resolve()),
+                    "launch_decision": "started",
+                    "node_id": node_id,
+                    "state_root": str(state_root.resolve()),
+                    "workspace_root": str(workspace_root.resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        incomplete_status_calls = {"count": 0}
+        incomplete_recovery_calls: list[dict[str, object]] = []
+        incomplete_launch_calls: list[str] = []
+        evaluation_report_ref = temp_root / "incomplete-terminal" / "EvaluationReport.json"
+        evaluation_report_ref.parent.mkdir(parents=True, exist_ok=True)
+
+        def _incomplete_status_reader(*, result_ref: str | Path, stall_threshold_s: float = 60.0) -> dict[str, object]:
+            launch_result_ref = str(Path(result_ref).resolve())
+            incomplete_status_calls["count"] += 1
+            status_ref = temp_root / f"incomplete-status-{incomplete_status_calls['count']}.json"
+            return {
+                "launch_result_ref": launch_result_ref,
+                "status_result_ref": str(status_ref.resolve()),
+                "node_id": node_id,
+                "state_root": str(state_root.resolve()),
+                "workspace_root": str(workspace_root.resolve()),
+                "pid_alive": False,
+                "recovery_eligible": False,
+                "stall_threshold_s": stall_threshold_s,
+                "lifecycle_status": "COMPLETED",
+                "recovery_reason": "authoritative_terminal_result",
+            }
+
+        def _incomplete_recovery_runner(**payload):
+            incomplete_recovery_calls.append(dict(payload))
+            recovery_result_ref = state_root / "artifacts" / "recovery" / node_id / "OrphanedActiveRecoveryResult.json"
+            recovery_result_ref.parent.mkdir(parents=True, exist_ok=True)
+            recovery_payload = {
+                "recovery_result_ref": str(recovery_result_ref.resolve()),
+                "node_id": node_id,
+                "state_root": str(state_root.resolve()),
+                "workspace_root": str(workspace_root.resolve()),
+                "recovery_decision": "accepted",
+            }
+            recovery_result_ref.write_text(json.dumps(recovery_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            return recovery_payload
+
+        def _incomplete_launcher(*, result_ref: str | Path, startup_probe_ms: int = 1500, startup_health_timeout_ms: int = 12000):
+            del startup_probe_ms, startup_health_timeout_ms
+            incomplete_launch_calls.append(str(result_ref))
+            evaluation_report_ref.write_text(
+                json.dumps({"status": "COMPLETED", "verdict": "PASS"}, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            implementer_result_ref.write_text(
+                json.dumps(
+                    {
+                        "schema": "loop_product.implementer_result",
+                        "schema_version": "0.1.0",
+                        "node_id": node_id,
+                        "status": "COMPLETED",
+                        "outcome": "COMPLETED",
+                        "evaluation_report_ref": str(evaluation_report_ref.resolve()),
+                        "evaluator_result": {
+                            "verdict": "PASS",
+                            "retryable": False,
+                            "summary": "simple evaluator reviewer verdict=PASS",
+                            "diagnostics": {"self_attribution": "", "self_repair": ""},
+                        },
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return {"launch_result_ref": str(launch_result_ref_2.resolve())}
+
+        incomplete_result = supervise_child_until_settled(
+            launch_result_ref=launch_result_ref_1,
+            poll_interval_s=0.0,
+            stall_threshold_s=0.0,
+            max_recoveries=2,
+            max_wall_clock_s=0.01,
+            runtime_status_reader=_incomplete_status_reader,
+            recovery_runner=_incomplete_recovery_runner,
+            launcher=_incomplete_launcher,
+            sleep_fn=lambda _: None,
+        )
+        Draft202012Validator(supervision_schema).validate(incomplete_result)
+        if str(incomplete_result.get("settled_reason") or "") != "pass":
+            return _fail("stopped child with incomplete/manual implementer_result must recover and settle after a valid relaunch")
+        if len(incomplete_recovery_calls) != 1 or len(incomplete_launch_calls) != 1:
+            return _fail("incomplete/manual implementer_result must trigger exactly one recovery/relaunch cycle in this fixture")
+        if str(incomplete_result.get("latest_launch_result_ref") or "") != str(launch_result_ref_2.resolve()):
+            return _fail("incomplete/manual implementer_result recovery path must update the settled launch_result_ref after relaunch")
+
     print("[loop-system-child-supervision-helper] OK")
     return 0
 

@@ -60,6 +60,11 @@ def _build_recovery_payload(
     status: Mapping[str, Any],
     result_ref: Path | None,
     result_payload: Mapping[str, Any] | None,
+    reason: str = "retryable_terminal_result_after_child_stop",
+    observation_kind: str = "retryable_terminal_result",
+    default_self_attribution: str = "retryable_terminal_result",
+    default_self_repair: str = "continue the same implementer task, repair the unmet in-scope requirements, and rerun evaluator",
+    default_summary: str = "child stopped after a retryable terminal evaluator result",
 ) -> dict[str, Any]:
     evaluator_result = dict((result_payload or {}).get("evaluator_result") or {})
     diagnostics = dict(evaluator_result.get("diagnostics") or {})
@@ -78,20 +83,20 @@ def _build_recovery_payload(
         "workspace_root": str(status.get("workspace_root") or ""),
         "confirmed_launch_result_ref": str(status.get("launch_result_ref") or ""),
         "confirmed_runtime_status_ref": str(status.get("status_result_ref") or ""),
-        "reason": "retryable_terminal_result_after_child_stop",
+        "reason": reason,
         "self_attribution": str(
             diagnostics.get("self_attribution")
-            or "retryable_terminal_result"
+            or default_self_attribution
         ),
         "self_repair": str(
             diagnostics.get("self_repair")
-            or "continue the same implementer task, repair the unmet in-scope requirements, and rerun evaluator"
+            or default_self_repair
         ),
-        "observation_kind": "retryable_terminal_result",
+        "observation_kind": observation_kind,
         "summary": str(
             evaluator_result.get("summary")
             or (result_payload or {}).get("summary")
-            or "child stopped after a retryable terminal evaluator result"
+            or default_summary
         ),
         "evidence_refs": evidence_refs,
     }
@@ -198,7 +203,14 @@ def supervise_child_until_settled(
             return result
 
         retryable_terminal_stopped = classification == "RETRYABLE_TERMINAL" and not bool(status.get("pid_alive"))
-        runtime_loss_without_result = classification == "MISSING" and bool(status.get("recovery_eligible"))
+        incomplete_terminal_stopped = (
+            classification == "MISSING"
+            and result_ref.exists()
+            and not bool(status.get("pid_alive"))
+        )
+        runtime_loss_without_result = classification == "MISSING" and (
+            bool(status.get("recovery_eligible")) or incomplete_terminal_stopped
+        )
         if retryable_terminal_stopped or runtime_loss_without_result:
             if recoveries_used >= max(0, int(max_recoveries)):
                 result = {
@@ -224,11 +236,27 @@ def supervise_child_until_settled(
             )
             if delay_s > 0.0:
                 sleep_fn(delay_s)
-            recovery_payload = _build_recovery_payload(
-                status=status,
-                result_ref=result_ref if result_ref.exists() else None,
-                result_payload=result_payload,
-            )
+            if incomplete_terminal_stopped:
+                recovery_payload = _build_recovery_payload(
+                    status=status,
+                    result_ref=result_ref if result_ref.exists() else None,
+                    result_payload=result_payload,
+                    reason="incomplete_terminal_result_after_child_stop",
+                    observation_kind="incomplete_terminal_result",
+                    default_self_attribution="terminal_result_missing_evaluator_evidence",
+                    default_self_repair=(
+                        "materialize evaluator-backed terminal closure through the committed evaluator path instead of hand-writing an implementer result"
+                    ),
+                    default_summary=(
+                        "child stopped after writing a completed implementer_result without evaluator-backed closure evidence"
+                    ),
+                )
+            else:
+                recovery_payload = _build_recovery_payload(
+                    status=status,
+                    result_ref=result_ref if result_ref.exists() else None,
+                    result_payload=result_payload,
+                )
             recovery_result = recovery_runner(**recovery_payload)
             relaunched = launcher(result_ref=str(recovery_result["recovery_result_ref"]))
             current_launch_result_ref = _absolute(str(relaunched["launch_result_ref"]))

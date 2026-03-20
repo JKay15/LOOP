@@ -427,6 +427,7 @@ def main() -> int:
             return _fail("reused live child launch must only persist one original attempt and one reuse result envelope")
 
         from loop_product import ai_launch as ai_launch_module
+        from loop_product import host_child_launch as host_child_launch_module
         from loop_product.dispatch import launch_runtime as launch_runtime_module
 
         host_zombie_node_id = "test-child-launch-helper-host-zombie"
@@ -570,6 +571,23 @@ def main() -> int:
             ai_launch_module._tmux_available = lambda: True
             ai_launch_module._resolve_tmux_target_session = lambda: "main"
             ai_launch_module._start_tmux_launch = _fake_tmux_launch
+            wrapper_script = workspace_root / "bridge-check.tmux-launch.sh"
+            bridge_stdout = workspace_root / "bridge-check.stdout.txt"
+            bridge_stderr = workspace_root / "bridge-check.stderr.txt"
+            bridge_exit_code = workspace_root / "bridge-check.exit_code.txt"
+            ai_launch_module._write_tmux_wrapper_script(
+                script_path=wrapper_script,
+                cwd=workspace_root,
+                cmd=["codex", "exec", "-C", str(workspace_root.resolve()), "-"],
+                env={},
+                stdout_path=bridge_stdout,
+                stderr_path=bridge_stderr,
+                exit_code_path=bridge_exit_code,
+                stdin_path=prompt_path,
+            )
+            wrapper_text = wrapper_script.read_text(encoding="utf-8")
+            if f"> {bridge_stdout.as_posix()}" in wrapper_text or f"2> {bridge_stderr.as_posix()}" in wrapper_text:
+                return _fail("tmux Codex launch wrapper must not redirect stdout/stderr straight into regular files")
             os.environ["CODEX_THREAD_ID"] = "test-thread"
             bridged = ai_launch_module.start_ai_launch(
                 cmd=["codex", "exec", "-C", str(workspace_root.resolve()), "-"],
@@ -584,6 +602,18 @@ def main() -> int:
                 return _fail("committed AI launch must select the tmux bridge when nested Codex launch is active")
             if list(bridge_capture.get("cmd") or [])[:2] != ["codex", "exec"]:
                 return _fail("tmux bridge selection must preserve the original committed Codex argv")
+            with host_child_launch_module.force_direct_child_launch_mode():
+                bridged_from_host_supervisor = ai_launch_module.start_ai_launch(
+                    cmd=["codex", "exec", "-C", str(workspace_root.resolve()), "-"],
+                    cwd=workspace_root,
+                    log_dir=workspace_root / ".artifacts" / "bridge-host",
+                    label="bridge-check-host",
+                    env={},
+                    stdin_path=prompt_path,
+                    start_new_session=False,
+                )
+            if bridged_from_host_supervisor.mode != "tmux":
+                return _fail("host-directed child launch must preserve terminal-safe tmux bridging for Codex child exec")
         finally:
             ai_launch_module._tmux_available = original_tmux_available
             ai_launch_module._resolve_tmux_target_session = original_resolve_tmux_target_session

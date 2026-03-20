@@ -162,6 +162,8 @@ def main() -> int:
             return _fail("materialized child nodes must persist an explicit implementer workspace under workspace/<node_id>")
         if str(child_node_record.get("codex_home") or "").strip():
             return _fail("materialized child nodes must not require a node-local CODEX_HOME override")
+        if "split_request" not in set(child_node_record.get("allowed_actions") or []):
+            return _fail("materialized implementer child nodes must carry split_request by default")
         if set(child_node_record.get("allowed_actions") or []) & {"retry_request", "relaunch_request"} != {"retry_request", "relaunch_request"}:
             return _fail("materialized implementer child nodes must carry retry_request and relaunch_request by default")
         child_runtime_state = dict(child_node_record.get("runtime_state") or {})

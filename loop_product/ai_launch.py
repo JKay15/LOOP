@@ -201,16 +201,20 @@ def _write_tmux_wrapper_script(
     stderr_path: Path,
     exit_code_path: Path,
     stdin_path: Path | None,
+    ready_path: Path | None = None,
 ) -> None:
     lines = ["#!/bin/sh", "set +e", f"cd {shlex.quote(str(cwd))} || exit 111"]
     for key, value in env.items():
         lines.append(f"export {key}={shlex.quote(str(value))}")
     cmd_text = shlex.join([str(item) for item in cmd])
-    redirect = ""
+    # Codex child launches must keep terminal-like stdout/stderr semantics; pane output is captured separately.
+    if ready_path is not None and str(ready_path):
+        quoted_ready = shlex.quote(str(ready_path))
+        lines.append(f"while [ ! -f {quoted_ready} ]; do sleep 0.05; done")
+        lines.append(f"rm -f {quoted_ready}")
     if stdin_path is not None and str(stdin_path):
-        redirect += f" < {shlex.quote(str(stdin_path))}"
-    redirect += f" > {shlex.quote(str(stdout_path))} 2> {shlex.quote(str(stderr_path))}"
-    lines.append(f"{cmd_text}{redirect}")
+        lines.append(f"exec < {shlex.quote(str(stdin_path))}")
+    lines.append(cmd_text)
     lines.append("code=$?")
     lines.append(f"printf '%s\\n' \"$code\" > {shlex.quote(str(exit_code_path))}")
     lines.append("exit \"$code\"")
@@ -234,9 +238,12 @@ def _start_tmux_launch(
     stderr_path = log_dir / f"{safe_label}.stderr.txt"
     exit_code_path = log_dir / f"{safe_label}.exit_code.txt"
     wrapper_script = log_dir / f"{safe_label}.tmux-launch.sh"
-    for path in (stdout_path, stderr_path, exit_code_path):
+    ready_path = log_dir / f"{safe_label}.tmux-ready"
+    for path in (stdout_path, stderr_path, exit_code_path, ready_path):
         if path.exists():
             path.unlink()
+    _ensure_file(stdout_path)
+    _ensure_file(stderr_path)
     _write_tmux_wrapper_script(
         script_path=wrapper_script,
         cwd=cwd,
@@ -246,6 +253,7 @@ def _start_tmux_launch(
         stderr_path=stderr_path,
         exit_code_path=exit_code_path,
         stdin_path=Path(stdin_path).expanduser().resolve() if stdin_path not in (None, "") else None,
+        ready_path=ready_path,
     )
     session_name = _resolve_tmux_target_session()
     probe = subprocess.run(
@@ -272,6 +280,25 @@ def _start_tmux_launch(
     if len(parts) != 4:
         raise RuntimeError(f"tmux bridge returned unexpected window metadata: {probe.stdout!r}")
     out_session, window_index, pane_id, pane_pid = parts
+    pipe_probe = subprocess.run(
+        [
+            "tmux",
+            "pipe-pane",
+            "-t",
+            pane_id,
+            "-o",
+            f"cat >> {shlex.quote(str(stdout_path))}",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if pipe_probe.returncode != 0:
+        subprocess.run(["tmux", "kill-pane", "-t", pane_id], text=True, capture_output=True, check=False)
+        raise RuntimeError(
+            f"tmux bridge failed to attach pane capture: {pipe_probe.stderr.strip() or pipe_probe.stdout.strip()}"
+        )
+    ready_path.write_text("ready\n", encoding="utf-8")
     return AiLaunchHandle(
         mode="tmux",
         cmd=[str(item) for item in cmd],

@@ -9,6 +9,8 @@
 - If bounded progress reveals a meaningful parallelizable gap, surface an explicit split request upward to the root kernel with the proposed child slices and why the current node should no longer own all of that work alone.
 - Do not directly materialize child nodes or mutate topology fact from inside the workspace; split, activate, merge, and relaunch remain kernel-owned facts even when the implementer is the one proposing them.
 - Prefer `run_evaluator_node_until_terminal(...)` or `scripts/run_evaluator_node_until_terminal.sh`; if bootstrap materializes an exact evaluator runner/submission, call that exact evaluator runner/submission before inferring wrapper args.
+- Treat exact frozen refs as authoritative; do not guess alternates or broad repo scans for evaluator/helper paths that are already frozen into the handoff or prompt.
+- In a fresh workspace with no deliverable yet, take one concrete workspace-local action before expanding into extra reconnaissance.
 - If endpoint-required file discovery is needed, use the filename/path discovery helper directly with targeted `--root`/`--term`/`--ext` flags; avoid one broad prose query. If the handoff requires local/offline user assets, search canonical local roots first and do not browse, download, or substitute remote assets.
 - For non-trivial content transforms, prefer committed helpers or Python over brittle shell quoting, and use a temp path and atomic replace instead of clobbering the live output in place.
 - If evaluator recovery continues inside the same evaluator run, preserve `EvaluatorRunState.json` and the frozen checker graph; a retryable evaluator-owned `RECOVERY_REQUIRED` result is not terminal node closeout, so continue recovery instead of reporting completion.

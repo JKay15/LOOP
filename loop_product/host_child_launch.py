@@ -87,9 +87,7 @@ def request_host_child_launch(
 @contextmanager
 def force_direct_child_launch_mode() -> Iterator[None]:
     previous_launch_mode = os.environ.get("LOOP_CHILD_LAUNCH_MODE")
-    previous_bridge_mode = os.environ.get("LOOP_CHILD_LAUNCH_BRIDGE_MODE")
     os.environ["LOOP_CHILD_LAUNCH_MODE"] = "direct"
-    os.environ["LOOP_CHILD_LAUNCH_BRIDGE_MODE"] = "direct"
     try:
         yield
     finally:
@@ -97,7 +95,3 @@ def force_direct_child_launch_mode() -> Iterator[None]:
             os.environ.pop("LOOP_CHILD_LAUNCH_MODE", None)
         else:
             os.environ["LOOP_CHILD_LAUNCH_MODE"] = previous_launch_mode
-        if previous_bridge_mode is None:
-            os.environ.pop("LOOP_CHILD_LAUNCH_BRIDGE_MODE", None)
-        else:
-            os.environ["LOOP_CHILD_LAUNCH_BRIDGE_MODE"] = previous_bridge_mode

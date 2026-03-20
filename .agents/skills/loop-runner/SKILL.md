@@ -19,9 +19,11 @@ description: Run one bounded LOOP node round using the repo-local kernel, dispat
 - Do not author task-local evaluator role-agent scripts or inject ad hoc `.cache/**`, `/tmp/**`, Desktop, or other temporary `agent_cmd` paths into evaluator requests.
 - If explicit evaluator role commands are needed at all, they must be repo-shipped evaluator tools already committed in this repo; otherwise stay on provider/profile execution.
 - If the kernel also pointed you at `evaluator-exec`, treat that skill as the high-variance execution helper for the same documented evaluator product surface, not as a replacement for the manual.
+- Treat exact frozen refs as authoritative when the prompt/handoff already names the evaluator runner, evaluator submission, helper scripts, result sinks, or baseline artifacts; use those exact refs before guessing alternate paths or scanning for lookalikes.
 
 ## Responsibilities
 - Consume the current node goal slice.
+- In a fresh workspace with no deliverable yet, take one concrete workspace-local action before broad reconnaissance or extra repo scanning.
 - Produce implementation progress and bounded implementation changes.
 - Call the evaluator surface after implementation work for the current round, using the documented evaluator product surface from `docs/contracts/LOOP_EVALUATOR_PROTOTYPE_PRODUCT_MANUAL.md`.
 - Use `initialize_evaluator_runtime(...)` when you need a trusted evaluator runtime bootstrap; do not call `kernel_internal_authority()` or `persist_kernel_state(...)` directly from an ordinary child context.

@@ -544,8 +544,12 @@ def _invoke_text_role(
         },
     )
     if final_exit_code != 0:
+        final_issue = dict((retry_history[-1] if retry_history else {}).get("issue") or {})
         detail = _compact_detail(final_raw_output_text or _read_text(final_stderr_ref))
         suffix = f": {detail}" if detail else ""
+        issue_kind = str(final_issue.get("issue_kind") or "").strip()
+        if issue_kind.startswith("provider_"):
+            raise RuntimeError(f"{role_instance_id} hit an upstream {issue_kind} blocker before producing result.json{suffix}")
         raise RuntimeError(f"{role_instance_id} failed with exit code {final_exit_code}{suffix}")
     return {
         "role_id": role_id,
