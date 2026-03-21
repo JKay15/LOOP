@@ -26,6 +26,11 @@ ACTIVE_NODE_STATUSES = {
     NodeStatus.BLOCKED.value,
 }
 _NODE_STATUS_VALUES = {item.value for item in NodeStatus}
+_TERMINAL_DEPENDENCY_NODE_STATUSES = {
+    NodeStatus.BLOCKED.value,
+    NodeStatus.COMPLETED.value,
+    NodeStatus.FAILED.value,
+}
 
 
 def _default_complexity_budget() -> dict[str, Any]:
@@ -330,6 +335,98 @@ def _synchronized_runtime_state(
     )
 
 
+def _dependency_snapshot_map(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    raw = payload.get("dependency_status")
+    if isinstance(raw, dict):
+        normalized: dict[str, dict[str, Any]] = {}
+        for key, value in raw.items():
+            node_id = str(key or "").strip()
+            if not node_id:
+                continue
+            normalized[node_id] = dict(value or {}) if isinstance(value, dict) else {"state_status": str(value or "")}
+        return normalized
+    if isinstance(raw, list):
+        normalized = {}
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            node_id = str(item.get("node_id") or item.get("dependency_node_id") or "").strip()
+            if not node_id:
+                continue
+            normalized[node_id] = dict(item)
+        return normalized
+    return {}
+
+
+def _dependency_snapshot_ready(snapshot: dict[str, Any]) -> bool:
+    state_status = str(snapshot.get("state_status") or snapshot.get("status") or "").strip().upper()
+    result_sink_present = snapshot.get("result_sink_present")
+    if result_sink_present is False:
+        return False
+    return state_status in _TERMINAL_DEPENDENCY_NODE_STATUSES
+
+
+def _node_dependency_ready(*, state_root: Path, node_payload: dict[str, Any]) -> bool:
+    status = str(node_payload.get("status") or "").strip().upper()
+    if status not in _TERMINAL_DEPENDENCY_NODE_STATUSES:
+        return False
+    runtime_state = normalize_runtime_state(dict(node_payload.get("runtime_state") or {}))
+    if str(runtime_state.get("attachment_state") or "") != RuntimeAttachmentState.TERMINAL.value:
+        return False
+    result_ref = _authoritative_result_ref_for_node(
+        state_root=state_root,
+        node_id=str(node_payload.get("node_id") or ""),
+        node_payload=dict(node_payload or {}),
+    )
+    return result_ref.exists()
+
+
+def _dependency_unblocked_resume_candidates(*, state_root: Path, kernel_state: KernelState) -> list[str]:
+    candidates: list[str] = []
+    for node_id, node_payload in list(kernel_state.nodes.items()):
+        if str(node_payload.get("status") or "").strip().upper() != NodeStatus.BLOCKED.value:
+            continue
+        allowed_actions = {str(item or "").strip() for item in list(node_payload.get("allowed_actions") or [])}
+        if "resume_request" not in allowed_actions:
+            continue
+        depends_on = [str(item or "").strip() for item in list(node_payload.get("depends_on_node_ids") or []) if str(item or "").strip()]
+        if not depends_on:
+            continue
+        runtime_state = normalize_runtime_state(dict(node_payload.get("runtime_state") or {}))
+        if str(runtime_state.get("attachment_state") or "") not in {
+            RuntimeAttachmentState.TERMINAL.value,
+            RuntimeAttachmentState.LOST.value,
+        }:
+            continue
+        result_ref = _authoritative_result_ref_for_node(
+            state_root=state_root,
+            node_id=node_id,
+            node_payload=dict(node_payload or {}),
+        )
+        if not result_ref.exists():
+            continue
+        try:
+            result_payload = json.loads(result_ref.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        snapshot_map = _dependency_snapshot_map(dict(result_payload or {}))
+        if not snapshot_map:
+            continue
+        any_snapshot_unready = False
+        all_dependencies_ready_now = True
+        for dependency_node_id in depends_on:
+            snapshot = dict(snapshot_map.get(dependency_node_id) or {})
+            if not _dependency_snapshot_ready(snapshot):
+                any_snapshot_unready = True
+            dependency_payload = dict(kernel_state.nodes.get(dependency_node_id) or {})
+            if not dependency_payload or not _node_dependency_ready(state_root=state_root, node_payload=dependency_payload):
+                all_dependencies_ready_now = False
+                break
+        if any_snapshot_unready and all_dependencies_ready_now:
+            candidates.append(node_id)
+    return candidates
+
+
 def synchronize_authoritative_node_results(
     state_root: Path,
     *,
@@ -414,6 +511,36 @@ def synchronize_authoritative_node_results(
                     generation=int(child_payload.get("generation") or 0),
                 )
                 refreshed = load_kernel_state(state_root)
+        kernel_state = refreshed
+
+    if continue_deferred:
+        from loop_product.kernel.submit import submit_topology_mutation
+        from loop_product.runtime.recover import build_resume_request
+
+        refreshed = load_kernel_state(state_root)
+        for node_id in _dependency_unblocked_resume_candidates(state_root=state_root, kernel_state=refreshed):
+            node_payload = dict(refreshed.nodes.get(node_id) or {})
+            try:
+                source_node = NodeSpec.from_dict(node_payload)
+            except Exception:
+                continue
+            mutation = build_resume_request(
+                source_node,
+                reason="authoritative dependency snapshot is stale and declared dependencies are now durably ready",
+                consistency_signal="dependency_results_now_ready_after_blocked_snapshot",
+                payload={
+                    "dependency_unblocked": True,
+                    "self_attribution": "kernel detected that the authoritative blocked dependency snapshot is stale",
+                    "self_repair": "resume the same logical node with an exact relaunch now that every declared dependency is durably ready",
+                },
+            )
+            submit_topology_mutation(
+                state_root,
+                mutation,
+                round_id=str(node_payload.get("round_id") or refreshed.root_node_id),
+                generation=int(node_payload.get("generation") or 0),
+            )
+            refreshed = load_kernel_state(state_root)
         kernel_state = refreshed
 
     return kernel_state

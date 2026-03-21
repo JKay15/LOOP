@@ -76,6 +76,9 @@ The `kernel` is the root supervisory authority for the complete LOOP repo. It ow
 - accepted deferred merge must reactivate the completed source node truthfully by resetting its runtime attachment state instead of pretending the old completed runtime is still attached
 - accepted reap proposals may retire a terminal non-root node from the live authoritative graph only after kernel has archived it under `.loop/quarantine/`
 - accepted `resume` and `retry` proposals reactivate the same node only after kernel review passes
+- when a blocked node's authoritative result explicitly records dependency unavailability and those declared dependencies later become durably ready, kernel-owned status sync may submit one committed same-node `resume` continuation for that exact node instead of leaving it stranded forever
+- accepted same-node dependency-unblocked `resume` must exact-relaunch the same logical node from its frozen handoff/workspace rather than inventing a replacement node id
+- when same-node `resume` or `retry` relaunches a stopped node, the superseded authoritative `result.json` that justified the recovery must be archived out of the live sink first so later authority queries do not reapply stale blocked truth on top of the resumed node
 - accepted `relaunch` proposals materialize a fresh replacement child from durable delegation inputs while freezing the superseded source node as closed fact
 - accepted implementer children must carry an explicit `workspace_root` under `workspace/<project>`; implementer launch policy is selected by that folder's `cwd` / `-C`, not by overriding the default Codex home
 - authoritative node recovery must distinguish lifecycle state from runtime attachment so the kernel can recognize an orphaned ACTIVE node whose backing child runtime has disappeared

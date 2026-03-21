@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from loop_product.dispatch.bootstrap import bootstrap_first_implementer_node
+from loop_product.dispatch.launch_runtime import launch_child_from_result_ref
 from loop_product.kernel.authority import KernelMutationAuthority
 from loop_product.kernel.state import ACTIVE_NODE_STATUSES, KernelState, persist_node_snapshot
 from loop_product.protocols.control_envelope import ControlEnvelope
@@ -260,8 +263,20 @@ def apply_accepted_recovery_mutation(
 
     if mutation.kind in {"resume", "retry"}:
         source_record = kernel_state.nodes[source_node_id]
+        previous_runtime_state = normalize_runtime_state(dict(source_record.get("runtime_state") or {}))
+        if previous_runtime_state.get("attachment_state") != RuntimeAttachmentState.ATTACHED.value:
+            _archive_superseded_authoritative_result(
+                state_root=state_root,
+                source_record=source_record,
+                envelope_id=str(envelope.envelope_id or ""),
+            )
         source_record["status"] = "ACTIVE"
-        if mutation.kind == "retry":
+        if mutation.kind == "resume":
+            source_record["runtime_state"] = _resume_runtime_state(
+                accepted_at=str(envelope.accepted_at or ""),
+                envelope_id=str(envelope.envelope_id or ""),
+            )
+        else:
             source_record["runtime_state"] = _retry_runtime_state(
                 review=review,
                 mutation=mutation,
@@ -270,6 +285,26 @@ def apply_accepted_recovery_mutation(
             )
         kernel_state.blocked_reasons.pop(source_node_id, None)
         persist_node_snapshot(state_root, source_record, authority=authority)
+        if mutation.kind == "resume" and previous_runtime_state.get("attachment_state") != RuntimeAttachmentState.ATTACHED.value:
+            try:
+                _bootstrap_and_launch_resumed_node(
+                    state_root=state_root,
+                    source_record=source_record,
+                    authority=authority,
+                )
+            except Exception as exc:  # noqa: BLE001
+                source_record["status"] = "BLOCKED"
+                source_record["runtime_state"] = normalize_runtime_state(
+                    {
+                        "attachment_state": RuntimeAttachmentState.LOST.value,
+                        "observed_at": str(envelope.accepted_at or ""),
+                        "summary": f"accepted resume relaunch failed: {exc}",
+                        "observation_kind": "resume_relaunch_error",
+                        "evidence_refs": [f"control_envelope:{str(envelope.envelope_id or '')}"],
+                    }
+                )
+                kernel_state.blocked_reasons[source_node_id] = f"accepted resume relaunch failed: {exc}"
+                persist_node_snapshot(state_root, source_record, authority=authority)
         return
 
     if mutation.kind != "relaunch":
@@ -359,11 +394,89 @@ def _normalized_relaunch_target(
     }
 
 
+def _same_node_continue_exact_request(*, state_root: Path, source_record: Mapping[str, Any]) -> dict[str, Any]:
+    workspace_root = Path(str(source_record.get("workspace_root") or "")).expanduser().resolve()
+    if not str(workspace_root).strip():
+        raise ValueError("resume relaunch requires a non-empty workspace_root on the source node")
+    handoff_ref = workspace_root / "FROZEN_HANDOFF.json"
+    if not handoff_ref.exists():
+        raise ValueError(f"resume relaunch requires a frozen handoff: {handoff_ref}")
+    handoff = json.loads(handoff_ref.read_text(encoding="utf-8"))
+    if not isinstance(handoff, dict):
+        raise ValueError(f"resume relaunch frozen handoff must be a JSON object: {handoff_ref}")
+    endpoint_artifact_ref = str(handoff.get("endpoint_artifact_ref") or "").strip()
+    root_goal = str(handoff.get("root_goal") or "").strip()
+    node_id = str(source_record.get("node_id") or "").strip()
+    round_id = str(source_record.get("round_id") or handoff.get("round_id") or "").strip()
+    goal_slice = str(source_record.get("goal_slice") or handoff.get("child_goal_slice") or "").strip()
+    result_sink_ref = str(source_record.get("result_sink_ref") or handoff.get("result_sink_ref") or "").strip()
+    if not (endpoint_artifact_ref and root_goal and node_id and round_id and goal_slice and result_sink_ref):
+        raise ValueError("resume relaunch requires endpoint_artifact_ref/root_goal/node_id/round_id/goal_slice/result_sink_ref")
+    return {
+        "mode": "continue_exact",
+        "state_root": str(state_root.resolve()),
+        "workspace_root": str(workspace_root.resolve()),
+        "node_id": node_id,
+        "round_id": round_id,
+        "root_goal": root_goal,
+        "child_goal_slice": goal_slice,
+        "endpoint_artifact_ref": endpoint_artifact_ref,
+        "workspace_mirror_relpath": str(handoff.get("workspace_mirror_relpath") or "deliverables/primary_artifact"),
+        "external_publish_target": str(handoff.get("external_publish_target") or ""),
+        "context_refs": [str(item) for item in list(handoff.get("context_refs") or [])],
+        "result_sink_ref": result_sink_ref,
+    }
+
+
+def _bootstrap_and_launch_resumed_node(
+    *,
+    state_root: Path,
+    source_record: Mapping[str, Any],
+    authority: KernelMutationAuthority | None = None,
+) -> None:
+    bootstrap_payload = bootstrap_first_implementer_node(
+        authority=authority,
+        **_same_node_continue_exact_request(state_root=state_root, source_record=source_record),
+    )
+    launch_child_from_result_ref(result_ref=str(bootstrap_payload.get("bootstrap_result_ref") or ""))
+
+
+def _archive_superseded_authoritative_result(
+    *,
+    state_root: Path,
+    source_record: Mapping[str, Any],
+    envelope_id: str,
+) -> None:
+    sink = str(source_record.get("result_sink_ref") or "").strip()
+    if not sink:
+        return
+    result_ref = (state_root / sink).resolve()
+    if not result_ref.exists():
+        return
+    stem = result_ref.stem
+    suffix = result_ref.suffix or ".json"
+    archive_ref = result_ref.with_name(f"{stem}.superseded__{envelope_id or 'recovery'}{suffix}")
+    archive_ref.write_text(result_ref.read_text(encoding="utf-8"), encoding="utf-8")
+    result_ref.unlink()
+
+
 def _normalized_runtime_loss_signal(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         return {}
     normalized = normalize_runtime_state(dict(payload))
     return normalized if normalized["attachment_state"] == RuntimeAttachmentState.LOST.value else {}
+
+
+def _resume_runtime_state(*, accepted_at: str, envelope_id: str) -> dict[str, Any]:
+    return normalize_runtime_state(
+        {
+            "attachment_state": RuntimeAttachmentState.UNOBSERVED.value,
+            "observed_at": accepted_at,
+            "summary": "resume accepted",
+            "observation_kind": "recovery_resume_accepted",
+            "evidence_refs": [f"control_envelope:{envelope_id}"],
+        }
+    )
 
 
 def _retry_runtime_state(
