@@ -422,30 +422,49 @@ def _materialize_evaluator_bundle(
 ) -> tuple[Path, Path]:
     from loop_product.loop import build_evaluator_submission_for_frozen_task
 
-    bootstrap_dir = state_root / "artifacts" / "bootstrap"
+    bootstrap_dir = state_root / "artifacts" / "bootstrap" / node.node_id
     submission_path = bootstrap_dir / "EvaluatorNodeSubmission.json"
     runner_path = workspace_root / "RUN_EVALUATOR_NODE_UNTIL_TERMINAL.sh"
     manual_path = bootstrap_dir / "EvaluatorProductManual.md"
     final_effects_path = bootstrap_dir / "EvaluatorFinalEffects.md"
     output_root = (state_root / "artifacts" / "evaluator_runs" / node.node_id).resolve()
     workspace_mirror_ref = str((workspace_root / workspace_mirror_relpath).resolve())
-    _write_text(
-        manual_path,
-        _render_task_scoped_evaluator_manual(
-            endpoint_artifact_ref=endpoint_artifact_ref,
-            workspace_root=workspace_root,
-            workspace_mirror_ref=workspace_mirror_ref,
-            external_publish_target=external_publish_target,
-            handoff_json_path=handoff_json_path,
-        ),
-    )
-    _write_text(
-        final_effects_path,
-        _render_task_scoped_evaluator_final_effects_text(
-            artifact_payload=artifact_payload,
-            workspace_mirror_ref=workspace_mirror_ref,
-        ),
-    )
+    if _use_whole_paper_evaluator_surface(node):
+        _write_text(
+            manual_path,
+            _render_task_scoped_evaluator_manual(
+                endpoint_artifact_ref=endpoint_artifact_ref,
+                workspace_root=workspace_root,
+                workspace_mirror_ref=workspace_mirror_ref,
+                external_publish_target=external_publish_target,
+                handoff_json_path=handoff_json_path,
+            ),
+        )
+        _write_text(
+            final_effects_path,
+            _render_task_scoped_evaluator_final_effects_text(
+                artifact_payload=artifact_payload,
+                workspace_mirror_ref=workspace_mirror_ref,
+            ),
+        )
+    else:
+        _write_text(
+            manual_path,
+            _render_slice_scoped_evaluator_manual(
+                node=node,
+                workspace_root=workspace_root,
+                workspace_mirror_ref=workspace_mirror_ref,
+                handoff_json_path=handoff_json_path,
+            ),
+        )
+        _write_text(
+            final_effects_path,
+            _render_slice_scoped_evaluator_final_effects_text(
+                node=node,
+                workspace_mirror_ref=workspace_mirror_ref,
+                required_output_paths=required_output_paths,
+            ),
+        )
     submission = build_evaluator_submission_for_frozen_task(
         target_node=node,
         workspace_root=workspace_root,
@@ -660,6 +679,38 @@ def _render_task_scoped_evaluator_final_effects_text(*, artifact_payload: dict[s
     return "\n".join(lines)
 
 
+def _render_slice_scoped_evaluator_final_effects_text(
+    *,
+    node: NodeSpec,
+    workspace_mirror_ref: str,
+    required_output_paths: list[str],
+) -> str:
+    lines = [
+        "# Slice-Scoped Evaluator Final Effects",
+        "",
+        (
+            f"- The workspace mirror artifact at `{workspace_mirror_ref}` fulfills the narrowed split-child slice "
+            f"owned by `{node.node_id}`: {node.goal_slice}"
+        ),
+        "- This evaluator judges only the slice-local deliverable surface for this node.",
+        "- It must not claim whole-paper terminal closure or whole-paper completion for unrelated nodes.",
+    ]
+    if required_output_paths:
+        lines.extend(["", "## Required Outputs", ""])
+        lines.extend(f"- `{item}`" for item in required_output_paths)
+    lines.extend(
+        [
+            "",
+            "## Evaluation Rules",
+            "",
+            "- Judge only this node's narrowed slice goal, deliverable artifact, and declared required outputs.",
+            "- Do not treat slice-local status files or README prose as whole-paper terminal evidence.",
+            "- Whole-paper success or failure remains reserved for the dedicated whole-paper closeout surface.",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _render_task_scoped_evaluator_manual(
     *,
     endpoint_artifact_ref: str,
@@ -694,6 +745,56 @@ def _render_task_scoped_evaluator_manual(
         ]
     )
     return "\n".join(lines)
+
+
+def _render_slice_scoped_evaluator_manual(
+    *,
+    node: NodeSpec,
+    workspace_root: Path,
+    workspace_mirror_ref: str,
+    handoff_json_path: Path,
+) -> str:
+    lines = [
+        "# Slice-Scoped Evaluator Product Manual",
+        "",
+        "This evaluator run judges one split-child implementer artifact for one narrowed branch of a larger whole-paper benchmark.",
+        "",
+        "## Documented Surface",
+        "",
+        f"- workspace_root: `{workspace_root.resolve()}`",
+        f"- workspace_mirror_ref: `{workspace_mirror_ref}`",
+        f"- frozen_handoff_ref: `{handoff_json_path.resolve()}`",
+        f"- target_node_id: `{node.node_id}`",
+        f"- slice_goal: `{node.goal_slice}`",
+        "",
+        "## Evaluation Rules",
+        "",
+        "- Judge only the slice-local artifact and reviewer-visible evidence for this node.",
+        "- Do not require unrelated whole-paper outputs from sibling or parent nodes.",
+        "- Whole-paper closure remains reserved for the dedicated whole-paper integration/closeout surface.",
+    ]
+    return "\n".join(lines)
+
+
+def _child_goal_requests_whole_paper_closeout(node: NodeSpec) -> bool:
+    text = f"{node.node_id} {node.goal_slice}".lower()
+    markers = (
+        "whole-paper",
+        "whole paper",
+        "final integration",
+        "final evaluation",
+        "final outcome",
+        "whole-paper closeout",
+        "whole-paper terminal",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _use_whole_paper_evaluator_surface(node: NodeSpec) -> bool:
+    parent = str(node.parent_node_id or "").strip()
+    if parent in {"", "root-kernel"}:
+        return True
+    return _child_goal_requests_whole_paper_closeout(node)
 
 
 def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **payload: Any) -> dict[str, Any]:

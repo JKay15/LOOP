@@ -696,7 +696,9 @@ def main() -> int:
         no_progress_status_calls = {"count": 0}
         no_progress_recovery_calls: list[dict[str, object]] = []
         no_progress_launch_calls: list[str] = []
+        no_progress_terminator_calls: list[str] = []
         no_progress_now = {"t": 1000.0}
+        no_progress_pid_alive = {"value": True}
 
         def _no_progress_status_reader(*, result_ref: str | Path, stall_threshold_s: float = 60.0) -> dict[str, object]:
             launch_result_ref = str(Path(result_ref).resolve())
@@ -708,10 +710,10 @@ def main() -> int:
                 "node_id": node_id,
                 "state_root": str(state_root.resolve()),
                 "workspace_root": str(workspace_root.resolve()),
-                "pid_alive": True,
+                "pid_alive": bool(no_progress_pid_alive["value"]),
                 "recovery_eligible": False,
                 "stall_threshold_s": stall_threshold_s,
-                "lifecycle_status": "ACTIVE",
+                "lifecycle_status": "ACTIVE" if no_progress_pid_alive["value"] else "BLOCKED",
                 "recovery_reason": "live_pid_still_attached",
                 "latest_log_age_s": 0.1,
             }
@@ -759,6 +761,10 @@ def main() -> int:
             no_progress_launch_calls.append("unexpected")
             return {}
 
+        def _no_progress_terminator(*, result_ref: str | Path):
+            no_progress_terminator_calls.append(str(Path(result_ref).resolve()))
+            no_progress_pid_alive["value"] = False
+
         no_progress_result = supervise_child_until_settled(
             launch_result_ref=launch_result_ref_1,
             poll_interval_s=0.0,
@@ -768,6 +774,7 @@ def main() -> int:
             runtime_status_reader=_no_progress_status_reader,
             recovery_runner=_no_progress_recovery_runner,
             launcher=_no_progress_launcher,
+            launch_terminator=_no_progress_terminator,
             progress_snapshot_reader=_no_progress_snapshot_reader,
             no_substantive_progress_window_s=5.0,
             now_fn=lambda: no_progress_now["t"],
@@ -776,10 +783,14 @@ def main() -> int:
         Draft202012Validator(supervision_schema).validate(no_progress_result)
         if str(no_progress_result.get("settled_reason") or "") != "no_substantive_progress":
             return _fail("supervision helper must settle to a truthful no_substantive_progress stop point when a live child shows unchanged placeholder-only progress")
+        if not bool(no_progress_result.get("settled")):
+            return _fail("no-substantive-progress stop points must be settled only after the live child has been stopped")
         if no_progress_recovery_calls:
             return _fail("no-substantive-progress stop points must not pretend the child is recovery-eligible")
         if no_progress_launch_calls:
             return _fail("no-substantive-progress stop points must not relaunch the child automatically")
+        if no_progress_terminator_calls != [str(launch_result_ref_1.resolve())]:
+            return _fail("no-substantive-progress stop points must terminate the live child before returning")
 
         workspace_root = ROOT / "workspace" / "test-child-supervision-empty-workspace-false-liveness"
         state_root = ROOT / ".loop" / "test-child-supervision-empty-workspace-false-liveness"
@@ -820,7 +831,9 @@ def main() -> int:
         empty_workspace_status_calls = {"count": 0}
         empty_workspace_recovery_calls: list[dict[str, object]] = []
         empty_workspace_launch_calls: list[str] = []
+        empty_workspace_terminator_calls: list[str] = []
         empty_workspace_now = {"t": 2000.0}
+        empty_workspace_pid_alive = {"value": True}
 
         def _empty_workspace_status_reader(*, result_ref: str | Path, stall_threshold_s: float = 60.0) -> dict[str, object]:
             launch_result_ref = str(Path(result_ref).resolve())
@@ -832,10 +845,10 @@ def main() -> int:
                 "node_id": node_id,
                 "state_root": str(state_root.resolve()),
                 "workspace_root": str(workspace_root.resolve()),
-                "pid_alive": True,
+                "pid_alive": bool(empty_workspace_pid_alive["value"]),
                 "recovery_eligible": False,
                 "stall_threshold_s": stall_threshold_s,
-                "lifecycle_status": "ACTIVE",
+                "lifecycle_status": "ACTIVE" if empty_workspace_pid_alive["value"] else "BLOCKED",
                 "recovery_reason": "live_pid_still_attached",
                 "latest_log_age_s": 0.1,
             }
@@ -887,6 +900,10 @@ def main() -> int:
             empty_workspace_launch_calls.append("unexpected")
             return {}
 
+        def _empty_workspace_terminator(*, result_ref: str | Path):
+            empty_workspace_terminator_calls.append(str(Path(result_ref).resolve()))
+            empty_workspace_pid_alive["value"] = False
+
         empty_workspace_result = supervise_child_until_settled(
             launch_result_ref=launch_result_ref_1,
             poll_interval_s=0.0,
@@ -896,6 +913,7 @@ def main() -> int:
             runtime_status_reader=_empty_workspace_status_reader,
             recovery_runner=_empty_workspace_recovery_runner,
             launcher=_empty_workspace_launcher,
+            launch_terminator=_empty_workspace_terminator,
             progress_snapshot_reader=_empty_workspace_snapshot_reader,
             no_substantive_progress_window_s=5.0,
             now_fn=lambda: empty_workspace_now["t"],
@@ -904,10 +922,14 @@ def main() -> int:
         Draft202012Validator(supervision_schema).validate(empty_workspace_result)
         if str(empty_workspace_result.get("settled_reason") or "") != "no_substantive_progress":
             return _fail("supervision helper must stop a live child that keeps the workspace mirror empty while repeatedly claiming it is writing the first artifact batch")
+        if not bool(empty_workspace_result.get("settled")):
+            return _fail("empty-workspace no-substantive-progress stop points must be settled only after the live child has been stopped")
         if empty_workspace_recovery_calls:
             return _fail("empty-workspace false-liveness stop points must not pretend the child is recovery-eligible")
         if empty_workspace_launch_calls:
             return _fail("empty-workspace false-liveness stop points must not relaunch the child automatically")
+        if empty_workspace_terminator_calls != [str(launch_result_ref_1.resolve())]:
+            return _fail("empty-workspace false-liveness stop points must terminate the live child before returning")
 
         workspace_root = ROOT / "workspace" / "test-child-supervision-xhigh-startup-grace"
         state_root = ROOT / ".loop" / "test-child-supervision-xhigh-startup-grace"
@@ -948,7 +970,9 @@ def main() -> int:
         xhigh_status_calls = {"count": 0}
         xhigh_recovery_calls: list[dict[str, object]] = []
         xhigh_launch_calls: list[str] = []
+        xhigh_terminator_calls: list[str] = []
         xhigh_now = {"t": 3000.0}
+        xhigh_pid_alive = {"value": True}
 
         def _xhigh_status_reader(*, result_ref: str | Path, stall_threshold_s: float = 60.0) -> dict[str, object]:
             launch_result_ref = str(Path(result_ref).resolve())
@@ -960,10 +984,10 @@ def main() -> int:
                 "node_id": node_id,
                 "state_root": str(state_root.resolve()),
                 "workspace_root": str(workspace_root.resolve()),
-                "pid_alive": True,
+                "pid_alive": bool(xhigh_pid_alive["value"]),
                 "recovery_eligible": False,
                 "stall_threshold_s": stall_threshold_s,
-                "lifecycle_status": "ACTIVE",
+                "lifecycle_status": "ACTIVE" if xhigh_pid_alive["value"] else "BLOCKED",
                 "recovery_reason": "live_pid_still_attached",
                 "latest_log_age_s": 0.1,
             }
@@ -1012,6 +1036,10 @@ def main() -> int:
             xhigh_launch_calls.append("unexpected")
             return {}
 
+        def _xhigh_terminator(*, result_ref: str | Path):
+            xhigh_terminator_calls.append(str(Path(result_ref).resolve()))
+            xhigh_pid_alive["value"] = False
+
         xhigh_not_yet_result = supervise_child_until_settled(
             launch_result_ref=launch_result_ref_1,
             poll_interval_s=10.0,
@@ -1021,6 +1049,7 @@ def main() -> int:
             runtime_status_reader=_xhigh_status_reader,
             recovery_runner=_xhigh_recovery_runner,
             launcher=_xhigh_launcher,
+            launch_terminator=_xhigh_terminator,
             progress_snapshot_reader=_xhigh_snapshot_reader,
             no_substantive_progress_window_s=300.0,
             now_fn=lambda: xhigh_now["t"],
@@ -1029,13 +1058,15 @@ def main() -> int:
         Draft202012Validator(supervision_schema).validate(xhigh_not_yet_result)
         if str(xhigh_not_yet_result.get("settled_reason") or "") != "timeout":
             return _fail("xhigh startup should keep a larger bounded grace window before empty-workspace no-substantive-progress fires")
-        if xhigh_recovery_calls or xhigh_launch_calls:
-            return _fail("xhigh startup grace should not trigger recovery or relaunch in the pre-grace fixture")
+        if xhigh_recovery_calls or xhigh_launch_calls or xhigh_terminator_calls:
+            return _fail("xhigh startup grace should not trigger recovery, relaunch, or termination in the pre-grace fixture")
 
         xhigh_now["t"] = 3000.0
         xhigh_status_calls["count"] = 0
         xhigh_recovery_calls.clear()
         xhigh_launch_calls.clear()
+        xhigh_terminator_calls.clear()
+        xhigh_pid_alive["value"] = True
         xhigh_stop_result = supervise_child_until_settled(
             launch_result_ref=launch_result_ref_1,
             poll_interval_s=10.0,
@@ -1045,6 +1076,7 @@ def main() -> int:
             runtime_status_reader=_xhigh_status_reader,
             recovery_runner=_xhigh_recovery_runner,
             launcher=_xhigh_launcher,
+            launch_terminator=_xhigh_terminator,
             progress_snapshot_reader=_xhigh_snapshot_reader,
             no_substantive_progress_window_s=300.0,
             now_fn=lambda: xhigh_now["t"],
@@ -1053,8 +1085,12 @@ def main() -> int:
         Draft202012Validator(supervision_schema).validate(xhigh_stop_result)
         if str(xhigh_stop_result.get("settled_reason") or "") != "no_substantive_progress":
             return _fail("xhigh startup must still settle to no_substantive_progress after the larger bounded grace window expires")
+        if not bool(xhigh_stop_result.get("settled")):
+            return _fail("xhigh startup no-substantive-progress stop points must be settled only after the live child has been stopped")
         if xhigh_recovery_calls or xhigh_launch_calls:
             return _fail("xhigh startup no-substantive-progress stop points must not pretend the child is recovery-eligible")
+        if xhigh_terminator_calls != [str(launch_result_ref_1.resolve())]:
+            return _fail("xhigh startup no-substantive-progress stop points must terminate the live child before returning")
 
     print("[loop-system-child-supervision-helper] OK")
     return 0

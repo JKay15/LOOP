@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -37,8 +38,17 @@ def main() -> int:
         import loop_product as loop_product_package
         import loop_product.runtime as runtime_surface
 
+        from loop_product.dispatch.child_dispatch import materialize_child
         from loop_product.dispatch.child_dispatch import load_child_runtime_context
+        from loop_product.kernel.authority import kernel_internal_authority
+        from loop_product.kernel.policy import (
+            implementer_budget_profile,
+            implementer_execution_policy,
+            implementer_reasoning_profile,
+        )
+        from loop_product.kernel.state import load_kernel_state
         from loop_product.protocols.node import NodeSpec
+        from loop_product.runtime_paths import node_live_artifact_root
     except Exception as exc:  # noqa: BLE001
         return _fail(f"bootstrap imports failed: {exc}")
 
@@ -178,14 +188,15 @@ def main() -> int:
             expected_workspace_sink_relpath = f"artifacts/{str(result.get('node_id') or '')}/implementer_result.json"
             expected_workspace_sink_ref = str((workspace_root / expected_workspace_sink_relpath).resolve())
             expected_kernel_sink_ref = str((state_root / expected_workspace_sink_relpath).resolve())
-            expected_evaluator_submission_ref = str((state_root / "artifacts" / "bootstrap" / "EvaluatorNodeSubmission.json").resolve())
+            evaluator_bundle_root = (state_root / "artifacts" / "bootstrap" / str(result.get("node_id") or "")).resolve()
+            expected_evaluator_submission_ref = str((evaluator_bundle_root / "EvaluatorNodeSubmission.json").resolve())
             expected_evaluator_runner_ref = str((workspace_root / "RUN_EVALUATOR_NODE_UNTIL_TERMINAL.sh").resolve())
             expected_publication_receipt_ref = str(
                 (state_root / "artifacts" / "publication" / str(result.get("node_id") or "") / "WorkspaceArtifactPublicationReceipt.json").resolve()
             )
             expected_publication_runner_ref = str((workspace_root / "PUBLISH_WORKSPACE_ARTIFACT.sh").resolve())
-            expected_evaluator_manual_ref = str((state_root / "artifacts" / "bootstrap" / "EvaluatorProductManual.md").resolve())
-            expected_evaluator_final_effects_ref = str((state_root / "artifacts" / "bootstrap" / "EvaluatorFinalEffects.md").resolve())
+            expected_evaluator_manual_ref = str((evaluator_bundle_root / "EvaluatorProductManual.md").resolve())
+            expected_evaluator_final_effects_ref = str((evaluator_bundle_root / "EvaluatorFinalEffects.md").resolve())
             if str(handoff_payload.get("workspace_result_sink_relpath") or "") != expected_workspace_sink_relpath:
                 return _fail("frozen handoff must persist the workspace-local implementer result mirror relpath")
             if str(handoff_payload.get("workspace_result_sink_ref") or "") != expected_workspace_sink_ref:
@@ -300,8 +311,12 @@ def main() -> int:
                 return _fail("bootstrap must materialize a task-scoped evaluator product manual")
             if not Path(expected_evaluator_final_effects_ref).exists():
                 return _fail("bootstrap must materialize task-scoped evaluator final effects")
+            if Path(expected_evaluator_submission_ref).parent != evaluator_bundle_root:
+                return _fail("bootstrap must materialize the evaluator bundle under a node-scoped bootstrap directory")
 
             submission_payload = json.loads(Path(expected_evaluator_submission_ref).read_text(encoding="utf-8"))
+            if str(submission_payload.get("target_node_id") or "") != str(result.get("node_id") or ""):
+                return _fail("node-scoped evaluator submission must target the materialized implementer node")
             if str(submission_payload.get("product_manual_ref") or "") != expected_evaluator_manual_ref:
                 return _fail("ordinary implementer bootstrap must point evaluator submission at the task-scoped manual")
             if str(submission_payload.get("final_effects_text_ref") or "") != expected_evaluator_final_effects_ref:
@@ -339,6 +354,71 @@ def main() -> int:
             delegation_payload = dict(runtime_context.get("delegation") or {})
             if "split_request" not in set(delegation_payload.get("allowed_actions") or []):
                 return _fail("ordinary implementer bootstrap must persist split_request in the frozen delegation artifact")
+
+            split_workspace_root = ROOT / "workspace" / "test-first-child-bootstrap-slice"
+            if split_workspace_root.exists():
+                shutil.rmtree(split_workspace_root)
+            split_workspace_root.mkdir(parents=True, exist_ok=True)
+            split_node_id = f"{str(result.get('node_id') or '')}__slice"
+            split_goal_slice = "faithfully formalize only the bounded utility appendix slice"
+            kernel_state = load_kernel_state(state_root)
+            split_node = materialize_child(
+                state_root=state_root,
+                kernel_state=kernel_state,
+                parent_node_id=str(result.get("node_id") or ""),
+                node_id=split_node_id,
+                goal_slice=split_goal_slice,
+                round_id="R1.S1",
+                execution_policy=implementer_execution_policy(),
+                reasoning_profile=implementer_reasoning_profile(),
+                budget_profile=implementer_budget_profile(),
+                workspace_root=split_workspace_root,
+                required_output_paths=["README.md", "TRACEABILITY.md", "WHOLE_PAPER_STATUS.json"],
+                result_sink_ref=f"artifacts/{split_node_id}/result.json",
+                authority=kernel_internal_authority(),
+            )
+            split_live_root = node_live_artifact_root(
+                state_root=state_root,
+                node_id=split_node.node_id,
+                workspace_mirror_relpath="deliverables/primary_artifact",
+            )
+            split_live_relpath = os.path.relpath(split_live_root, start=split_workspace_root.resolve())
+            split_request = {
+                "mode": "continue_exact",
+                "task_slug": "gon birthday poster",
+                "root_goal": "deliver the gon birthday poster task through one materialized implementer node",
+                "child_goal_slice": split_goal_slice,
+                "endpoint_artifact_ref": str(endpoint_artifact.resolve()),
+                "workspace_root": str(split_workspace_root.resolve()),
+                "state_root": str(state_root.resolve()),
+                "node_id": split_node.node_id,
+                "round_id": split_node.round_id,
+                "workspace_mirror_relpath": "deliverables/primary_artifact",
+                "workspace_live_artifact_relpath": split_live_relpath,
+                "external_publish_target": "",
+                "context_refs": [str(endpoint_artifact.resolve()), str(handoff_json.resolve())],
+                "required_output_paths": ["README.md", "TRACEABILITY.md", "WHOLE_PAPER_STATUS.json"],
+                "result_sink_ref": split_node.result_sink_ref,
+            }
+            Draft202012Validator(request_schema).validate(split_request)
+            split_bootstrap = bootstrap_first_implementer_node(**split_request)
+            Draft202012Validator(result_schema).validate(split_bootstrap)
+            split_handoff = json.loads(Path(str(split_bootstrap.get("handoff_json_ref") or "")).read_text(encoding="utf-8"))
+            split_bundle_root = (state_root / "artifacts" / "bootstrap" / split_node.node_id).resolve()
+            split_submission_ref = str((split_bundle_root / "EvaluatorNodeSubmission.json").resolve())
+            split_final_effects_ref = str((split_bundle_root / "EvaluatorFinalEffects.md").resolve())
+            if str(split_handoff.get("evaluator_submission_ref") or "") != split_submission_ref:
+                return _fail("split child bootstrap must persist a node-scoped evaluator submission ref")
+            if str(split_handoff.get("workspace_live_artifact_ref") or "") != str(split_live_root.resolve()):
+                return _fail("split child bootstrap must preserve the exact external live artifact root")
+            split_submission_payload = json.loads(Path(split_submission_ref).read_text(encoding="utf-8"))
+            if str(split_submission_payload.get("goal_slice") or "") != split_goal_slice:
+                return _fail("split child evaluator submission must preserve the narrowed slice goal")
+            split_final_effects_text = Path(split_final_effects_ref).read_text(encoding="utf-8").lower()
+            if "whole-paper faithful complete formalization" in split_final_effects_text:
+                return _fail("split child evaluator bundle must not reuse whole-paper final effects text")
+            if "paper defect exposed" in split_final_effects_text and "external dependency blocked" in split_final_effects_text:
+                return _fail("split child evaluator bundle must stay slice-scoped instead of advertising whole-paper terminal classifications")
 
             launch_spec = dict(result.get("launch_spec") or {})
             argv = list(launch_spec.get("argv") or [])
@@ -438,6 +518,7 @@ def main() -> int:
             ancestor_relative_ref.unlink(missing_ok=True)
             shutil.rmtree(workspace_root, ignore_errors=True)
             shutil.rmtree(state_root, ignore_errors=True)
+            shutil.rmtree(ROOT / "workspace" / "test-first-child-bootstrap-slice", ignore_errors=True)
             shutil.rmtree(ROOT / "workspace" / "test-first-child-bootstrap-from-endpoint", ignore_errors=True)
             shutil.rmtree(ROOT / ".loop" / "test-first-child-bootstrap-from-endpoint", ignore_errors=True)
 

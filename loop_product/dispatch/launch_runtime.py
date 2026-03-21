@@ -301,6 +301,14 @@ def _reap_runtime_owned_launch(launch_result: dict[str, Any]) -> None:
         _terminate_pid(pid)
 
 
+def terminate_runtime_owned_launch_result_ref(*, result_ref: str | Path) -> None:
+    """Terminate the runtime-owned child process referenced by a launch result."""
+
+    payload = _load_optional_json(Path(result_ref).expanduser().resolve())
+    if payload:
+        _reap_runtime_owned_launch(payload)
+
+
 def _existing_live_launch_result(*, state_root: Path, node_id: str, workspace_root: Path) -> dict[str, Any] | None:
     launch_root = state_root / "artifacts" / "launches" / node_id
     if not launch_root.exists():

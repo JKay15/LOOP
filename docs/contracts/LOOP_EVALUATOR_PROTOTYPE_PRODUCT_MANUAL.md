@@ -62,7 +62,7 @@ python -m loop_product.evaluator.prototype --input <fixture_request.json> --mode
 ## Implementer quick path
 
 For ordinary implementer subagents inside this repo, the preferred route is not to start from a hand-written raw `fixture_request.json`.
-The committed first-child bootstrap should already have materialized a task-scoped evaluator submission, plus task-scoped manual/final-effects refs, for that frozen implementer task.
+The committed first-child bootstrap should already have materialized a node-scoped evaluator submission, plus node-scoped manual/final-effects refs, for that frozen implementer task.
 
 Prefer the repo-local adapter path in `loop_product.loop.evaluator_client`:
 
@@ -72,6 +72,8 @@ Prefer the repo-local adapter path in `loop_product.loop.evaluator_client`:
 - `run_evaluator_node(...)`
 
 That quick path has two layers. `initialize_evaluator_runtime(...)` prepares the trusted `.loop/...` runtime state for an ordinary implementer caller without exposing kernel authority directly. The adapter path then materializes the evaluator request JSON for you and calls the documented evaluator product surface. This is the normal route when a LOOP implementer already has the frozen final effect, implementation location, and role requirements in hand.
+
+For split children, that node-scoped evaluator bundle must stay slice-scoped by default: the bundle should judge only the narrowed branch goal and declared required outputs for that child, not silently inherit the parent/source whole-paper final-effects surface. Only an explicit final-integration / whole-paper closeout node may reuse a whole-paper evaluator surface.
 
 Use the raw `loop-evaluator --input <fixture_request.json>` surface when you genuinely need the generic caller-facing entrypoint. Do not treat the raw surface as proof that evaluator usage is inherently heavy if `initialize_evaluator_runtime(...)` plus `run_evaluator_node(...)` already covers the implementer case.
 

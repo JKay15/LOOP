@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from loop_product.dispatch.child_progress_snapshot import child_progress_snapshot_from_launch_result_ref
+from loop_product.dispatch.launch_runtime import terminate_runtime_owned_launch_result_ref
 from loop_product.kernel.state import load_kernel_state
 from loop_product.protocols.node import NodeSpec
 from loop_product.protocols.schema import validate_repo_object
@@ -296,6 +297,7 @@ def supervise_child_until_settled(
     runtime_status_reader: Callable[..., dict[str, Any]],
     recovery_runner: Callable[..., dict[str, Any]],
     launcher: Callable[..., dict[str, Any]],
+    launch_terminator: Callable[..., None] | None = None,
     progress_snapshot_reader: Callable[..., dict[str, Any]] | None = None,
     no_substantive_progress_window_s: float = 300.0,
     now_fn: Callable[[], float] = time.time,
@@ -317,6 +319,11 @@ def supervise_child_until_settled(
             )
 
         progress_snapshot_reader = _default_progress_snapshot_reader
+    if launch_terminator is None:
+        def _default_launch_terminator(*, result_ref: str | Path) -> None:
+            terminate_runtime_owned_launch_result_ref(result_ref=result_ref)
+
+        launch_terminator = _default_launch_terminator
 
     while True:
         status = runtime_status_reader(
@@ -361,13 +368,21 @@ def supervise_child_until_settled(
                         status=status,
                     ),
                 ):
+                    launch_terminator(result_ref=str(current_launch_result_ref))
+                    status = runtime_status_reader(
+                        result_ref=str(current_launch_result_ref),
+                        stall_threshold_s=stall_threshold_s,
+                    )
+                    if bool(status.get("pid_alive")):
+                        sleep_fn(max(0.05, float(poll_interval_s)))
+                        continue
                     result = {
                         "launch_result_ref": str(_absolute(launch_result_ref)),
                         "latest_launch_result_ref": str(current_launch_result_ref),
                         "node_id": node_id,
                         "state_root": str(state_root),
                         "workspace_root": str(status.get("workspace_root") or ""),
-                        "settled": False,
+                        "settled": True,
                         "settled_reason": "no_substantive_progress",
                         "recoveries_used": recoveries_used,
                         "implementer_result_ref": "",
@@ -386,13 +401,21 @@ def supervise_child_until_settled(
                     placeholder_progress_fingerprint = snapshot_fingerprint
                     placeholder_progress_started_at = observed_at
                 elif (observed_at - placeholder_progress_started_at) >= float(no_substantive_progress_window_s):
+                    launch_terminator(result_ref=str(current_launch_result_ref))
+                    status = runtime_status_reader(
+                        result_ref=str(current_launch_result_ref),
+                        stall_threshold_s=stall_threshold_s,
+                    )
+                    if bool(status.get("pid_alive")):
+                        sleep_fn(max(0.05, float(poll_interval_s)))
+                        continue
                     result = {
                         "launch_result_ref": str(_absolute(launch_result_ref)),
                         "latest_launch_result_ref": str(current_launch_result_ref),
                         "node_id": node_id,
                         "state_root": str(state_root),
                         "workspace_root": str(status.get("workspace_root") or ""),
-                        "settled": False,
+                        "settled": True,
                         "settled_reason": "no_substantive_progress",
                         "recoveries_used": recoveries_used,
                         "implementer_result_ref": "",
