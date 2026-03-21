@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 from loop_product.kernel.state import ACTIVE_NODE_STATUSES, KernelState
 from loop_product.protocols.node import NodeSpec, normalize_execution_policy, normalize_reasoning_profile
 from loop_product.protocols.topology import TopologyMutation
+from loop_product.topology.budget import normalized_complexity_budget
 
 _SPLIT_CHECK_ORDER = (
     "S1_source_node_authorized",
@@ -285,8 +286,9 @@ def review_split_request(kernel_state: KernelState, mutation: TopologyMutation) 
     active_now = sum(
         1 for node in kernel_state.nodes.values() if str(node.get("status") or "") in ACTIVE_NODE_STATUSES
     )
-    max_active_nodes = int(dict(kernel_state.complexity_budget).get("max_active_nodes", 4) or 4)
-    max_child_generations = int(dict(kernel_state.complexity_budget).get("max_child_generations", 3) or 3)
+    normalized_budget = normalized_complexity_budget(dict(kernel_state.complexity_budget))
+    max_active_nodes = int(normalized_budget.get("max_active_nodes") or 0)
+    max_child_generations = int(normalized_budget.get("max_child_generations") or 0)
     minimum_target_count = 2 if normalized_split_mode == "parallel" else 1
     projected_active = active_now + len(normalized_target_nodes) if normalized_split_mode == "parallel" else active_now
 

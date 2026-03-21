@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -26,7 +28,10 @@ def _require_contains(text: str, needle: str, *, context: str) -> None:
 
 def main() -> int:
     from loop_product.dispatch import bootstrap as bootstrap_module
+    from loop_product.kernel.state import KernelState, persist_kernel_state
+    from loop_product.kernel.authority import kernel_internal_authority
     from loop_product.protocols.node import NodeSpec, NodeStatus
+    from loop_product.kernel.state import ensure_runtime_tree
 
     product_agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
     workspace_agents = (ROOT / "workspace" / "AGENTS.md").read_text(encoding="utf-8")
@@ -34,6 +39,9 @@ def main() -> int:
     loop_runner_skill = (ROOT / ".agents" / "skills" / "loop-runner" / "SKILL.md").read_text(encoding="utf-8")
     kernel_contract = (ROOT / "docs" / "contracts" / "LOOP_SYSTEM_KERNEL_CONTRACT.md").read_text(encoding="utf-8")
     node_contract = (ROOT / "docs" / "contracts" / "LOOP_SYSTEM_NODE_CONTRACT.md").read_text(encoding="utf-8")
+    evaluator_node_contract = (ROOT / "docs" / "contracts" / "LOOP_SYSTEM_EVALUATOR_NODE_CONTRACT.md").read_text(
+        encoding="utf-8"
+    )
 
     try:
         _require_contains(
@@ -57,6 +65,21 @@ def main() -> int:
             context="workspace rules",
         )
         _require_contains(
+            workspace_agents,
+            "submit_split_request_from_handoff.sh",
+            context="workspace rules",
+        )
+        _require_contains(
+            workspace_agents,
+            "submit_activate_request_from_handoff.sh",
+            context="workspace rules",
+        )
+        _require_contains(
+            workspace_agents,
+            "WHOLE_PAPER_STATUS.json",
+            context="workspace rules",
+        )
+        _require_contains(
             child_dispatch_skill,
             "Only the current implementer may propose that the task should split",
             context="child-dispatch skill",
@@ -74,6 +97,21 @@ def main() -> int:
         _require_contains(
             loop_runner_skill,
             "Do not treat a possible split as local permission to spawn helpers or mutate topology yourself",
+            context="loop-runner skill",
+        )
+        _require_contains(
+            loop_runner_skill,
+            "submit_split_request_from_handoff.sh",
+            context="loop-runner skill",
+        )
+        _require_contains(
+            loop_runner_skill,
+            "submit_activate_request_from_handoff.sh",
+            context="loop-runner skill",
+        )
+        _require_contains(
+            loop_runner_skill,
+            "WHOLE_PAPER_STATUS.json",
             context="loop-runner skill",
         )
         _require_contains(
@@ -127,6 +165,16 @@ def main() -> int:
             context="kernel contract",
         )
         _require_contains(
+            kernel_contract,
+            "text-only split recommendations in workspace prose are not submitted topology proposals",
+            context="kernel contract",
+        )
+        _require_contains(
+            kernel_contract,
+            "accepted deferred split children require a later activate proposal",
+            context="kernel contract",
+        )
+        _require_contains(
             node_contract,
             "treat exact frozen refs as authoritative during startup",
             context="node contract",
@@ -155,6 +203,26 @@ def main() -> int:
             node_contract,
             "Do not broad-search repo roots, `.loop/**` history, or unrelated evaluator workspaces",
             context="node contract",
+        )
+        _require_contains(
+            node_contract,
+            "repo-shipped split helper",
+            context="node contract",
+        )
+        _require_contains(
+            node_contract,
+            "repo-shipped activate helper",
+            context="node contract",
+        )
+        _require_contains(
+            node_contract,
+            "WHOLE_PAPER_STATUS.json",
+            context="node contract",
+        )
+        _require_contains(
+            evaluator_node_contract,
+            "WHOLE_PAPER_STATUS.json",
+            context="evaluator node contract",
         )
     except AssertionError as exc:
         return _fail(str(exc))
@@ -194,6 +262,12 @@ def main() -> int:
             return _fail("bootstrap child prompt must forbid self-materializing child nodes from implementer context")
         if "report whether split was proposed or accepted" not in prompt_text:
             return _fail("bootstrap child prompt must require split/outcome reporting in the implementer closeout")
+        if "submit_split_request_from_handoff.sh" not in prompt_text:
+            return _fail("bootstrap child prompt must surface an exact split helper path instead of only prose guidance")
+        if "submit_activate_request_from_handoff.sh" not in prompt_text:
+            return _fail("bootstrap child prompt must surface an exact activate helper path for deferred children")
+        if "WHOLE_PAPER_STATUS.json" not in prompt_text:
+            return _fail("bootstrap child prompt must require structured whole-paper terminal evidence before evaluator")
         if "exact frozen refs in the handoff/prompt as authoritative" not in prompt_text:
             return _fail("bootstrap child prompt must treat exact frozen refs as authoritative during startup")
         if "one concrete workspace-local action" not in prompt_text:
@@ -210,6 +284,252 @@ def main() -> int:
             return _fail("bootstrap child prompt must require substantive artifact startup before broad theorem search")
         if "Do not broad-search repo roots, `.loop/**` history, or unrelated evaluator workspaces" not in prompt_text:
             return _fail("bootstrap child prompt must forbid broad history mining when exact frozen refs exist")
+
+    with tempfile.TemporaryDirectory(prefix="loop_product_split_helper_") as td:
+        temp_root = Path(td)
+        state_root = temp_root / ".loop" / "split-helper"
+        workspace_root = temp_root / "workspace"
+        workspace_root.mkdir(parents=True, exist_ok=True)
+        ensure_runtime_tree(state_root)
+        root_node = NodeSpec(
+            node_id="root-kernel",
+            node_kind="kernel",
+            goal_slice="test split helper",
+            parent_node_id=None,
+            generation=0,
+            round_id="R0",
+            execution_policy={"mode": "kernel"},
+            reasoning_profile={"role": "kernel", "thinking_budget": "medium"},
+            budget_profile={"max_rounds": 2},
+            allowed_actions=["dispatch", "submit", "audit"],
+            delegation_ref="",
+            result_sink_ref="artifacts/root/result.json",
+            lineage_ref="root-kernel",
+            status=NodeStatus.ACTIVE,
+        )
+        child_node = NodeSpec(
+            node_id="child-001",
+            node_kind="implementer",
+            goal_slice="test direct split helper submission",
+            parent_node_id="root-kernel",
+            generation=1,
+            round_id="R1",
+            execution_policy={"sandbox_mode": "danger-full-access"},
+            reasoning_profile={"role": "implementer", "thinking_budget": "high"},
+            budget_profile={"max_rounds": 2},
+            allowed_actions=["implement", "evaluate", "report", "split_request"],
+            workspace_root=str(workspace_root.resolve()),
+            delegation_ref="state/delegations/child-001.json",
+            result_sink_ref="artifacts/child-001/implementer_result.json",
+            lineage_ref="root-kernel->child-001",
+            status=NodeStatus.ACTIVE,
+        )
+        kernel_state = KernelState(
+            task_id="split-helper-test",
+            root_goal="exercise split helper",
+            root_node_id=root_node.node_id,
+        )
+        kernel_state.register_node(root_node)
+        kernel_state.register_node(child_node)
+        persist_kernel_state(state_root, kernel_state, authority=kernel_internal_authority())
+
+        handoff = workspace_root / "FROZEN_HANDOFF.json"
+        handoff.write_text(
+            json.dumps(
+                {
+                    "node_id": child_node.node_id,
+                    "round_id": child_node.round_id,
+                    "kernel_result_sink_ref": str((state_root / child_node.result_sink_ref).resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        proposal = workspace_root / "SplitRequest.json"
+        proposal.write_text(
+            json.dumps(
+                {
+                    "split_mode": "parallel",
+                    "reason": "parallelizable proof frontier split",
+                    "completed_work": "block A inventory and starter formalization",
+                    "remaining_work": "blocks B/C and utility-learning appendix remain independent",
+                    "target_nodes": [
+                        {"node_id": "child-001-block-bc", "goal_slice": "formalize Block B and Block C"},
+                        {"node_id": "child-001-block-e", "goal_slice": "formalize Block E"},
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        result_ref = workspace_root / "SplitRequestResult.json"
+        helper = ROOT / "scripts" / "submit_split_request_from_handoff.sh"
+        proc = subprocess.run(
+            [str(helper), "--handoff-ref", str(handoff), "--proposal-ref", str(proposal), "--result-ref", str(result_ref)],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            return _fail(
+                "repo-shipped split helper must submit a kernel-reviewed split proposal from frozen handoff context; "
+                f"stderr={proc.stderr.strip()!r}"
+            )
+        if not result_ref.exists():
+            return _fail("split helper must materialize a deterministic result file")
+        result_payload = json.loads(result_ref.read_text(encoding="utf-8"))
+        if str(result_payload.get("status") or "") != "ACCEPTED":
+            return _fail("split helper must surface ACCEPTED when kernel review accepts the proposal")
+
+    with tempfile.TemporaryDirectory(prefix="loop_product_activate_helper_") as td:
+        temp_root = Path(td)
+        state_root = temp_root / ".loop" / "activate-helper"
+        workspace_root = temp_root / "workspace"
+        workspace_root.mkdir(parents=True, exist_ok=True)
+        ensure_runtime_tree(state_root)
+        root_node = NodeSpec(
+            node_id="root-kernel",
+            node_kind="kernel",
+            goal_slice="test activate helper",
+            parent_node_id=None,
+            generation=0,
+            round_id="R0",
+            execution_policy={"mode": "kernel"},
+            reasoning_profile={"role": "kernel", "thinking_budget": "medium"},
+            budget_profile={"max_rounds": 2},
+            allowed_actions=["dispatch", "submit", "audit"],
+            delegation_ref="",
+            result_sink_ref="artifacts/root/result.json",
+            lineage_ref="root-kernel",
+            status=NodeStatus.ACTIVE,
+        )
+        child_node = NodeSpec(
+            node_id="child-001",
+            node_kind="implementer",
+            goal_slice="test deferred activate helper submission",
+            parent_node_id="root-kernel",
+            generation=1,
+            round_id="R1",
+            execution_policy={"sandbox_mode": "danger-full-access"},
+            reasoning_profile={"role": "implementer", "thinking_budget": "high"},
+            budget_profile={"max_rounds": 2},
+            allowed_actions=["implement", "evaluate", "report", "split_request"],
+            workspace_root=str(workspace_root.resolve()),
+            delegation_ref="state/delegations/child-001.json",
+            result_sink_ref="artifacts/child-001/implementer_result.json",
+            lineage_ref="root-kernel->child-001",
+            status=NodeStatus.ACTIVE,
+        )
+        kernel_state = KernelState(
+            task_id="activate-helper-test",
+            root_goal="exercise activate helper",
+            root_node_id=root_node.node_id,
+        )
+        kernel_state.register_node(root_node)
+        kernel_state.register_node(child_node)
+        persist_kernel_state(state_root, kernel_state, authority=kernel_internal_authority())
+
+        deferred_proposal = workspace_root / "SplitRequest.json"
+        deferred_proposal.write_text(
+            json.dumps(
+                {
+                    "split_mode": "deferred",
+                    "reason": "defer formalization lane until source checkpoint is done",
+                    "completed_work": "source node owns extraction and partition",
+                    "remaining_work": "follow-up child formalizes deferred branch after source terminal",
+                    "target_nodes": [
+                        {
+                            "node_id": "child-001-followup",
+                            "goal_slice": "formalize the deferred branch",
+                            "depends_on_node_ids": ["child-001"],
+                            "activation_condition": "after:child-001:terminal",
+                        }
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        handoff = workspace_root / "FROZEN_HANDOFF.json"
+        handoff.write_text(
+            json.dumps(
+                {
+                    "node_id": child_node.node_id,
+                    "round_id": child_node.round_id,
+                    "kernel_result_sink_ref": str((state_root / child_node.result_sink_ref).resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        split_result_ref = workspace_root / "SplitRequestResult.json"
+        split_helper = ROOT / "scripts" / "submit_split_request_from_handoff.sh"
+        split_proc = subprocess.run(
+            [str(split_helper), "--handoff-ref", str(handoff), "--proposal-ref", str(deferred_proposal), "--result-ref", str(split_result_ref)],
+            capture_output=True,
+            text=True,
+        )
+        if split_proc.returncode != 0:
+            return _fail(
+                "activate helper setup requires the deferred split helper path to succeed first; "
+                f"stderr={split_proc.stderr.strip()!r}"
+            )
+        source_state_path = state_root / "state" / "child-001.json"
+        source_state = json.loads(source_state_path.read_text(encoding="utf-8"))
+        source_state["status"] = "COMPLETED"
+        source_state_path.write_text(json.dumps(source_state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        kernel_state_obj = json.loads((state_root / "state" / "kernel_state.json").read_text(encoding="utf-8"))
+        kernel_state_obj["nodes"]["child-001"]["status"] = "COMPLETED"
+        (state_root / "state" / "kernel_state.json").write_text(
+            json.dumps(kernel_state_obj, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        activate_proposal = workspace_root / "ActivateRequest.json"
+        activate_proposal.write_text(
+            json.dumps(
+                {
+                    "target_node_id": "child-001-followup",
+                    "reason": "source checkpoint completed; activate deferred child",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        activate_result_ref = workspace_root / "ActivateRequestResult.json"
+        activate_helper = ROOT / "scripts" / "submit_activate_request_from_handoff.sh"
+        activate_proc = subprocess.run(
+            [
+                str(activate_helper),
+                "--handoff-ref",
+                str(handoff),
+                "--proposal-ref",
+                str(activate_proposal),
+                "--result-ref",
+                str(activate_result_ref),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if activate_proc.returncode != 0:
+            return _fail(
+                "repo-shipped activate helper must submit a kernel-reviewed activate proposal from frozen handoff context; "
+                f"stderr={activate_proc.stderr.strip()!r}"
+            )
+        if not activate_result_ref.exists():
+            return _fail("activate helper must materialize a deterministic result file")
+        activate_result_payload = json.loads(activate_result_ref.read_text(encoding="utf-8"))
+        if str(activate_result_payload.get("status") or "") != "ACCEPTED":
+            return _fail("activate helper must surface ACCEPTED when kernel review accepts the proposal")
 
     print("[loop-system-split-instruction-chain] OK")
     return 0

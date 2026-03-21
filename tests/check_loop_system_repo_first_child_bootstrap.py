@@ -163,6 +163,8 @@ def main() -> int:
             handoff_payload = json.loads(handoff_json.read_text(encoding="utf-8"))
             if str(handoff_payload.get("endpoint_artifact_ref") or "") != str(endpoint_artifact.resolve()):
                 return _fail("frozen handoff must persist endpoint_artifact_ref")
+            if str(handoff_payload.get("state_root") or "") != str(state_root.resolve()):
+                return _fail("frozen handoff must persist the exact state_root for topology helpers")
             if str(handoff_payload.get("workspace_mirror_relpath") or "") != "deliverables/gon_birthday_poster.html":
                 return _fail("frozen handoff must persist the workspace mirror relpath")
             if str(handoff_payload.get("external_publish_target") or "") != "/Users/example/Desktop/gon_birthday_poster.html":
@@ -196,6 +198,9 @@ def main() -> int:
                 return _fail("bootstrap result must surface the exact evaluator submission ref")
             if str(result.get("evaluator_runner_ref") or "") != expected_evaluator_runner_ref:
                 return _fail("bootstrap result must surface the exact evaluator runner ref")
+            handoff_md_text = handoff_md.read_text(encoding="utf-8")
+            if f"- state_root: `{state_root.resolve()}`" not in handoff_md_text:
+                return _fail("frozen handoff markdown must include the exact state_root for helper replay")
 
             prompt_text = child_prompt.read_text(encoding="utf-8")
             for needle in (
@@ -218,6 +223,8 @@ def main() -> int:
                 str((ROOT / ".agents" / "skills" / "evaluator-exec" / "SKILL.md").resolve()),
                 str((ROOT / "docs" / "contracts" / "LOOP_EVALUATOR_PROTOTYPE_PRODUCT_MANUAL.md").resolve()),
                 str((ROOT / "scripts" / "find_local_input_candidates.sh").resolve()),
+                str((ROOT / "scripts" / "submit_split_request_from_handoff.sh").resolve()),
+                str((ROOT / "scripts" / "submit_activate_request_from_handoff.sh").resolve()),
                 expected_kernel_sink_ref,
                 expected_workspace_sink_ref,
                 "fresh workspace-local Lean package",
@@ -241,6 +248,10 @@ def main() -> int:
                 "After the skeleton exists, materially advance the first incomplete staged phase with source-backed content before broadening into later phases or open-ended reconnaissance",
                 "planned outputs, `pending` tables, TODO notes, or placeholder headings alone do not count as substantive staged progress",
                 "Do not broad-search repo roots, `.loop/**` history, or unrelated evaluator workspaces for helper or template discovery when the exact frozen refs already name the required helper or baseline artifacts",
+                "If you decide split is warranted, materialize a structured split proposal and call the exact split helper named in this prompt instead of only writing the recommendation into deliverable prose",
+                "If kernel accepts a deferred split, do not assume the planned children will start automatically",
+                "materialize a structured activate proposal and call the exact activate helper named in this prompt",
+                "Do not start evaluator for a staged whole-paper benchmark until the artifact carries structured terminal-classification evidence in `WHOLE_PAPER_STATUS.json`",
                 "Before evaluator or final report, the final `deliverables/primary_artifact` must not ship runtime-owned heavy trees",
                 "such as `.lake`, `.git`, `.venv`, `.uv-cache`, `build`, or `_lake_build`",
             ):
@@ -354,6 +365,8 @@ def main() -> int:
             derived_handoff_payload = json.loads(derived_handoff_json.read_text(encoding="utf-8"))
             if str(derived_handoff_payload.get("endpoint_artifact_ref") or "") != str(endpoint_artifact.resolve()):
                 return _fail("endpoint-driven bootstrap must preserve endpoint_artifact_ref")
+            if str(derived_handoff_payload.get("state_root") or "") != str(derived_state_root.resolve()):
+                return _fail("endpoint-driven bootstrap must preserve state_root in the frozen handoff")
             if str(derived_handoff_payload.get("workspace_mirror_relpath") or "") != "deliverables/gon_birthday_poster.html":
                 return _fail(
                     "endpoint-driven bootstrap must derive workspace_mirror_relpath from the external publish target basename"

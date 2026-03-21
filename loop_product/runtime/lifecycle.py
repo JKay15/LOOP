@@ -26,7 +26,13 @@ from loop_product.kernel.policy import (
     kernel_execution_policy,
     kernel_reasoning_profile,
 )
-from loop_product.kernel.state import KernelState, ensure_runtime_tree, load_kernel_state, persist_kernel_state
+from loop_product.kernel.state import (
+    KernelState,
+    ensure_runtime_tree,
+    load_kernel_state,
+    persist_kernel_state,
+    synchronize_authoritative_node_results,
+)
 from loop_product.protocols.node import NodeSpec
 from loop_product.protocols.control_objects import NodeTerminalOutcome, NodeTerminalResult
 from loop_product.protocols.node import NodeStatus
@@ -111,8 +117,20 @@ def child_runtime_status_from_launch_result_ref(
 ) -> dict[str, Any]:
     """Public trusted surface for committed child-runtime status queries."""
 
+    result_path = Path(result_ref).expanduser().resolve()
+    try:
+        launch_payload = json.loads(result_path.read_text(encoding="utf-8"))
+        state_root = require_runtime_root(Path(str(launch_payload["state_root"])).expanduser().resolve())
+        synchronize_authoritative_node_results(
+            state_root,
+            continue_deferred=True,
+            authority=kernel_internal_authority(),
+        )
+    except Exception:
+        pass
+
     return dispatch_child_runtime_status_from_launch_result_ref(
-        result_ref=result_ref,
+        result_ref=result_path,
         stall_threshold_s=stall_threshold_s,
     )
 

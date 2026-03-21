@@ -1109,6 +1109,104 @@ def main() -> int:
         if str(retryable_fail_node.get("status") or "") != NodeStatus.ACTIVE.value:
             return _fail("retryable FAIL must leave the implementer node ACTIVE for repair work")
 
+        whole_paper_gate_state_root = temp_root / ".loop" / "whole_paper_gate"
+        whole_paper_gate_workspace_root = temp_root / "whole_paper_gate_workspace"
+        whole_paper_gate_artifact_root = whole_paper_gate_workspace_root / "deliverables" / "primary_artifact"
+        whole_paper_gate_artifact_root.mkdir(parents=True, exist_ok=True)
+        ensure_runtime_tree(whole_paper_gate_state_root)
+        whole_paper_gate_root_node = NodeSpec(
+            node_id="whole-paper-gate-root",
+            node_kind="kernel",
+            goal_slice="exercise whole-paper evaluator preflight gate",
+            parent_node_id=None,
+            generation=0,
+            round_id="R0",
+            execution_policy={"mode": "kernel"},
+            reasoning_profile={"role": "kernel", "thinking_budget": "medium"},
+            budget_profile={"max_rounds": 1},
+            allowed_actions=["dispatch", "submit", "audit"],
+            delegation_ref="",
+            result_sink_ref="artifacts/whole_paper_gate/root_summary.json",
+            lineage_ref="whole-paper-gate-root",
+            status=NodeStatus.ACTIVE,
+        )
+        whole_paper_gate_child_node = NodeSpec(
+            node_id="whole-paper-gate-child",
+            node_kind="implementer",
+            goal_slice="ensure incomplete whole-paper artifacts cannot start evaluator",
+            parent_node_id=whole_paper_gate_root_node.node_id,
+            generation=1,
+            round_id="R1",
+            execution_policy={"sandbox_mode": "danger-full-access"},
+            reasoning_profile={"role": "implementer", "thinking_budget": "high"},
+            budget_profile={"max_rounds": 1},
+            allowed_actions=["evaluate", "report", "split_request"],
+            delegation_ref="state/delegations/whole-paper-gate-child.json",
+            result_sink_ref="artifacts/whole_paper_gate/implementer_result.json",
+            lineage_ref="whole-paper-gate-root->whole-paper-gate-child",
+            status=NodeStatus.ACTIVE,
+        )
+        whole_paper_gate_kernel_state = KernelState(
+            task_id="whole-paper-evaluator-gate",
+            root_goal="prevent premature whole-paper evaluator attempts",
+            root_node_id=whole_paper_gate_root_node.node_id,
+        )
+        whole_paper_gate_kernel_state.register_node(whole_paper_gate_root_node)
+        whole_paper_gate_kernel_state.register_node(whole_paper_gate_child_node)
+        persist_kernel_state(
+            whole_paper_gate_state_root,
+            whole_paper_gate_kernel_state,
+            authority=kernel_internal_authority(),
+        )
+        (whole_paper_gate_artifact_root / "README.md").write_text("# README\n", encoding="utf-8")
+        (whole_paper_gate_artifact_root / "TRACEABILITY.md").write_text(
+            "# Traceability\n\nThis artifact does not yet justify any terminal whole-paper result.\n",
+            encoding="utf-8",
+        )
+        (whole_paper_gate_artifact_root / "EXTRACTION_REPORT.md").write_text("# Extraction\n", encoding="utf-8")
+        (whole_paper_gate_artifact_root / "PARTITION_PLAN.md").write_text(
+            "# Partition\n\nSplit recommendation recorded only in prose.\n",
+            encoding="utf-8",
+        )
+        manual_ref = whole_paper_gate_workspace_root / "PRODUCT_MANUAL.md"
+        manual_ref.write_text("# Manual\n\nWhole-paper benchmark.\n", encoding="utf-8")
+        final_effects_ref = whole_paper_gate_workspace_root / "FINAL_EFFECTS.md"
+        final_effects_ref.write_text(
+            "\n".join(
+                [
+                    "# Final Effects",
+                    "",
+                    "- whole-paper faithful complete formalization",
+                    "- paper defect exposed",
+                    "- external dependency blocked",
+                    "- intermediate block success is not whole-paper final success",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        whole_paper_gate_submission = build_evaluator_submission_for_frozen_task(
+            target_node=whole_paper_gate_child_node,
+            workspace_root=whole_paper_gate_workspace_root,
+            output_root=whole_paper_gate_state_root / "artifacts" / "evaluator_node_whole_paper_gate_runs",
+            implementation_package_ref=whole_paper_gate_artifact_root,
+            product_manual_ref=manual_ref,
+            final_effects_text_ref=final_effects_ref,
+            role_agent_cmd=_fixture_role_agent_cmd(scenario="wave_sequence"),
+        )
+        try:
+            run_evaluator_node_until_terminal(
+                state_root=whole_paper_gate_state_root,
+                submission=whole_paper_gate_submission,
+                max_same_run_recovery_attempts=0,
+            )
+        except ValueError as exc:
+            msg = str(exc)
+            if "WHOLE_PAPER_STATUS.json" not in msg or "whole-paper" not in msg:
+                return _fail("whole-paper evaluator preflight rejection must explain the missing structured terminal status evidence")
+        else:
+            return _fail("whole-paper evaluator attempts must fail closed before evaluator launch when terminal status evidence is missing")
+
         runtime_closure_only_state_root = temp_root / ".loop" / "runtime_closure_only"
         runtime_closure_only_workspace_root = temp_root / "runtime_closure_only_workspace"
         runtime_closure_only_workspace_root.mkdir(parents=True, exist_ok=True)
@@ -1367,6 +1465,10 @@ def main() -> int:
         (artifact_root / ".venv" / "bin" / "python").write_text("# stub\n", encoding="utf-8")
         (artifact_root / ".uv-cache").mkdir(parents=True, exist_ok=True)
         (artifact_root / ".uv-cache" / "cache.txt").write_text("cache\n", encoding="utf-8")
+        (artifact_root / "build" / "lib").mkdir(parents=True, exist_ok=True)
+        (artifact_root / "build" / "lib" / "artifact.txt").write_text("build\n", encoding="utf-8")
+        (artifact_root / "_lake_build" / "lib").mkdir(parents=True, exist_ok=True)
+        (artifact_root / "_lake_build" / "lib" / "artifact.txt").write_text("lake-build\n", encoding="utf-8")
         artifact_manual_ref = artifact_workspace_root / "PRODUCT_MANUAL.md"
         artifact_manual_ref.write_text("# Manual\n\nInspect the staged deliverable only.\n", encoding="utf-8")
         if not (artifact_root / ".lake").exists():
@@ -1415,6 +1517,19 @@ def main() -> int:
         )
         if artifact_copy_result.verdict is not EvaluatorVerdict.PASS:
             return _fail("nested-heavy-tree fixture must still reach PASS through the evaluator-node path")
+        for heavyweight_relpath in (
+            Path(".lake"),
+            Path(".git"),
+            Path(".venv"),
+            Path(".uv-cache"),
+            Path("build"),
+            Path("_lake_build"),
+        ):
+            if (artifact_root / heavyweight_relpath).exists():
+                return _fail(
+                    "evaluator-node runtime must canonicalize the source deliverable itself and prune "
+                    f"runtime-owned heavy tree {heavyweight_relpath} before a successful evaluation"
+                )
         artifact_copy_run_root = Path(str(artifact_copy_refs["evaluation_report_ref"])).resolve().parent
         for expected_workspace in (
             artifact_copy_run_root / ".loop" / "test_ai" / "workspaces" / "test_ai__EU-001" / "workspace",
@@ -1437,6 +1552,8 @@ def main() -> int:
                 Path(".git"),
                 Path(".venv"),
                 Path(".uv-cache"),
+                Path("build"),
+                Path("_lake_build"),
             ):
                 if (copied_artifact_root / heavyweight_relpath).exists():
                     return _fail(

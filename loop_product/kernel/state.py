@@ -25,6 +25,19 @@ ACTIVE_NODE_STATUSES = {
     NodeStatus.ACTIVE.value,
     NodeStatus.BLOCKED.value,
 }
+_NODE_STATUS_VALUES = {item.value for item in NodeStatus}
+
+
+def _default_complexity_budget() -> dict[str, Any]:
+    from loop_product.topology.budget import default_complexity_budget
+
+    return default_complexity_budget()
+
+
+def _normalized_complexity_budget(raw: dict[str, Any] | None = None) -> dict[str, Any]:
+    from loop_product.topology.budget import normalized_complexity_budget
+
+    return normalized_complexity_budget(raw)
 
 
 @dataclass(slots=True)
@@ -38,7 +51,7 @@ class KernelState:
     nodes: dict[str, dict[str, Any]] = field(default_factory=dict)
     delegation_map: dict[str, str] = field(default_factory=dict)
     blocked_reasons: dict[str, str] = field(default_factory=dict)
-    complexity_budget: dict[str, Any] = field(default_factory=lambda: {"max_active_nodes": 4})
+    complexity_budget: dict[str, Any] = field(default_factory=_default_complexity_budget)
     accepted_envelopes: list[dict[str, Any]] = field(default_factory=list)
     active_evaluator_lanes: list[dict[str, Any]] = field(default_factory=list)
     active_requirements: list[str] = field(default_factory=list)
@@ -246,7 +259,7 @@ class KernelState:
             nodes=dict(data.get("nodes") or {}),
             delegation_map=dict(data.get("delegation_map") or {}),
             blocked_reasons=dict(data.get("blocked_reasons") or {}),
-            complexity_budget=dict(data.get("complexity_budget") or {"max_active_nodes": 4}),
+            complexity_budget=_normalized_complexity_budget(dict(data.get("complexity_budget") or {})),
             accepted_envelopes=list(data.get("accepted_envelopes") or []),
             active_evaluator_lanes=list(data.get("active_evaluator_lanes") or []),
             active_requirements=list(data.get("active_requirements") or []),
@@ -260,6 +273,150 @@ def ensure_runtime_tree(state_root: Path) -> None:
     state_root = require_runtime_root(state_root)
     for rel in ("state", "cache", "audit", "artifacts", "quarantine"):
         (state_root / rel).mkdir(parents=True, exist_ok=True)
+
+
+def _authoritative_result_ref_for_node(*, state_root: Path, node_id: str, node_payload: dict[str, Any]) -> Path:
+    sink = str(node_payload.get("result_sink_ref") or "").strip()
+    if not sink:
+        sink = f"artifacts/{node_id}/result.json"
+    return (state_root / sink).resolve()
+
+
+def _accepted_deferred_split(payload: dict[str, Any]) -> bool:
+    split = dict(payload.get("split") or payload.get("split_report") or {})
+    deferred = dict(split.get("deferred_request") or {})
+    return bool(deferred.get("accepted"))
+
+
+def _normalized_status_from_authoritative_result(
+    *,
+    current_status: str,
+    payload: dict[str, Any],
+) -> str:
+    outcome = str(payload.get("outcome") or "").strip().upper()
+    raw_status = str(payload.get("status") or "").strip().upper()
+    if outcome == "SPLIT_ACCEPTED_AWAITING_CHILDREN":
+        return NodeStatus.BLOCKED.value
+    if _accepted_deferred_split(payload):
+        return NodeStatus.COMPLETED.value
+    if raw_status in _NODE_STATUS_VALUES:
+        return raw_status
+    return current_status
+
+
+def _synchronized_runtime_state(
+    *,
+    existing: dict[str, Any],
+    desired_status: str,
+    result_ref: Path,
+    result_payload: dict[str, Any],
+) -> dict[str, Any]:
+    runtime_state = normalize_runtime_state(existing)
+    if desired_status not in {NodeStatus.BLOCKED.value, NodeStatus.COMPLETED.value, NodeStatus.FAILED.value}:
+        return runtime_state
+    evidence_refs = [str(result_ref.resolve())]
+    for item in list(runtime_state.get("evidence_refs") or []):
+        item_text = str(item or "").strip()
+        if item_text and item_text not in evidence_refs:
+            evidence_refs.append(item_text)
+    return normalize_runtime_state(
+        {
+            **runtime_state,
+            "attachment_state": RuntimeAttachmentState.TERMINAL.value,
+            "summary": str(result_payload.get("summary") or runtime_state.get("summary") or ""),
+            "observation_kind": "authoritative_result",
+            "evidence_refs": evidence_refs,
+        }
+    )
+
+
+def synchronize_authoritative_node_results(
+    state_root: Path,
+    *,
+    continue_deferred: bool = True,
+    authority: KernelMutationAuthority | None = None,
+) -> KernelState:
+    """Normalize durable node state from authoritative child result sinks."""
+
+    require_kernel_authority(authority, surface="synchronize_authoritative_node_results")
+    state_root = require_runtime_root(state_root)
+    kernel_state = load_kernel_state(state_root)
+    dirty = False
+    deferred_ready_sources: list[str] = []
+
+    for node_id, node_payload in list(kernel_state.nodes.items()):
+        result_ref = _authoritative_result_ref_for_node(
+            state_root=state_root,
+            node_id=node_id,
+            node_payload=dict(node_payload or {}),
+        )
+        if not result_ref.exists():
+            continue
+        try:
+            result_payload = json.loads(result_ref.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        desired_status = _normalized_status_from_authoritative_result(
+            current_status=str(node_payload.get("status") or ""),
+            payload=result_payload,
+        )
+        if desired_status != str(node_payload.get("status") or ""):
+            node_payload["status"] = desired_status
+            dirty = True
+        normalized_runtime_state = _synchronized_runtime_state(
+            existing=dict(node_payload.get("runtime_state") or {}),
+            desired_status=str(node_payload.get("status") or ""),
+            result_ref=result_ref,
+            result_payload=result_payload,
+        )
+        if normalized_runtime_state != normalize_runtime_state(dict(node_payload.get("runtime_state") or {})):
+            node_payload["runtime_state"] = normalized_runtime_state
+            dirty = True
+        summary = str(result_payload.get("summary") or "").strip()
+        if str(node_payload.get("status") or "") == NodeStatus.BLOCKED.value and summary:
+            if kernel_state.blocked_reasons.get(node_id) != summary:
+                kernel_state.blocked_reasons[node_id] = summary
+                dirty = True
+        elif node_id in kernel_state.blocked_reasons and str(node_payload.get("status") or "") != NodeStatus.BLOCKED.value:
+            kernel_state.blocked_reasons.pop(node_id, None)
+            dirty = True
+        if _accepted_deferred_split(result_payload):
+            deferred_ready_sources.append(node_id)
+
+    if dirty:
+        for node in kernel_state.nodes.values():
+            persist_node_snapshot(state_root, node, authority=authority)
+        persist_kernel_state(state_root, kernel_state, authority=authority)
+
+    if continue_deferred and deferred_ready_sources:
+        from loop_product.kernel.submit import submit_topology_mutation
+        from loop_product.topology.activate import build_activate_request, review_activate_request
+
+        refreshed = load_kernel_state(state_root)
+        for source_node_id in deferred_ready_sources:
+            for child_id, child_payload in list(refreshed.nodes.items()):
+                if str(child_payload.get("status") or "") != NodeStatus.PLANNED.value:
+                    continue
+                depends_on = [str(item).strip() for item in list(child_payload.get("depends_on_node_ids") or []) if str(item).strip()]
+                if source_node_id not in depends_on:
+                    continue
+                mutation = build_activate_request(
+                    child_id,
+                    reason=f"authoritative deferred source {source_node_id} reached a completed segment; continue the ready planned child",
+                )
+                review = review_activate_request(refreshed, mutation)
+                if str(review.get("decision") or "").upper() != "ACCEPT":
+                    continue
+                submit_topology_mutation(
+                    state_root,
+                    mutation,
+                    round_id=str(child_payload.get("round_id") or refreshed.root_node_id),
+                    generation=int(child_payload.get("generation") or 0),
+                )
+                refreshed = load_kernel_state(state_root)
+        kernel_state = refreshed
+
+    return kernel_state
 
 
 def persist_kernel_state(
@@ -316,4 +473,10 @@ def query_kernel_state(state_root: Path) -> dict[str, Any]:
     """Return a read-only authoritative state snapshot for kernel queries."""
 
     state_root = require_runtime_root(state_root)
-    return load_kernel_state(state_root).to_dict()
+    from loop_product.kernel.authority import kernel_internal_authority
+
+    return synchronize_authoritative_node_results(
+        state_root,
+        continue_deferred=True,
+        authority=kernel_internal_authority(),
+    ).to_dict()

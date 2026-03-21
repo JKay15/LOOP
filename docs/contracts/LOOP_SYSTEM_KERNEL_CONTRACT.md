@@ -44,6 +44,7 @@ The `kernel` is the root supervisory authority for the complete LOOP repo. It ow
 - after launch, root-side supervision should prefer one committed helper call (preferably `scripts/supervise_child_from_launch.sh`) that keeps the same node under liveness/recovery supervision until it settles instead of relying on ad hoc polling loops in chat; when persisted launch or evaluator evidence classifies retryable provider/runtime churn, that supervision should apply bounded issue-aware cooldown before same-node recovery/relaunch rather than turning transient upstream pressure into a rapid attempt storm
 - while that supervision remains active, root must not end the root conversation or treat the task as settled before the child actually settles; `scripts/child_progress_snapshot.sh` is an optional committed observation surface when root needs live state, evaluator state, or doc-usage evidence without ad hoc manual log reading
 - product closeout for an auto-split-capable run must state whether split was proposed, accepted, and useful; if split was rejected or never requested, that must also be reported explicitly
+- text-only split recommendations in workspace prose are not submitted topology proposals; kernel authority begins only after a real split mutation is submitted for review
 - before same-node orphaned-active recovery, root supervision should query one committed child-runtime status helper (preferably `scripts/check_child_runtime_status.sh`) so a quiet child with a still-live PID stays in supervision rather than being recovered too early
 - create the first implementer project folder under `workspace/` and pin that node's `workspace_root` plus launch `cwd` / `-C` to the same folder before launching it
 - while an implementer is still in flight, root-kernel supervision is limited to liveness, status, and runtime-recovery decisions until a terminal evaluator-backed result exists
@@ -65,9 +66,12 @@ The `kernel` is the root supervisory authority for the complete LOOP repo. It ow
 - `accepted_envelopes.json` is the accepted-fact sidecar under `.loop/state/`
 - every runtime `state_root` passed to kernel/gateway/runtime helpers must resolve inside a `.loop/` boundary; roots outside `.loop/` must be rejected before any durable write happens
 - accepted split proposals are not merely audit comments; once kernel accepts them they materialize durable child delegation/state artifacts and block the source node with an auditable reason
+- accepted parallel split children must not stop at state-only materialization; root must derive each child's frozen bootstrap bundle from authoritative source context and emit canonical child-launch materialization for every accepted parallel child
 - split acceptance must be based on kernel-reviewed normalized child data; malformed child payloads, target-id drift, or generation drift must be rejected before acceptance rather than partially mutating `.loop`
 - deferred split is a separate accepted mode: the source remains `ACTIVE`, accepted future children materialize as `PLANNED`, and kernel preserves their dependency/activation metadata for later activation
+- accepted deferred split children require a later activate proposal; `PLANNED` children do not self-start just because the source node wrote about them
 - accepted deferred activation promotes one `PLANNED` child to `ACTIVE` only after kernel review confirms its dependency set and activation condition are satisfied and the active-node budget still permits activation
+- accepted deferred activation must immediately bootstrap and launch that activated child from authoritative frozen parent context rather than stopping at state-only promotion
 - accepted merge proposals may reactivate either a blocked parallel source or a completed deferred source only when all declared child branches are merge-ready and kernel has accepted the convergence request
 - accepted deferred merge must reactivate the completed source node truthfully by resetting its runtime attachment state instead of pretending the old completed runtime is still attached
 - accepted reap proposals may retire a terminal non-root node from the live authoritative graph only after kernel has archived it under `.loop/quarantine/`
@@ -88,6 +92,8 @@ The `kernel` is the root supervisory authority for the complete LOOP repo. It ow
 - evaluator-side checker/test_ai/ai_user/reviewer launches should prefer the committed evaluator role-launch runtime over ad hoc `bash -c "codex exec ..."` reconstruction
 - evaluator recovery within the same evaluator run must preserve `EvaluatorRunState.json` plus the frozen checker graph so lane resume does not mutate the already-accepted evaluation decomposition mid-run
 - accepted terminal node facts must keep `kernel_state.json` and the per-node snapshot under `.loop/state/<node>.json` in sync on terminal status and runtime attachment state rather than updating only the aggregate kernel graph
+- committed authority/status query surfaces must also reconcile authoritative non-evaluator child result sinks back into `kernel_state.json` and `.loop/state/<node>.json`; a child that already wrote a kernel-visible blocked/completed result must not remain falsely `ACTIVE` in the authoritative graph
+- when an authoritative child result records an accepted deferred split, kernel-owned continuation should be able to normalize the completed source segment and submit ready activate proposals for the planned children so deferred continuation does not stall at `PLANNED` forever
 - `query_kernel_state(...)` must expose:
   - active node graph
   - lifecycle state

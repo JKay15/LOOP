@@ -201,6 +201,7 @@ def _ensure_kernel_state(*, state_root: Path, task_slug: str, root_goal: str, au
 def _build_handoff_payload(
     *,
     node: NodeSpec,
+    state_root: Path,
     endpoint_artifact_ref: str,
     root_goal: str,
     child_goal_slice: str,
@@ -225,6 +226,7 @@ def _build_handoff_payload(
         "round_id": node.round_id,
         "lineage_ref": node.lineage_ref,
         "workspace_root": str(workspace_root.resolve()),
+        "state_root": str(state_root.resolve()),
         "endpoint_artifact_ref": endpoint_artifact_ref,
         "root_goal": root_goal,
         "child_goal_slice": child_goal_slice,
@@ -252,6 +254,7 @@ def _render_handoff_md(payload: dict[str, Any]) -> str:
         f"- round_id: `{payload['round_id']}`",
         f"- lineage_ref: `{payload['lineage_ref']}`",
         f"- workspace_root: `{payload['workspace_root']}`",
+        f"- state_root: `{payload['state_root']}`",
         f"- endpoint_artifact_ref: `{payload['endpoint_artifact_ref']}`",
         "",
         "## Frozen Goal",
@@ -295,6 +298,8 @@ def _render_child_prompt(
     evaluator_exec_skill = (repo_root / ".agents" / "skills" / "evaluator-exec" / "SKILL.md").resolve()
     evaluator_manual = (repo_root / "docs" / "contracts" / "LOOP_EVALUATOR_PROTOTYPE_PRODUCT_MANUAL.md").resolve()
     local_input_helper = (repo_root / "scripts" / "find_local_input_candidates.sh").resolve()
+    split_submit_helper = (repo_root / "scripts" / "submit_split_request_from_handoff.sh").resolve()
+    activate_submit_helper = (repo_root / "scripts" / "submit_activate_request_from_handoff.sh").resolve()
     return "\n".join(
         [
             "Read and follow:",
@@ -331,11 +336,19 @@ def _render_child_prompt(
             "Do not publish directly to the external publish target from this node unless the frozen handoff explicitly makes publication implementer-owned; the normal owner is root-kernel.",
             "If bounded progress reveals a meaningful parallelizable gap, surface a split request upward to the root kernel with the proposed child slices and why the current node should no longer own all remaining work alone.",
             "Do not directly materialize child nodes yourself or mutate topology fact from implementer context; split remains kernel-owned until an explicit acceptance decision exists.",
+            "If you decide split is warranted, materialize a structured split proposal and call the exact split helper named in this prompt instead of only writing the recommendation into deliverable prose such as `PARTITION_PLAN.md` or `TRACEABILITY.md`.",
+            "If kernel accepts a deferred split, do not assume the planned children will start automatically.",
+            "When a deferred child is genuinely ready, materialize a structured activate proposal and call the exact activate helper named in this prompt instead of treating `PLANNED` child state as self-starting.",
+            "A text-only split recommendation is not a submitted kernel proposal.",
+            "Do not start evaluator for a staged whole-paper benchmark until the artifact carries structured terminal-classification evidence in `WHOLE_PAPER_STATUS.json`.",
+            "Extraction inventories, partition plans, intermediate block ledgers, or prose stating that whole-paper closure is still pending remain non-terminal evidence and are not evaluator-ready whole-paper closeout.",
             "For the repo-root reads required by `workspace/AGENTS.md`, use these exact refs instead of guessing relative paths from the project folder:",
             "",
             f"- `{loop_runner_skill}`",
             f"- `{evaluator_exec_skill}`",
             f"- `{evaluator_manual}`",
+            f"- `{split_submit_helper}`",
+            f"- `{activate_submit_helper}`",
             "",
             "If endpoint-required local file discovery is needed, prefer the committed filename/path helper with targeted --root/--term/--ext flags over ad hoc content grep or one broad prose query:",
             "",
@@ -680,6 +693,7 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
     )
     handoff_payload = _build_handoff_payload(
         node=child_node,
+        state_root=state_root,
         endpoint_artifact_ref=request["endpoint_artifact_ref"],
         root_goal=request["root_goal"],
         child_goal_slice=request["child_goal_slice"],

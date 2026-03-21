@@ -6,6 +6,7 @@ from typing import Any
 
 from loop_product.kernel.state import ACTIVE_NODE_STATUSES, KernelState
 from loop_product.protocols.topology import TopologyMutation
+from loop_product.topology.budget import normalized_complexity_budget
 
 _TERMINAL_STATUSES = {"COMPLETED", "FAILED"}
 
@@ -61,7 +62,7 @@ def review_activate_request(kernel_state: KernelState, mutation: TopologyMutatio
     active_now = sum(
         1 for node in kernel_state.nodes.values() if str(node.get("status") or "") in ACTIVE_NODE_STATUSES
     )
-    max_active_nodes = int(dict(kernel_state.complexity_budget).get("max_active_nodes", 4) or 4)
+    max_active_nodes = int(normalized_complexity_budget(dict(kernel_state.complexity_budget)).get("max_active_nodes") or 0)
 
     checks = [
         {

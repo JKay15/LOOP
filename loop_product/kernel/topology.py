@@ -6,7 +6,9 @@ import json
 from pathlib import Path
 from typing import Any
 
+from loop_product.dispatch.bootstrap import bootstrap_first_implementer_node
 from loop_product.dispatch.child_dispatch import materialize_child
+from loop_product.dispatch.launch_runtime import launch_child_from_result_ref
 from loop_product.kernel.authority import KernelMutationAuthority, require_kernel_authority
 from loop_product.kernel.state import KernelState, persist_node_snapshot
 from loop_product.protocols.control_envelope import ControlEnvelope
@@ -18,6 +20,137 @@ from loop_product.topology.activate import review_activate_request
 from loop_product.topology.merge import review_merge_request
 from loop_product.topology.prune import review_reap_request
 from loop_product.topology.split_review import review_split_request
+
+
+def _load_source_handoff(source_record: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
+    workspace_root = Path(str(source_record.get("workspace_root") or "")).expanduser().resolve()
+    if not str(workspace_root).strip():
+        raise ValueError("source node missing workspace_root for split child bootstrap")
+    handoff_ref = workspace_root / "FROZEN_HANDOFF.json"
+    if not handoff_ref.exists():
+        raise ValueError(f"source frozen handoff missing for split child bootstrap: {handoff_ref}")
+    payload = json.loads(handoff_ref.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"source frozen handoff must be a JSON object: {handoff_ref}")
+    return handoff_ref, payload
+
+
+def _child_bootstrap_request_from_source_handoff(
+    *,
+    state_root: Path,
+    source_record: dict[str, Any],
+    child_record: dict[str, Any],
+) -> dict[str, Any]:
+    _handoff_ref, handoff = _load_source_handoff(source_record)
+    node_id = str(child_record.get("node_id") or "").strip()
+    goal_slice = str(child_record.get("goal_slice") or "").strip()
+    workspace_root = str(child_record.get("workspace_root") or "").strip()
+    result_sink_ref = str(child_record.get("result_sink_ref") or "").strip()
+    round_id = str(child_record.get("round_id") or "").strip()
+    if not (node_id and goal_slice and workspace_root and result_sink_ref and round_id):
+        raise ValueError(
+            f"child bootstrap requires node_id/goal_slice/workspace_root/result_sink_ref/round_id for {node_id or '<missing>'}"
+        )
+    endpoint_artifact_ref = str(handoff.get("endpoint_artifact_ref") or "").strip()
+    root_goal = str(handoff.get("root_goal") or "").strip()
+    if not endpoint_artifact_ref or not root_goal:
+        raise ValueError("source frozen handoff missing endpoint_artifact_ref or root_goal for child bootstrap")
+    return {
+        "mode": "continue_exact",
+        "state_root": str(state_root.resolve()),
+        "workspace_root": workspace_root,
+        "node_id": node_id,
+        "round_id": round_id,
+        "root_goal": root_goal,
+        "child_goal_slice": goal_slice,
+        "endpoint_artifact_ref": endpoint_artifact_ref,
+        "workspace_mirror_relpath": str(handoff.get("workspace_mirror_relpath") or "deliverables/primary_artifact"),
+        "external_publish_target": str(handoff.get("external_publish_target") or ""),
+        "context_refs": list(handoff.get("context_refs") or []),
+        "result_sink_ref": result_sink_ref,
+    }
+
+
+def _mark_split_child_launch_failure(
+    *,
+    state_root: Path,
+    kernel_state: KernelState,
+    node_id: str,
+    summary: str,
+    authority: KernelMutationAuthority,
+) -> None:
+    if node_id not in kernel_state.nodes:
+        return
+    node_record = kernel_state.nodes[node_id]
+    node_record["status"] = "BLOCKED"
+    node_record["runtime_state"] = normalize_runtime_state(
+        {
+            "attachment_state": RuntimeAttachmentState.LOST.value,
+            "observed_at": "",
+            "summary": summary,
+            "observation_kind": "parallel_split_launch_error",
+            "evidence_refs": [],
+        }
+    )
+    kernel_state.blocked_reasons[node_id] = summary
+    persist_node_snapshot(state_root, node_record, authority=authority)
+
+
+def _bootstrap_and_launch_parallel_children(
+    *,
+    state_root: Path,
+    kernel_state: KernelState,
+    source_record: dict[str, Any],
+    target_nodes: list[dict[str, Any]],
+    authority: KernelMutationAuthority,
+) -> None:
+    for target in target_nodes:
+        node_id = str(target.get("node_id") or "").strip()
+        if not node_id:
+            continue
+        child_record = dict(kernel_state.nodes.get(node_id) or {})
+        try:
+            bootstrap_payload = bootstrap_first_implementer_node(
+                authority=authority,
+                **_child_bootstrap_request_from_source_handoff(
+                    state_root=state_root,
+                    source_record=source_record,
+                    child_record=child_record,
+                ),
+            )
+            launch_child_from_result_ref(result_ref=str(bootstrap_payload.get("bootstrap_result_ref") or ""))
+        except Exception as exc:  # noqa: BLE001
+            _mark_split_child_launch_failure(
+                state_root=state_root,
+                kernel_state=kernel_state,
+                node_id=node_id,
+                summary=f"parallel split child bootstrap/launch failed: {exc}",
+                authority=authority,
+            )
+
+
+def _bootstrap_and_launch_activated_child(
+    *,
+    state_root: Path,
+    kernel_state: KernelState,
+    child_record: dict[str, Any],
+    authority: KernelMutationAuthority,
+) -> None:
+    parent_node_id = str(child_record.get("parent_node_id") or "").strip()
+    if not parent_node_id:
+        raise ValueError(f"activated child {child_record.get('node_id')!r} missing parent_node_id")
+    source_record = dict(kernel_state.nodes.get(parent_node_id) or {})
+    if not source_record:
+        raise ValueError(f"activated child {child_record.get('node_id')!r} missing parent source record {parent_node_id!r}")
+    bootstrap_payload = bootstrap_first_implementer_node(
+        authority=authority,
+        **_child_bootstrap_request_from_source_handoff(
+            state_root=state_root,
+            source_record=source_record,
+            child_record=child_record,
+        ),
+    )
+    launch_child_from_result_ref(result_ref=str(bootstrap_payload.get("bootstrap_result_ref") or ""))
 
 
 def review_topology_mutation(kernel_state: KernelState, mutation: TopologyMutation) -> dict[str, Any]:
@@ -85,6 +218,21 @@ def apply_accepted_topology_mutation(
         source_record = kernel_state.nodes[source_node_id]
         source_record["status"] = "ACTIVE"
         persist_node_snapshot(state_root, source_record, authority=authority)
+        try:
+            _bootstrap_and_launch_activated_child(
+                state_root=state_root,
+                kernel_state=kernel_state,
+                child_record=source_record,
+                authority=authority,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _mark_split_child_launch_failure(
+                state_root=state_root,
+                kernel_state=kernel_state,
+                node_id=source_node_id,
+                summary=f"deferred activation child bootstrap/launch failed: {exc}",
+                authority=authority,
+            )
         return
     if mutation.kind == "merge":
         source_node_id = mutation.source_node_id
@@ -152,5 +300,13 @@ def apply_accepted_topology_mutation(
                 target.get("lineage_ref") or f"{source_record.get('lineage_ref') or source_node_id}->{node_id}"
             ),
             status=NodeStatus.PLANNED if normalized_split_mode == "deferred" else NodeStatus.ACTIVE,
+            authority=authority,
+        )
+    if normalized_split_mode == "parallel" and target_nodes:
+        _bootstrap_and_launch_parallel_children(
+            state_root=state_root,
+            kernel_state=kernel_state,
+            source_record=source_record,
+            target_nodes=target_nodes,
             authority=authority,
         )
