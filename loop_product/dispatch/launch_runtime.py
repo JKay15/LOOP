@@ -820,9 +820,17 @@ def child_runtime_status_from_launch_result_ref(
 ) -> dict[str, Any]:
     """Summarize current child-runtime status from a committed ChildLaunchResult."""
 
+    result_path = Path(result_ref).expanduser().resolve()
+    try:
+        from loop_product.runtime.lifecycle import synchronize_authoritative_state_from_launch_result_ref
+
+        synchronize_authoritative_state_from_launch_result_ref(result_ref=result_path)
+    except Exception:
+        pass
+
     if should_request_host_child_runtime_status():
         payload = request_host_child_runtime_status(
-            launch_result_ref=str(Path(result_ref).expanduser().resolve()),
+            launch_result_ref=str(result_path),
             stall_threshold_s=float(stall_threshold_s),
         )
         hygiene_state = _live_workspace_artifact_hygiene_sync(
@@ -834,18 +842,18 @@ def child_runtime_status_from_launch_result_ref(
             if launch_payload:
                 _reap_runtime_owned_launch(launch_payload)
             return _direct_child_runtime_status_from_launch_result_ref(
-                result_ref=result_ref,
+                result_ref=result_path,
                 stall_threshold_s=stall_threshold_s,
             )
         pid = int(payload.get("pid") or 0)
         if bool(payload.get("pid_alive")) and pid > 0 and not _pid_alive(pid):
             return _direct_child_runtime_status_from_launch_result_ref(
-                result_ref=result_ref,
+                result_ref=result_path,
                 stall_threshold_s=stall_threshold_s,
             )
         return payload
 
     return _direct_child_runtime_status_from_launch_result_ref(
-        result_ref=result_ref,
+        result_ref=result_path,
         stall_threshold_s=stall_threshold_s,
     )

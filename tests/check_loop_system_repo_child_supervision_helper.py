@@ -244,6 +244,102 @@ def main() -> int:
         if str(result.get("latest_launch_result_ref") or "") != str(launch_result_ref_2.resolve()):
             return _fail("child supervision helper must update the settled launch_result_ref after relaunch")
 
+        workspace_root = ROOT / "workspace" / "test-child-supervision-authoritative-blocked"
+        state_root = ROOT / ".loop" / "test-child-supervision-authoritative-blocked"
+        shutil.rmtree(workspace_root, ignore_errors=True)
+        shutil.rmtree(state_root, ignore_errors=True)
+        bootstrap = bootstrap_first_implementer_node(
+            mode="fresh",
+            task_slug="test-child-supervision-authoritative-blocked",
+            root_goal="bootstrap one implementer node for authoritative blocked supervision validation",
+            child_goal_slice="surface an authoritative blocked branch result without same-node recovery churn",
+            endpoint_artifact_ref=str(endpoint.resolve()),
+            workspace_root=str(workspace_root),
+            state_root=str(state_root),
+            workspace_mirror_relpath="deliverables/out.txt",
+            external_publish_target=str((temp_root / "Desktop" / "out-blocked.txt").resolve()),
+            context_refs=[],
+        )
+
+        node_id = str(bootstrap["node_id"])
+        implementer_result_ref = state_root / "artifacts" / node_id / "implementer_result.json"
+        implementer_result_ref.parent.mkdir(parents=True, exist_ok=True)
+        implementer_result_ref.write_text(
+            json.dumps(
+                {
+                    "schema": "loop_product.implementer_result",
+                    "schema_version": "0.1.0",
+                    "node_id": node_id,
+                    "status": "BLOCKED",
+                    "outcome": "BLOCKED",
+                    "summary": "authoritative blocked branch result",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        launch_result_ref_blocked = state_root / "artifacts" / "launches" / node_id / "attempt_001" / "ChildLaunchResult.json"
+        launch_result_ref_blocked.parent.mkdir(parents=True, exist_ok=True)
+        launch_result_ref_blocked.write_text(
+            json.dumps(
+                {
+                    "launch_result_ref": str(launch_result_ref_blocked.resolve()),
+                    "node_id": node_id,
+                    "state_root": str(state_root.resolve()),
+                    "workspace_root": str(workspace_root.resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        blocked_recovery_calls: list[dict[str, object]] = []
+        blocked_launch_calls: list[str] = []
+
+        def _blocked_status_reader(*, result_ref: str | Path, stall_threshold_s: float = 60.0) -> dict[str, object]:
+            return {
+                "launch_result_ref": str(Path(result_ref).resolve()),
+                "status_result_ref": str((temp_root / "blocked-status.json").resolve()),
+                "node_id": node_id,
+                "state_root": str(state_root.resolve()),
+                "workspace_root": str(workspace_root.resolve()),
+                "pid_alive": False,
+                "recovery_eligible": False,
+                "stall_threshold_s": stall_threshold_s,
+                "recovery_reason": "node_status_blocked",
+                "lifecycle_status": "BLOCKED",
+                "runtime_attachment_state": "TERMINAL",
+            }
+
+        def _blocked_recovery_runner(**payload):
+            blocked_recovery_calls.append(dict(payload))
+            raise AssertionError("authoritative blocked child result must not invoke same-node recovery")
+
+        def _blocked_launcher(*, result_ref: str | Path, startup_probe_ms: int = 1500, startup_health_timeout_ms: int = 12000):
+            del startup_probe_ms, startup_health_timeout_ms
+            blocked_launch_calls.append(str(result_ref))
+            raise AssertionError("authoritative blocked child result must not relaunch")
+
+        blocked_result = supervise_child_until_settled(
+            launch_result_ref=launch_result_ref_blocked,
+            poll_interval_s=0.0,
+            stall_threshold_s=0.0,
+            max_recoveries=1,
+            max_wall_clock_s=0.0,
+            runtime_status_reader=_blocked_status_reader,
+            recovery_runner=_blocked_recovery_runner,
+            launcher=_blocked_launcher,
+            sleep_fn=lambda _: None,
+        )
+        Draft202012Validator(supervision_schema).validate(blocked_result)
+        if str(blocked_result.get("settled_reason") or "") != "authoritative_result":
+            return _fail("child supervision helper must settle authoritative blocked results without recovery churn")
+        if blocked_recovery_calls or blocked_launch_calls:
+            return _fail("authoritative blocked result must not trigger recovery or relaunch")
+
         workspace_root = ROOT / "workspace" / "test-child-supervision-provider-capacity"
         state_root = ROOT / ".loop" / "test-child-supervision-provider-capacity"
         shutil.rmtree(workspace_root, ignore_errors=True)

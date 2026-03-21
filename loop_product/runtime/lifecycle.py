@@ -39,6 +39,23 @@ from loop_product.protocols.node import NodeStatus
 from loop_product.runtime_paths import require_runtime_root
 
 
+def synchronize_authoritative_state_from_launch_result_ref(*, result_ref: str | Path) -> Path | None:
+    """Best-effort authoritative sync for a committed child launch result."""
+
+    result_path = Path(result_ref).expanduser().resolve()
+    try:
+        launch_payload = json.loads(result_path.read_text(encoding="utf-8"))
+        state_root = require_runtime_root(Path(str(launch_payload["state_root"])).expanduser().resolve())
+        synchronize_authoritative_node_results(
+            state_root,
+            continue_deferred=True,
+            authority=kernel_internal_authority(),
+        )
+        return state_root
+    except Exception:
+        return None
+
+
 def node_status_for_outcome(outcome: NodeTerminalOutcome) -> str:
     if outcome is NodeTerminalOutcome.PASS:
         return "COMPLETED"
@@ -118,16 +135,7 @@ def child_runtime_status_from_launch_result_ref(
     """Public trusted surface for committed child-runtime status queries."""
 
     result_path = Path(result_ref).expanduser().resolve()
-    try:
-        launch_payload = json.loads(result_path.read_text(encoding="utf-8"))
-        state_root = require_runtime_root(Path(str(launch_payload["state_root"])).expanduser().resolve())
-        synchronize_authoritative_node_results(
-            state_root,
-            continue_deferred=True,
-            authority=kernel_internal_authority(),
-        )
-    except Exception:
-        pass
+    synchronize_authoritative_state_from_launch_result_ref(result_ref=result_path)
 
     return dispatch_child_runtime_status_from_launch_result_ref(
         result_ref=result_path,
@@ -172,7 +180,7 @@ def supervise_child_until_settled(
         max_recoveries=max_recoveries,
         max_wall_clock_s=max_wall_clock_s,
         no_substantive_progress_window_s=no_substantive_progress_window_s,
-        runtime_status_reader=dispatch_child_runtime_status_from_launch_result_ref,
+        runtime_status_reader=child_runtime_status_from_launch_result_ref,
         recovery_runner=dispatch_recover_orphaned_active_node,
         launcher=dispatch_launch_child_from_result_ref,
     )

@@ -122,6 +122,33 @@ def _mark_split_child_launch_failure(
     persist_node_snapshot(state_root, node_record, authority=authority)
 
 
+def _activation_condition_blocks_immediate_parallel_launch(activation_condition: str) -> bool:
+    text = str(activation_condition or "").strip()
+    if not text:
+        return False
+    normalized = text.lower()
+    immediate_prefixes = (
+        "may start immediately",
+        "start immediately",
+        "may launch immediately",
+        "launch immediately",
+        "can start immediately",
+        "can launch immediately",
+    )
+    if normalized.startswith(immediate_prefixes):
+        return False
+    if normalized.startswith("after:"):
+        return True
+    blocking_markers = (
+        "only after",
+        "until ",
+        "wait until",
+        "wait for",
+        "blocked until",
+    )
+    return any(marker in normalized for marker in blocking_markers)
+
+
 def _bootstrap_and_launch_parallel_children(
     *,
     state_root: Path,
@@ -313,7 +340,7 @@ def apply_accepted_topology_mutation(
         launch_immediately = (
             normalized_split_mode == "parallel"
             and not list(target.get("depends_on_node_ids") or [])
-            and not str(target.get("activation_condition") or "").strip()
+            and not _activation_condition_blocks_immediate_parallel_launch(str(target.get("activation_condition") or ""))
         )
         materialize_child(
             state_root=state_root,

@@ -450,11 +450,36 @@ def supervise_child_until_settled(
             return result
 
         retryable_terminal_stopped = classification == "RETRYABLE_TERMINAL" and not bool(status.get("pid_alive"))
+        authoritative_terminal_stopped = (
+            classification == "MISSING"
+            and result_ref.exists()
+            and not bool(status.get("pid_alive"))
+            and str(status.get("lifecycle_status") or "") in {"BLOCKED", "COMPLETED", "FAILED"}
+            and str(status.get("runtime_attachment_state") or "") == "TERMINAL"
+        )
         incomplete_terminal_stopped = (
             classification == "MISSING"
             and result_ref.exists()
             and not bool(status.get("pid_alive"))
         )
+        if authoritative_terminal_stopped:
+            result = {
+                "launch_result_ref": str(_absolute(launch_result_ref)),
+                "latest_launch_result_ref": str(current_launch_result_ref),
+                "node_id": node_id,
+                "state_root": str(state_root),
+                "workspace_root": str(status.get("workspace_root") or ""),
+                "settled": True,
+                "settled_reason": "authoritative_result",
+                "recoveries_used": recoveries_used,
+                "implementer_result_ref": str(result_ref),
+                "implementer_outcome": str((result_payload or {}).get("outcome") or ""),
+                "evaluator_verdict": str(((result_payload or {}).get("evaluator_result") or {}).get("verdict") or ""),
+                "status_result_ref": str(status.get("status_result_ref") or ""),
+                "history": history,
+            }
+            validate_repo_object("LoopChildSupervisionResult.schema.json", result)
+            return result
         runtime_loss_without_result = classification == "MISSING" and (
             bool(status.get("recovery_eligible")) or incomplete_terminal_stopped
         )

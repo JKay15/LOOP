@@ -412,10 +412,12 @@ def _parallel_split_with_dependency_bound_child_case() -> int:
                 {
                     "node_id": "child-extraction-001",
                     "goal_slice": "close the whole-paper extraction/dependency ledger",
+                    "activation_condition": "May start immediately from the shared extraction ledger and dependency graph.",
                 },
                 {
                     "node_id": "child-linear-001",
                     "goal_slice": "formalize the linear chain independently",
+                    "activation_condition": "May start immediately from the shared extraction ledger and dependency graph.",
                 },
                 {
                     "node_id": "child-final-001",
@@ -589,6 +591,7 @@ def _split_required_outputs_persist_case() -> int:
 
 def _authoritative_child_result_sync_case() -> int:
     from loop_product.dispatch.child_dispatch import materialize_child
+    from loop_product.dispatch import launch_runtime
     from loop_product.dispatch.publication import publish_workspace_artifact_snapshot
     from loop_product.kernel.authority import kernel_internal_authority
     from loop_product.kernel.query import query_authority_view
@@ -642,6 +645,86 @@ def _authoritative_child_result_sync_case() -> int:
             + "\n",
             encoding="utf-8",
         )
+        live_root = node_live_artifact_root(
+            state_root=state_root,
+            node_id="child-blocked-001",
+            workspace_mirror_relpath="deliverables/primary_artifact",
+        )
+        live_root.mkdir(parents=True, exist_ok=True)
+        (live_root / "README.md").write_text("# blocked child\n", encoding="utf-8")
+        publish_workspace_artifact_snapshot(
+            node_id="child-blocked-001",
+            live_artifact_ref=live_root,
+            publish_artifact_ref=child_workspace_root / "deliverables" / "primary_artifact",
+            publication_receipt_ref=state_root
+            / "artifacts"
+            / "publication"
+            / "child-blocked-001"
+            / "WorkspaceArtifactPublicationReceipt.json",
+        )
+        launch_result_ref = state_root / "artifacts" / "launches" / "child-blocked-001" / "attempt_001" / "ChildLaunchResult.json"
+        launch_log_dir = launch_result_ref.parent / "logs"
+        launch_log_dir.mkdir(parents=True, exist_ok=True)
+        stdout_ref = launch_log_dir / "child-blocked-001.stdout.txt"
+        stderr_ref = launch_log_dir / "child-blocked-001.stderr.txt"
+        stdin_ref = child_workspace_root / "CHILD_PROMPT.md"
+        stdout_ref.write_text("", encoding="utf-8")
+        stderr_ref.write_text("", encoding="utf-8")
+        stdin_ref.write_text("blocked child prompt\n", encoding="utf-8")
+        launch_request_ref = launch_result_ref.parent / "ChildLaunchRequest.json"
+        launch_request_ref.write_text(
+            json.dumps({"node_id": "child-blocked-001"}, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        launch_result_ref.write_text(
+            json.dumps(
+                {
+                    "launch_decision": "started",
+                    "source_result_ref": str(result_ref.resolve()),
+                    "node_id": "child-blocked-001",
+                    "workspace_root": str(child_workspace_root.resolve()),
+                    "state_root": str(state_root.resolve()),
+                    "startup_health_timeout_ms": 250,
+                    "startup_retry_limit": 0,
+                    "attempt_count": 1,
+                    "retryable_failure_kind": "",
+                    "attempts": [
+                        {
+                            "attempt_index": 1,
+                            "launch_decision": "started",
+                            "launch_request_ref": str(launch_request_ref.resolve()),
+                            "launch_log_dir": str(launch_log_dir.resolve()),
+                            "stdout_ref": str(stdout_ref.resolve()),
+                            "stderr_ref": str(stderr_ref.resolve()),
+                            "stdin_ref": str(stdin_ref.resolve()),
+                            "wrapped_argv": ["sleep", "1"],
+                            "pid": 999999,
+                            "exit_code": 0,
+                            "retryable_failure_kind": "",
+                        }
+                    ],
+                    "launch_request_ref": str(launch_request_ref.resolve()),
+                    "launch_result_ref": str(launch_result_ref.resolve()),
+                    "launch_log_dir": str(launch_log_dir.resolve()),
+                    "stdout_ref": str(stdout_ref.resolve()),
+                    "stderr_ref": str(stderr_ref.resolve()),
+                    "stdin_ref": str(stdin_ref.resolve()),
+                    "wrapped_argv": ["sleep", "1"],
+                    "pid": 999999,
+                    "exit_code": 0,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        status_payload = launch_runtime.child_runtime_status_from_launch_result_ref(
+            result_ref=str(launch_result_ref.resolve()),
+            stall_threshold_s=0,
+        )
+        if str(status_payload.get("lifecycle_status") or "") != NodeStatus.BLOCKED.value:
+            return _fail("runtime status helper must absorb authoritative child blocked result before reporting lifecycle")
 
         authority_view = query_authority_view(state_root)
         node_graph = {item["node_id"]: item for item in authority_view["node_graph"]}
