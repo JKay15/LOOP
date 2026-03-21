@@ -328,6 +328,107 @@ def _rejected_split_case() -> int:
     return 0
 
 
+def _parallel_split_with_dependency_bound_child_case() -> int:
+    import loop_product.kernel.topology as topology_module
+
+    from loop_product.kernel.query import query_authority_view
+    from loop_product.kernel.submit import submit_topology_mutation
+    from loop_product.protocols.control_envelope import EnvelopeStatus
+    from loop_product.protocols.node import NodeStatus
+    from loop_product.topology.split_review import build_split_request
+
+    with tempfile.TemporaryDirectory(prefix="loop_system_parallel_split_dependency_gate_") as td:
+        state_root = Path(td) / ".loop"
+        _persist_base_state(state_root)
+        source_node = _base_source_node()
+        bootstrap_calls: list[dict[str, object]] = []
+        launch_calls: list[dict[str, object]] = []
+        original_bootstrap = getattr(topology_module, "bootstrap_first_implementer_node", None)
+        original_launch = getattr(topology_module, "launch_child_from_result_ref", None)
+
+        def _fake_bootstrap(**kwargs):
+            bootstrap_calls.append(dict(kwargs))
+            bootstrap_ref = state_root / "artifacts" / "bootstrap" / f"{kwargs['node_id']}__bootstrap.json"
+            bootstrap_ref.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "bootstrap_result_ref": str(bootstrap_ref.resolve()),
+                "node_id": kwargs["node_id"],
+                "state_root": str(state_root.resolve()),
+                "workspace_root": str(kwargs["workspace_root"]),
+            }
+            bootstrap_ref.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            return payload
+
+        def _fake_launch_child_from_result_ref(**kwargs):
+            launch_calls.append(dict(kwargs))
+            return {"launch_decision": "test-only", "source_result_ref": str(kwargs.get("result_ref") or "")}
+
+        topology_module.bootstrap_first_implementer_node = _fake_bootstrap
+        topology_module.launch_child_from_result_ref = _fake_launch_child_from_result_ref
+        mutation = build_split_request(
+            source_node=source_node,
+            target_nodes=[
+                {
+                    "node_id": "child-extraction-001",
+                    "goal_slice": "close the whole-paper extraction/dependency ledger",
+                },
+                {
+                    "node_id": "child-linear-001",
+                    "goal_slice": "formalize the linear chain independently",
+                },
+                {
+                    "node_id": "child-final-001",
+                    "goal_slice": "integrate only after extraction and linear children finish",
+                    "depends_on_node_ids": ["child-extraction-001", "child-linear-001"],
+                },
+            ],
+            split_mode="parallel",
+            reason="parallelize independent fronts but keep dependency-bound final integration gated",
+        )
+        envelope = submit_topology_mutation(
+            state_root,
+            mutation,
+            round_id=source_node.round_id,
+            generation=source_node.generation,
+        )
+        try:
+            if envelope.status is not EnvelopeStatus.ACCEPTED:
+                return _fail(f"dependency-gated parallel split must still be accepted, got {envelope.status.value!r}")
+
+            authority = query_authority_view(state_root)
+            node_graph = {item["node_id"]: item for item in authority["node_graph"]}
+            if node_graph.get("child-extraction-001", {}).get("status") != NodeStatus.ACTIVE.value:
+                return _fail("dependency-free parallel split child must become ACTIVE immediately")
+            if node_graph.get("child-linear-001", {}).get("status") != NodeStatus.ACTIVE.value:
+                return _fail("second dependency-free parallel split child must become ACTIVE immediately")
+            if node_graph.get("child-final-001", {}).get("status") != NodeStatus.PLANNED.value:
+                return _fail("dependency-bound child in a parallel split must remain PLANNED until dependencies are ready")
+            if "child-final-001" not in authority["planned_child_nodes"]:
+                return _fail("dependency-bound parallel child must appear in planned_child_nodes")
+            if "child-final-001" in authority["active_child_nodes"]:
+                return _fail("dependency-bound parallel child must not appear in active_child_nodes before activation")
+
+            final_state = json.loads((state_root / "state" / "child-final-001.json").read_text(encoding="utf-8"))
+            if final_state.get("depends_on_node_ids") != ["child-extraction-001", "child-linear-001"]:
+                return _fail("dependency-bound parallel child must preserve depends_on_node_ids in node state")
+            if len(bootstrap_calls) != 2 or len(launch_calls) != 2:
+                return _fail("only dependency-free parallel split children should bootstrap and launch immediately")
+            bootstrapped_ids = {str(item.get("node_id") or "") for item in bootstrap_calls}
+            if bootstrapped_ids != {"child-extraction-001", "child-linear-001"}:
+                return _fail("dependency-bound parallel child must not be bootstrapped before activation")
+        finally:
+            if original_bootstrap is not None:
+                topology_module.bootstrap_first_implementer_node = original_bootstrap
+            else:
+                delattr(topology_module, "bootstrap_first_implementer_node")
+            if original_launch is not None:
+                topology_module.launch_child_from_result_ref = original_launch
+            else:
+                delattr(topology_module, "launch_child_from_result_ref")
+
+    return 0
+
+
 def _authoritative_child_result_sync_case() -> int:
     from loop_product.dispatch.child_dispatch import materialize_child
     from loop_product.kernel.authority import kernel_internal_authority
@@ -401,6 +502,9 @@ def _authoritative_child_result_sync_case() -> int:
 def main() -> int:
     try:
         rc = _accepted_split_case()
+        if rc:
+            return rc
+        rc = _parallel_split_with_dependency_bound_child_case()
         if rc:
             return rc
         rc = _authoritative_child_result_sync_case()

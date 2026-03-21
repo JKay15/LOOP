@@ -13,14 +13,14 @@ from loop_product.protocols.control_envelope import ControlEnvelope, EnvelopeSta
 from loop_product.protocols.topology import TopologyMutation
 
 
-def _enforce_topology_kernel_review(kernel_state, envelope: ControlEnvelope) -> ControlEnvelope:
+def _enforce_topology_kernel_review(state_root: Path, kernel_state, envelope: ControlEnvelope) -> ControlEnvelope:
     payload = dict(envelope.payload or {})
     mutation_payload = payload.get("topology_mutation") or payload
     try:
         mutation = TopologyMutation.from_dict(dict(mutation_payload or {}))
     except Exception as exc:  # noqa: BLE001
         return envelope.rejected(f"invalid topology mutation payload: {exc}")
-    review = review_topology_mutation(kernel_state, mutation)
+    review = review_topology_mutation(kernel_state, mutation, state_root=state_root)
     summary = str(review.get("summary") or mutation.reason or envelope.note or "kernel reviewed topology mutation")
     reviewed = replace(
         envelope,
@@ -43,7 +43,7 @@ def submit_control_envelope(state_root: Path, envelope: ControlEnvelope) -> Cont
     kernel_state = None
     if normalized.status.value != "rejected" and normalized.classification == "topology":
         kernel_state = load_kernel_state(state_root)
-        normalized = _enforce_topology_kernel_review(kernel_state, normalized)
+        normalized = _enforce_topology_kernel_review(state_root, kernel_state, normalized)
     accepted = accept_control_envelope(state_root, normalized)
     if accepted.status.value != "accepted":
         return accepted
@@ -72,7 +72,7 @@ def submit_topology_mutation(
     """Review a topology mutation under kernel authority, then accept or reject it."""
 
     kernel_state = load_kernel_state(state_root)
-    review = review_topology_mutation(kernel_state, mutation)
+    review = review_topology_mutation(kernel_state, mutation, state_root=state_root)
     envelope = mutation.to_envelope(
         round_id=round_id,
         generation=generation,

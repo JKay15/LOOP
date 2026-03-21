@@ -25,8 +25,9 @@ def _fail(msg: str) -> int:
 
 def main() -> int:
     from loop_product.dispatch import launch_runtime as launch_runtime_module
+    from loop_product.kernel.query import query_authority_view
     from loop_product.kernel.authority import kernel_internal_authority
-    from loop_product.kernel.state import KernelState, ensure_runtime_tree, persist_kernel_state
+    from loop_product.kernel.state import KernelState, ensure_runtime_tree, load_kernel_state, persist_kernel_state
     from loop_product.protocols.node import NodeSpec, NodeStatus
 
     with tempfile.TemporaryDirectory(prefix="loop_product_process_hygiene_") as td:
@@ -218,6 +219,48 @@ def main() -> int:
             return _fail("runtime status must explain terminal closeout with authoritative_terminal_result")
         if str(status_payload.get("lifecycle_status") or "") != "COMPLETED":
             return _fail("runtime status must surface terminal lifecycle_status once authoritative terminal result exists")
+
+        active_hygiene_workspace_root = workspace_root / "child-hygiene-live-001"
+        active_hygiene_artifact_root = active_hygiene_workspace_root / "deliverables" / "primary_artifact"
+        (active_hygiene_artifact_root / ".lake" / "packages" / "mathlib").mkdir(parents=True, exist_ok=True)
+        (active_hygiene_artifact_root / ".lake" / "packages" / "mathlib" / "dummy.txt").write_text("cached\n", encoding="utf-8")
+        (active_hygiene_artifact_root / ".git").mkdir(parents=True, exist_ok=True)
+        (active_hygiene_artifact_root / ".git" / "config").write_text("[core]\n\trepositoryformatversion = 0\n", encoding="utf-8")
+        (active_hygiene_artifact_root / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+        (active_hygiene_artifact_root / ".venv" / "bin" / "python").write_text("# stub\n", encoding="utf-8")
+        (active_hygiene_artifact_root / ".uv-cache").mkdir(parents=True, exist_ok=True)
+        (active_hygiene_artifact_root / ".uv-cache" / "cache.txt").write_text("cache\n", encoding="utf-8")
+        (active_hygiene_artifact_root / "build" / "lib").mkdir(parents=True, exist_ok=True)
+        (active_hygiene_artifact_root / "build" / "lib" / "artifact.txt").write_text("build\n", encoding="utf-8")
+        (active_hygiene_artifact_root / "_lake_build" / "lib").mkdir(parents=True, exist_ok=True)
+        (active_hygiene_artifact_root / "_lake_build" / "lib" / "artifact.txt").write_text("lake-build\n", encoding="utf-8")
+        active_hygiene_kernel_state = load_kernel_state(state_root)
+        active_hygiene_node = NodeSpec(
+            node_id="child-hygiene-live-001",
+            node_kind="implementer",
+            goal_slice="keep runtime heavy trees out of live deliverables",
+            parent_node_id="root-kernel",
+            generation=1,
+            round_id="R1.live",
+            execution_policy={"sandbox_mode": "workspace-write"},
+            reasoning_profile={"thinking_budget": "high", "role": "implementer"},
+            budget_profile={"max_rounds": 2},
+            allowed_actions=["implement", "report"],
+            workspace_root=str(active_hygiene_workspace_root.resolve()),
+            delegation_ref="state/delegations/child-hygiene-live-001.json",
+            result_sink_ref="artifacts/child-hygiene-live-001/result.json",
+            lineage_ref="root-kernel->child-hygiene-live-001",
+            status=NodeStatus.ACTIVE,
+        )
+        active_hygiene_kernel_state.register_node(active_hygiene_node)
+        persist_kernel_state(state_root, active_hygiene_kernel_state, authority=kernel_internal_authority())
+        _ = query_authority_view(state_root)
+        for heavyweight_relpath in (".lake", ".git", ".venv", ".uv-cache", "build", "_lake_build"):
+            if (active_hygiene_artifact_root / heavyweight_relpath).exists():
+                return _fail(
+                    "authority sync must scrub runtime-owned heavy trees from live child deliverables, "
+                    f"but left {heavyweight_relpath} behind"
+                )
 
     print("[loop-system-process-hygiene] OK")
     return 0

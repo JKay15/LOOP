@@ -63,6 +63,7 @@ Every LOOP execution unit is a `node`, and child materialization must pass throu
 - child-visible split submission must have a repo-shipped split helper path; text-only split recommendations in `PARTITION_PLAN.md`, `TRACEABILITY.md`, or similar prose are not submitted topology proposals
 - fresh implementer child nodes must materialize `split_request` in `allowed_actions` by default so the documented autosplit-capable path is actually invokable from the persisted node/delegation surface
 - accepted split children must match the reviewed `target_node_ids` exactly and must inherit the kernel-owned `parent generation + 1` step rather than proposer-supplied generation drift
+- accepted `parallel` split children may start immediately only when they are dependency-free; any accepted split target that already declares `depends_on_node_ids` or an `activation_condition` must persist as `PLANNED` until a later activate step, even if the parent split itself was accepted in `parallel` mode
 - accepted deferred split children must persist `depends_on_node_ids` and `activation_condition` in both node state and frozen delegation, and must land as `PLANNED` rather than `ACTIVE`
 - child-visible prompt/rule surfaces must expose both a repo-shipped split helper and a repo-shipped activate helper so implementers do not have to invent topology-envelope details locally
 - the frozen handoff consumed by repo-shipped topology helpers must preserve the exact `state_root` and authoritative kernel sink refs so split/activate submission can reconstruct kernel context without ad hoc path guessing
@@ -74,6 +75,7 @@ Every LOOP execution unit is a `node`, and child materialization must pass throu
 - same-node dependency-unblocked continuation must archive the superseded blocked `result.json` out of the live authoritative sink before relaunch so repeated authority queries do not keep replaying stale dependency snapshots
 - if a blocked parallel source node or a completed deferred source node proposes a merge, that proposal must remain a proposal until kernel accepts it; accepted merge reactivates the source node only after its declared child branches are already completed
 - accepted deferred merge must preserve completed child evidence while resetting the reactivated source node's runtime state truthfully for the next active segment
+- committed authority sync must also scrub runtime-owned heavy trees from live workspace deliverables and staging artifacts such as `deliverables/primary_artifact` or `.tmp_primary_artifact`; evaluator-side canonicalization alone is not sufficient once child nodes are already running in parallel
 - terminal non-root nodes may be reaped only after kernel accepts a reap request and archives the retired node outside the live authoritative graph
 - if a node proposes `resume`, `retry`, or `relaunch`, that recovery proposal must remain a proposal until kernel accepts it
 - implementer child nodes must carry recovery permissions needed for kernel-owned `resume`, `retry`, and `relaunch` instead of shipping as non-recoverable minimal workers

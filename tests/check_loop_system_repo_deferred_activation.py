@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -438,6 +439,162 @@ def _default_budget_parallel_split_case() -> int:
     return 0
 
 
+def _dependency_ready_parallel_planned_activation_case() -> int:
+    import loop_product.kernel.topology as topology_module
+
+    from loop_product.dispatch.child_dispatch import materialize_child
+    from loop_product.kernel.authority import kernel_internal_authority
+    from loop_product.kernel.query import query_authority_view
+    from loop_product.kernel.state import load_kernel_state, persist_kernel_state
+    from loop_product.protocols.node import NodeStatus
+
+    with tempfile.TemporaryDirectory(prefix="loop_system_parallel_planned_activation_") as td:
+        state_root = Path(td) / ".loop"
+        _persist_base_state(state_root)
+        authority = kernel_internal_authority()
+        kernel_state = load_kernel_state(state_root)
+        cleanup_roots = [
+            ROOT / "workspace" / "test-parallel-planned-child-linear-001",
+            ROOT / "workspace" / "test-parallel-planned-child-external-001",
+            ROOT / "workspace" / "test-parallel-planned-child-final-001",
+        ]
+
+        dep_specs = [
+            ("child-linear-001", "close the linear chain", "artifacts/child-linear-001/result.json"),
+            ("child-external-001", "close the external dependency chain", "artifacts/child-external-001/result.json"),
+        ]
+        for node_id, goal_slice, result_sink_ref in dep_specs:
+            workspace_root = ROOT / "workspace" / f"test-parallel-planned-{node_id}"
+            node = materialize_child(
+                state_root=state_root,
+                kernel_state=kernel_state,
+                parent_node_id="child-implementer-001",
+                node_id=node_id,
+                goal_slice=goal_slice,
+                round_id=f"R1.{node_id}",
+                execution_policy={"agent_provider": "codex_cli", "sandbox_mode": "workspace-write"},
+                reasoning_profile={"thinking_budget": "medium", "role": "implementer"},
+                budget_profile={"max_rounds": 1},
+                workspace_root=str(workspace_root.resolve()),
+                result_sink_ref=result_sink_ref,
+                authority=authority,
+            )
+            _write_source_handoff(state_root=state_root, workspace_root=Path(node.workspace_root), source_node=node)
+
+        planned_workspace_root = ROOT / "workspace" / "test-parallel-planned-child-final-001"
+        planned_node = materialize_child(
+            state_root=state_root,
+            kernel_state=kernel_state,
+            parent_node_id="child-implementer-001",
+            node_id="child-final-001",
+            goal_slice="integrate dependency-ready child results into one final whole-paper outcome",
+            round_id="R1.child-final-001",
+            execution_policy={"agent_provider": "codex_cli", "sandbox_mode": "workspace-write"},
+            reasoning_profile={"thinking_budget": "high", "role": "implementer"},
+            budget_profile={"max_rounds": 2},
+            workspace_root=str(planned_workspace_root.resolve()),
+            depends_on_node_ids=["child-linear-001", "child-external-001"],
+            result_sink_ref="artifacts/child-final-001/result.json",
+            status=NodeStatus.PLANNED,
+            authority=authority,
+        )
+        persist_kernel_state(state_root, kernel_state, authority=authority)
+        _write_source_handoff(state_root=state_root, workspace_root=Path(planned_node.workspace_root), source_node=planned_node)
+
+        dep_payloads = {
+            "child-linear-001": {
+                "status": "BLOCKED",
+                "outcome": "PAPER_DEFECT_EXPOSED",
+                "summary": "linear chain closed to a terminal paper defect exposure",
+            },
+            "child-external-001": {
+                "status": "COMPLETED",
+                "outcome": "FULLY_FAITHFUL_COMPLETE",
+                "summary": "external dependency chain completed successfully",
+            },
+        }
+        for node_id, payload in dep_payloads.items():
+            result_ref = state_root / "artifacts" / node_id / "result.json"
+            result_ref.parent.mkdir(parents=True, exist_ok=True)
+            result_ref.write_text(
+                json.dumps({"schema": "loop_product.child_result", "node_id": node_id, **payload}, indent=2, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
+
+        bootstrap_calls: list[dict[str, object]] = []
+        launch_calls: list[dict[str, object]] = []
+        original_bootstrap = getattr(topology_module, "bootstrap_first_implementer_node", None)
+        original_launch = getattr(topology_module, "launch_child_from_result_ref", None)
+
+        def _fake_bootstrap(**kwargs):
+            bootstrap_calls.append(dict(kwargs))
+            bootstrap_ref = state_root / "artifacts" / "bootstrap" / f"{kwargs['node_id']}__bootstrap.json"
+            bootstrap_ref.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "bootstrap_result_ref": str(bootstrap_ref.resolve()),
+                "node_id": str(kwargs["node_id"]),
+                "workspace_root": str(kwargs["workspace_root"]),
+                "state_root": str(kwargs["state_root"]),
+                "launch_spec": {
+                    "argv": ["/bin/echo", "parallel-planned-activate"],
+                    "env": {},
+                    "cwd": str(kwargs["workspace_root"]),
+                    "stdin_path": str((Path(str(kwargs["workspace_root"])) / "CHILD_PROMPT.md").resolve()),
+                },
+            }
+            bootstrap_ref.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            return payload
+
+        def _fake_launch(*, result_ref: str | Path, startup_probe_ms: int = 1500, startup_health_timeout_ms: int = 12000):
+            del startup_probe_ms, startup_health_timeout_ms
+            launch_calls.append({"result_ref": str(Path(result_ref).resolve())})
+            return {"launch_result_ref": str(Path(result_ref).resolve())}
+
+        topology_module.bootstrap_first_implementer_node = _fake_bootstrap
+        topology_module.launch_child_from_result_ref = _fake_launch
+        previous_runtime_status_mode = os.environ.get("LOOP_CHILD_RUNTIME_STATUS_MODE")
+        os.environ["LOOP_CHILD_RUNTIME_STATUS_MODE"] = "direct"
+        try:
+            authority_view = query_authority_view(state_root)
+            node_graph = {item["node_id"]: item for item in authority_view["node_graph"]}
+            if node_graph.get("child-final-001", {}).get("status") != NodeStatus.ACTIVE.value:
+                return _fail("planned child with terminal-ready dependencies must auto-activate once dependencies close")
+            if "child-final-001" not in authority_view["active_child_nodes"]:
+                return _fail("dependency-ready planned child must move into active_child_nodes after auto-activation")
+            if "child-final-001" in authority_view["planned_child_nodes"]:
+                return _fail("dependency-ready planned child must leave planned_child_nodes after auto-activation")
+            if len(bootstrap_calls) != 1 or len(launch_calls) != 1:
+                return _fail("dependency-ready planned child auto-activation must bootstrap and launch exactly once")
+
+            accepted_envelopes = json.loads((state_root / "state" / "accepted_envelopes.json").read_text(encoding="utf-8"))
+            activate_envelopes = [
+                env
+                for env in accepted_envelopes
+                if ((env.get("payload") or {}).get("topology_mutation") or {}).get("kind") == "activate"
+            ]
+            if len(activate_envelopes) != 1:
+                return _fail("dependency-ready planned child must submit exactly one accepted activate proposal")
+        finally:
+            if previous_runtime_status_mode is None:
+                os.environ.pop("LOOP_CHILD_RUNTIME_STATUS_MODE", None)
+            else:
+                os.environ["LOOP_CHILD_RUNTIME_STATUS_MODE"] = previous_runtime_status_mode
+            if original_bootstrap is not None:
+                topology_module.bootstrap_first_implementer_node = original_bootstrap
+            else:
+                delattr(topology_module, "bootstrap_first_implementer_node")
+            if original_launch is not None:
+                topology_module.launch_child_from_result_ref = original_launch
+            else:
+                delattr(topology_module, "launch_child_from_result_ref")
+            for cleanup_root in cleanup_roots:
+                if cleanup_root.exists():
+                    shutil.rmtree(cleanup_root, ignore_errors=True)
+
+    return 0
+
+
 def _rejected_activation_case() -> int:
     from loop_product.kernel.query import query_authority_view
     from loop_product.kernel.submit import submit_topology_mutation
@@ -480,6 +637,9 @@ def main() -> int:
         if rc:
             return rc
         rc = _default_budget_parallel_split_case()
+        if rc:
+            return rc
+        rc = _dependency_ready_parallel_planned_activation_case()
         if rc:
             return rc
         rc = _rejected_activation_case()

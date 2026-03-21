@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from loop_product.kernel.state import ACTIVE_NODE_STATUSES, KernelState
+from pathlib import Path
+
+from loop_product.kernel.state import ACTIVE_NODE_STATUSES, KernelState, authoritative_node_dependency_ready
 from loop_product.protocols.topology import TopologyMutation
+from loop_product.runtime_paths import require_runtime_root
 from loop_product.topology.budget import normalized_complexity_budget
 
 _TERMINAL_STATUSES = {"COMPLETED", "FAILED"}
@@ -22,7 +25,25 @@ def build_activate_request(
     return TopologyMutation.activate(source_node_id, reason=reason, payload=dict(payload or {}))
 
 
-def _condition_satisfied(kernel_state: KernelState, condition: str) -> tuple[bool, str]:
+def _dependency_ready_for_activation(
+    *,
+    kernel_state: KernelState,
+    dependency_node_id: str,
+    state_root: Path | None = None,
+) -> bool:
+    dependency = dict(kernel_state.nodes.get(str(dependency_node_id)) or {})
+    if not dependency:
+        return False
+    if state_root is not None:
+        if authoritative_node_dependency_ready(
+            state_root=require_runtime_root(state_root),
+            node_payload=dependency,
+        ):
+            return True
+    return str(dependency.get("status") or "") in _TERMINAL_STATUSES
+
+
+def _condition_satisfied(kernel_state: KernelState, condition: str, *, state_root: Path | None = None) -> tuple[bool, str]:
     normalized = str(condition or "").strip()
     if not normalized:
         return True, ""
@@ -38,7 +59,11 @@ def _condition_satisfied(kernel_state: KernelState, condition: str) -> tuple[boo
     dependency_status = str(dependency.get("status") or "")
     requirement = str(requirement or "").strip().lower()
     if requirement == "terminal":
-        return dependency_status in _TERMINAL_STATUSES, ""
+        return _dependency_ready_for_activation(
+            kernel_state=kernel_state,
+            dependency_node_id=dependency_node_id,
+            state_root=state_root,
+        ), ""
     if requirement == "completed":
         return dependency_status == "COMPLETED", ""
     if requirement == "failed":
@@ -46,7 +71,12 @@ def _condition_satisfied(kernel_state: KernelState, condition: str) -> tuple[boo
     return False, f"unsupported activation requirement {requirement!r}"
 
 
-def review_activate_request(kernel_state: KernelState, mutation: TopologyMutation) -> dict[str, Any]:
+def review_activate_request(
+    kernel_state: KernelState,
+    mutation: TopologyMutation,
+    *,
+    state_root: Path | None = None,
+) -> dict[str, Any]:
     """Review a deferred-child activation request under current kernel authority."""
 
     source = dict(kernel_state.nodes.get(mutation.source_node_id) or {})
@@ -57,8 +87,15 @@ def review_activate_request(kernel_state: KernelState, mutation: TopologyMutatio
         node_id: str(dict(kernel_state.nodes.get(node_id) or {}).get("status") or "")
         for node_id in depends_on
     }
-    dependencies_terminal = bool(depends_on) and all(status in _TERMINAL_STATUSES for status in dependency_statuses.values())
-    condition_ok, condition_error = _condition_satisfied(kernel_state, activation_condition)
+    dependencies_terminal = bool(depends_on) and all(
+        _dependency_ready_for_activation(
+            kernel_state=kernel_state,
+            dependency_node_id=node_id,
+            state_root=state_root,
+        )
+        for node_id in depends_on
+    )
+    condition_ok, condition_error = _condition_satisfied(kernel_state, activation_condition, state_root=state_root)
     active_now = sum(
         1 for node in kernel_state.nodes.values() if str(node.get("status") or "") in ACTIVE_NODE_STATUSES
     )

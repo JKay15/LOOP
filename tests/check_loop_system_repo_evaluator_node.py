@@ -1207,6 +1207,144 @@ def main() -> int:
         else:
             return _fail("whole-paper evaluator attempts must fail closed before evaluator launch when terminal status evidence is missing")
 
+        whole_paper_dependency_gate_state_root = temp_root / ".loop" / "whole_paper_dependency_gate"
+        whole_paper_dependency_gate_workspace_root = temp_root / "whole_paper_dependency_gate_workspace"
+        whole_paper_dependency_gate_workspace_root.mkdir(parents=True, exist_ok=True)
+        whole_paper_dependency_gate_artifact_root = whole_paper_dependency_gate_workspace_root / "deliverables" / "primary_artifact"
+        whole_paper_dependency_gate_artifact_root.mkdir(parents=True, exist_ok=True)
+        ensure_runtime_tree(whole_paper_dependency_gate_state_root)
+        whole_paper_dependency_gate_root_node = NodeSpec(
+            node_id="whole-paper-dependency-gate-root",
+            node_kind="kernel",
+            goal_slice="exercise whole-paper dependency gate",
+            parent_node_id=None,
+            generation=0,
+            round_id="R0",
+            execution_policy={"mode": "kernel"},
+            reasoning_profile={"role": "kernel", "thinking_budget": "medium"},
+            budget_profile={"max_rounds": 1},
+            allowed_actions=["dispatch", "submit", "audit"],
+            delegation_ref="",
+            result_sink_ref="artifacts/whole_paper_dependency_gate/root_summary.json",
+            lineage_ref="whole-paper-dependency-gate-root",
+            status=NodeStatus.ACTIVE,
+        )
+        linear_dep_node = NodeSpec(
+            node_id="whole-paper-linear-dep",
+            node_kind="implementer",
+            goal_slice="close the linear chain dependency",
+            parent_node_id=whole_paper_dependency_gate_root_node.node_id,
+            generation=1,
+            round_id="R1.linear",
+            execution_policy={"sandbox_mode": "danger-full-access"},
+            reasoning_profile={"role": "implementer", "thinking_budget": "high"},
+            budget_profile={"max_rounds": 2},
+            allowed_actions=["implement", "report"],
+            delegation_ref="state/delegations/whole-paper-linear-dep.json",
+            result_sink_ref="artifacts/whole_paper_linear_dep/result.json",
+            lineage_ref="whole-paper-dependency-gate-root->whole-paper-linear-dep",
+            status=NodeStatus.ACTIVE,
+        )
+        final_integration_node = NodeSpec(
+            node_id="whole-paper-final-integration",
+            node_kind="implementer",
+            goal_slice="final whole-paper integration after dependency closure",
+            parent_node_id=whole_paper_dependency_gate_root_node.node_id,
+            generation=1,
+            round_id="R1.final",
+            execution_policy={"sandbox_mode": "danger-full-access"},
+            reasoning_profile={"role": "implementer", "thinking_budget": "high"},
+            budget_profile={"max_rounds": 2},
+            allowed_actions=["evaluate", "report"],
+            depends_on_node_ids=[linear_dep_node.node_id],
+            delegation_ref="state/delegations/whole-paper-final-integration.json",
+            result_sink_ref="artifacts/whole_paper_final_integration/implementer_result.json",
+            lineage_ref="whole-paper-dependency-gate-root->whole-paper-final-integration",
+            status=NodeStatus.ACTIVE,
+        )
+        whole_paper_dependency_gate_kernel_state = KernelState(
+            task_id="whole-paper-dependency-gate-evaluator-node",
+            root_goal="reject whole-paper evaluator launch until dependency nodes reach terminal-ready outcomes",
+            root_node_id=whole_paper_dependency_gate_root_node.node_id,
+        )
+        whole_paper_dependency_gate_kernel_state.register_node(whole_paper_dependency_gate_root_node)
+        whole_paper_dependency_gate_kernel_state.register_node(linear_dep_node)
+        whole_paper_dependency_gate_kernel_state.register_node(final_integration_node)
+        persist_kernel_state(
+            whole_paper_dependency_gate_state_root,
+            whole_paper_dependency_gate_kernel_state,
+            authority=kernel_internal_authority(),
+        )
+        (whole_paper_dependency_gate_artifact_root / "README.md").write_text("# README\n", encoding="utf-8")
+        (whole_paper_dependency_gate_artifact_root / "TRACEABILITY.md").write_text("# Traceability\n", encoding="utf-8")
+        (whole_paper_dependency_gate_artifact_root / "WHOLE_PAPER_STATUS.json").write_text(
+            json.dumps(
+                {
+                    "status": "TERMINAL",
+                    "terminal_classification": "paper defect exposed",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        linear_dep_result_ref = whole_paper_dependency_gate_state_root / "artifacts" / "whole_paper_linear_dep" / "result.json"
+        linear_dep_result_ref.parent.mkdir(parents=True, exist_ok=True)
+        linear_dep_result_ref.write_text(
+            json.dumps(
+                {
+                    "schema": "loop_product.child_result",
+                    "node_id": linear_dep_node.node_id,
+                    "status": "BLOCKED",
+                    "outcome": "BLOCKED",
+                    "summary": "dependency has not reached a terminal-consumable outcome yet",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        dependency_gate_manual_ref = whole_paper_dependency_gate_workspace_root / "PRODUCT_MANUAL.md"
+        dependency_gate_manual_ref.write_text("# Manual\n\nWhole-paper final integration.\n", encoding="utf-8")
+        dependency_gate_final_effects_ref = whole_paper_dependency_gate_workspace_root / "FINAL_EFFECTS.md"
+        dependency_gate_final_effects_ref.write_text(
+            "\n".join(
+                [
+                    "# Final Effects",
+                    "",
+                    "- whole-paper faithful complete formalization",
+                    "- paper defect exposed",
+                    "- external dependency blocked",
+                    "- final integration may launch evaluator only after dependency nodes close to terminal-ready outcomes",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        whole_paper_dependency_gate_submission = build_evaluator_submission_for_frozen_task(
+            target_node=final_integration_node,
+            workspace_root=whole_paper_dependency_gate_workspace_root,
+            output_root=whole_paper_dependency_gate_state_root / "artifacts" / "evaluator_node_whole_paper_dependency_gate_runs",
+            implementation_package_ref=whole_paper_dependency_gate_artifact_root,
+            product_manual_ref=dependency_gate_manual_ref,
+            final_effects_text_ref=dependency_gate_final_effects_ref,
+            role_agent_cmd=_fixture_role_agent_cmd(scenario="wave_sequence"),
+        )
+        try:
+            run_evaluator_node_until_terminal(
+                state_root=whole_paper_dependency_gate_state_root,
+                submission=whole_paper_dependency_gate_submission,
+                max_same_run_recovery_attempts=0,
+            )
+        except ValueError as exc:
+            msg = str(exc)
+            if "dependency" not in msg.lower() or linear_dep_node.node_id not in msg:
+                return _fail("whole-paper evaluator dependency gate must explain which declared dependency is not terminal-ready")
+        else:
+            return _fail("whole-paper final integration must fail closed before evaluator launch when dependency nodes are not terminal-ready")
+
         runtime_closure_only_state_root = temp_root / ".loop" / "runtime_closure_only"
         runtime_closure_only_workspace_root = temp_root / "runtime_closure_only_workspace"
         runtime_closure_only_workspace_root.mkdir(parents=True, exist_ok=True)

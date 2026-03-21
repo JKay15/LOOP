@@ -7,15 +7,15 @@ import json
 import hashlib
 import os
 import re
-import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from loop_product import build_endpoint_clarification_part1_input, run_evaluator
+from loop_product.artifact_hygiene import canonicalize_directory_artifact_heavy_trees
 from loop_product.evaluator.agent_execution_policy import validate_evaluator_agent_execution, validate_repo_shipped_role_agent_cmd
-from loop_product.kernel.state import load_kernel_state
+from loop_product.kernel.state import authoritative_node_dependency_ready, load_kernel_state
 from loop_product.kernel.submit import submit_control_envelope
 from loop_product.protocols.control_envelope import ControlEnvelope, EnvelopeStatus
 from loop_product.protocols.control_objects import NodeTerminalOutcome, NodeTerminalResult
@@ -95,10 +95,6 @@ _WHOLE_PAPER_TERMINAL_CLASSIFICATIONS = {
     "paper defect exposed",
     "external dependency blocked",
 }
-_NESTED_RUNTIME_HEAVY_DIR_NAMES = frozenset({".lake", ".git", ".venv", ".uv-cache"})
-_ARTIFACT_ROOT_RUNTIME_HEAVY_DIR_NAMES = frozenset({"build", "_lake_build"})
-
-
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -126,52 +122,19 @@ def _whole_paper_terminal_status_path(artifact_root: Path) -> Path:
     return artifact_root / "WHOLE_PAPER_STATUS.json"
 
 
-def _iter_runtime_heavy_tree_paths(artifact_root: Path) -> list[Path]:
-    matches: list[Path] = []
-    for current_root, dirnames, _filenames in os.walk(artifact_root):
-        current_path = Path(current_root)
-        keep_dirnames: list[str] = []
-        for dirname in dirnames:
-            candidate = current_path / dirname
-            if dirname in _NESTED_RUNTIME_HEAVY_DIR_NAMES:
-                matches.append(candidate)
-                continue
-            if current_path == artifact_root and dirname in _ARTIFACT_ROOT_RUNTIME_HEAVY_DIR_NAMES:
-                matches.append(candidate)
-                continue
-            keep_dirnames.append(dirname)
-        dirnames[:] = keep_dirnames
-    return sorted({path.resolve() for path in matches}, key=lambda item: (len(item.parts), str(item)))
-
-
-def _remove_runtime_heavy_tree(path: Path) -> None:
-    if path.is_symlink() or path.is_file():
-        path.unlink()
-        return
-    shutil.rmtree(path)
-
-
-def _canonicalize_directory_artifact_heavy_trees(artifact_root: Path) -> list[str]:
-    removed: list[str] = []
-    for heavy_path in _iter_runtime_heavy_tree_paths(artifact_root):
-        if not heavy_path.exists():
-            continue
-        _remove_runtime_heavy_tree(heavy_path)
-        removed.append(str(heavy_path))
-    remaining = [str(path) for path in _iter_runtime_heavy_tree_paths(artifact_root) if path.exists()]
-    if remaining:
-        raise ValueError(
-            "directory artifact runtime canonicalization could not prune runtime-owned heavy trees: "
-            + ", ".join(remaining)
-        )
-    return removed
-
-
 def _enforce_directory_artifact_hygiene_preflight(submission: EvaluatorNodeSubmission) -> None:
     artifact_root = Path(submission.implementation_package_ref).expanduser().resolve()
     if not artifact_root.exists() or not artifact_root.is_dir():
         return
-    _canonicalize_directory_artifact_heavy_trees(artifact_root)
+    canonicalize_directory_artifact_heavy_trees(artifact_root)
+
+
+def _derive_state_root_from_submission(submission: EvaluatorNodeSubmission) -> Path:
+    output_root = Path(submission.output_root).expanduser().resolve()
+    for candidate in (output_root, *output_root.parents):
+        if (candidate / "state" / "kernel_state.json").exists():
+            return require_runtime_root(candidate)
+    raise ValueError(f"evaluator submission output_root does not resolve under a .loop boundary: {output_root}")
 
 
 def _enforce_whole_paper_preflight(submission: EvaluatorNodeSubmission) -> None:
@@ -208,6 +171,25 @@ def _enforce_whole_paper_preflight(submission: EvaluatorNodeSubmission) -> None:
         raise ValueError(
             "whole-paper evaluator preflight requires WHOLE_PAPER_STATUS.json to use one of the allowed terminal "
             f"classifications: {sorted(_WHOLE_PAPER_TERMINAL_CLASSIFICATIONS)}"
+        )
+    state_root = _derive_state_root_from_submission(submission)
+    kernel_state = load_kernel_state(state_root)
+    target_payload = dict(kernel_state.nodes.get(submission.target_node_id) or {})
+    depends_on = [str(item).strip() for item in list(target_payload.get("depends_on_node_ids") or []) if str(item).strip()]
+    if not depends_on:
+        return
+    unresolved: list[str] = []
+    for dependency_node_id in depends_on:
+        dependency_payload = dict(kernel_state.nodes.get(dependency_node_id) or {})
+        if not dependency_payload or not authoritative_node_dependency_ready(
+            state_root=state_root,
+            node_payload=dependency_payload,
+        ):
+            unresolved.append(dependency_node_id)
+    if unresolved:
+        raise ValueError(
+            "whole-paper evaluator preflight requires declared dependency nodes to already be terminal-ready before "
+            f"evaluator launch: {', '.join(unresolved)}"
         )
 
 

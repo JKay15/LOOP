@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from loop_product.artifact_hygiene import canonicalize_workspace_artifact_heavy_trees
 from loop_product.gateway.classify import classify_envelope
 from loop_product.kernel.authority import KernelMutationAuthority, require_kernel_authority
 from loop_product.protocols.control_envelope import ControlEnvelope
@@ -30,6 +31,11 @@ _TERMINAL_DEPENDENCY_NODE_STATUSES = {
     NodeStatus.BLOCKED.value,
     NodeStatus.COMPLETED.value,
     NodeStatus.FAILED.value,
+}
+_NON_READY_TERMINAL_OUTCOMES = {
+    "BLOCKED",
+    "REPAIR_REQUIRED",
+    "SPLIT_ACCEPTED_AWAITING_CHILDREN",
 }
 
 
@@ -360,13 +366,30 @@ def _dependency_snapshot_map(payload: dict[str, Any]) -> dict[str, dict[str, Any
 
 def _dependency_snapshot_ready(snapshot: dict[str, Any]) -> bool:
     state_status = str(snapshot.get("state_status") or snapshot.get("status") or "").strip().upper()
+    outcome = str(snapshot.get("outcome") or "").strip().upper()
     result_sink_present = snapshot.get("result_sink_present")
     if result_sink_present is False:
         return False
-    return state_status in _TERMINAL_DEPENDENCY_NODE_STATUSES
+    if state_status not in _TERMINAL_DEPENDENCY_NODE_STATUSES:
+        return False
+    if state_status == NodeStatus.BLOCKED.value:
+        return bool(outcome) and outcome not in _NON_READY_TERMINAL_OUTCOMES
+    return outcome not in _NON_READY_TERMINAL_OUTCOMES
 
 
-def _node_dependency_ready(*, state_root: Path, node_payload: dict[str, Any]) -> bool:
+def authoritative_result_payload_dependency_ready(payload: dict[str, Any]) -> bool:
+    status = str(payload.get("status") or "").strip().upper()
+    outcome = str(payload.get("outcome") or "").strip().upper()
+    if _accepted_deferred_split(payload):
+        return True
+    if status not in _TERMINAL_DEPENDENCY_NODE_STATUSES:
+        return False
+    if status == NodeStatus.BLOCKED.value:
+        return bool(outcome) and outcome not in _NON_READY_TERMINAL_OUTCOMES
+    return outcome not in _NON_READY_TERMINAL_OUTCOMES
+
+
+def authoritative_node_dependency_ready(*, state_root: Path, node_payload: dict[str, Any]) -> bool:
     status = str(node_payload.get("status") or "").strip().upper()
     if status not in _TERMINAL_DEPENDENCY_NODE_STATUSES:
         return False
@@ -378,7 +401,24 @@ def _node_dependency_ready(*, state_root: Path, node_payload: dict[str, Any]) ->
         node_id=str(node_payload.get("node_id") or ""),
         node_payload=dict(node_payload or {}),
     )
-    return result_ref.exists()
+    if not result_ref.exists():
+        return status in {NodeStatus.COMPLETED.value, NodeStatus.FAILED.value}
+    try:
+        result_payload = json.loads(result_ref.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return authoritative_result_payload_dependency_ready(dict(result_payload or {}))
+
+
+def _workspace_artifact_hygiene_sync(*, kernel_state: KernelState) -> None:
+    for node_payload in kernel_state.nodes.values():
+        workspace_root = str(node_payload.get("workspace_root") or "").strip()
+        if not workspace_root:
+            continue
+        artifact_workspace = Path(workspace_root).expanduser().resolve()
+        if not artifact_workspace.exists() or not artifact_workspace.is_dir():
+            continue
+        canonicalize_workspace_artifact_heavy_trees(artifact_workspace)
 
 
 def _dependency_unblocked_resume_candidates(*, state_root: Path, kernel_state: KernelState) -> list[str]:
@@ -419,7 +459,10 @@ def _dependency_unblocked_resume_candidates(*, state_root: Path, kernel_state: K
             if not _dependency_snapshot_ready(snapshot):
                 any_snapshot_unready = True
             dependency_payload = dict(kernel_state.nodes.get(dependency_node_id) or {})
-            if not dependency_payload or not _node_dependency_ready(state_root=state_root, node_payload=dependency_payload):
+            if not dependency_payload or not authoritative_node_dependency_ready(
+                state_root=state_root,
+                node_payload=dependency_payload,
+            ):
                 all_dependencies_ready_now = False
                 break
         if any_snapshot_unready and all_dependencies_ready_now:
@@ -438,8 +481,8 @@ def synchronize_authoritative_node_results(
     require_kernel_authority(authority, surface="synchronize_authoritative_node_results")
     state_root = require_runtime_root(state_root)
     kernel_state = load_kernel_state(state_root)
+    _workspace_artifact_hygiene_sync(kernel_state=kernel_state)
     dirty = False
-    deferred_ready_sources: list[str] = []
 
     for node_id, node_payload in list(kernel_state.nodes.items()):
         result_ref = _authoritative_result_ref_for_node(
@@ -477,38 +520,46 @@ def synchronize_authoritative_node_results(
         elif node_id in kernel_state.blocked_reasons and str(node_payload.get("status") or "") != NodeStatus.BLOCKED.value:
             kernel_state.blocked_reasons.pop(node_id, None)
             dirty = True
-        if _accepted_deferred_split(result_payload):
-            deferred_ready_sources.append(node_id)
-
     if dirty:
         for node in kernel_state.nodes.values():
             persist_node_snapshot(state_root, node, authority=authority)
         persist_kernel_state(state_root, kernel_state, authority=authority)
 
-    if continue_deferred and deferred_ready_sources:
+    if continue_deferred:
         from loop_product.kernel.submit import submit_topology_mutation
         from loop_product.topology.activate import build_activate_request, review_activate_request
 
         refreshed = load_kernel_state(state_root)
-        for source_node_id in deferred_ready_sources:
+        while True:
+            ready_planned: list[tuple[str, str, int]] = []
             for child_id, child_payload in list(refreshed.nodes.items()):
                 if str(child_payload.get("status") or "") != NodeStatus.PLANNED.value:
                     continue
-                depends_on = [str(item).strip() for item in list(child_payload.get("depends_on_node_ids") or []) if str(item).strip()]
-                if source_node_id not in depends_on:
-                    continue
                 mutation = build_activate_request(
                     child_id,
-                    reason=f"authoritative deferred source {source_node_id} reached a completed segment; continue the ready planned child",
+                    reason=f"authoritative dependency snapshot for {child_id} is now terminal-ready; continue the planned child",
                 )
-                review = review_activate_request(refreshed, mutation)
+                review = review_activate_request(refreshed, mutation, state_root=state_root)
                 if str(review.get("decision") or "").upper() != "ACCEPT":
                     continue
+                ready_planned.append(
+                    (
+                        child_id,
+                        str(child_payload.get("round_id") or refreshed.root_node_id),
+                        int(child_payload.get("generation") or 0),
+                    )
+                )
+            if not ready_planned:
+                break
+            for child_id, round_id, generation in ready_planned:
                 submit_topology_mutation(
                     state_root,
-                    mutation,
-                    round_id=str(child_payload.get("round_id") or refreshed.root_node_id),
-                    generation=int(child_payload.get("generation") or 0),
+                    build_activate_request(
+                        child_id,
+                        reason=f"authoritative dependency snapshot for {child_id} is now terminal-ready; continue the planned child",
+                    ),
+                    round_id=round_id,
+                    generation=generation,
                 )
                 refreshed = load_kernel_state(state_root)
         kernel_state = refreshed

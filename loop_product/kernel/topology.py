@@ -153,13 +153,18 @@ def _bootstrap_and_launch_activated_child(
     launch_child_from_result_ref(result_ref=str(bootstrap_payload.get("bootstrap_result_ref") or ""))
 
 
-def review_topology_mutation(kernel_state: KernelState, mutation: TopologyMutation) -> dict[str, Any]:
+def review_topology_mutation(
+    kernel_state: KernelState,
+    mutation: TopologyMutation,
+    *,
+    state_root: Path | None = None,
+) -> dict[str, Any]:
     """Review a topology mutation under current kernel authority."""
 
     if mutation.kind == "split":
         return review_split_request(kernel_state, mutation)
     if mutation.kind == "activate":
-        return review_activate_request(kernel_state, mutation)
+        return review_activate_request(kernel_state, mutation, state_root=state_root)
     if mutation.kind == "merge":
         return review_merge_request(kernel_state, mutation)
     if mutation.kind == "reap":
@@ -273,11 +278,17 @@ def apply_accepted_topology_mutation(
     persist_node_snapshot(state_root, source_record, authority=authority)
 
     target_nodes = [dict(item) for item in (review.get("normalized_target_nodes") or [])]
+    launch_targets: list[dict[str, Any]] = []
     for target in target_nodes:
         node_id = str(target.get("node_id") or "").strip()
         goal_slice = str(target.get("goal_slice") or "").strip()
         if not (node_id and goal_slice):
             continue
+        launch_immediately = (
+            normalized_split_mode == "parallel"
+            and not list(target.get("depends_on_node_ids") or [])
+            and not str(target.get("activation_condition") or "").strip()
+        )
         materialize_child(
             state_root=state_root,
             kernel_state=kernel_state,
@@ -299,14 +310,16 @@ def apply_accepted_topology_mutation(
             lineage_ref=str(
                 target.get("lineage_ref") or f"{source_record.get('lineage_ref') or source_node_id}->{node_id}"
             ),
-            status=NodeStatus.PLANNED if normalized_split_mode == "deferred" else NodeStatus.ACTIVE,
+            status=NodeStatus.ACTIVE if launch_immediately else NodeStatus.PLANNED,
             authority=authority,
         )
-    if normalized_split_mode == "parallel" and target_nodes:
+        if launch_immediately:
+            launch_targets.append(target)
+    if normalized_split_mode == "parallel" and launch_targets:
         _bootstrap_and_launch_parallel_children(
             state_root=state_root,
             kernel_state=kernel_state,
             source_record=source_record,
-            target_nodes=target_nodes,
+            target_nodes=launch_targets,
             authority=authority,
         )

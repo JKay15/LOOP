@@ -64,6 +64,7 @@ The evaluator is a graph participant, not an oracle outside the graph.
 - evaluator recovery must skip already-completed lanes instead of replaying them by default
 - reviewer only after every lane is terminal
 - whole-paper benchmark submissions must fail closed before evaluator launch unless the delivered artifact includes structured terminal evidence in `WHOLE_PAPER_STATUS.json`; extraction/partition/intermediate ledgers alone are not evaluator-ready whole-paper closure
+- whole-paper final-integration submissions must also fail closed before evaluator launch when any declared `depends_on_node_ids` dependency has not yet reached a terminal-ready authoritative outcome
 - child prompt and workspace rules must treat deferred split follow-up activation as separate topology work; evaluator launch must not be used as a substitute for activate submission
 - evaluator node adapters must translate retryable `RECOVERY_REQUIRED` outcomes into `retryable=true` evaluator results instead of treating them as final evaluator closure
 - evaluator node adapters must translate terminal simple-evaluator `ERROR` reports into evaluator verdict `ERROR`; reserve evaluator verdict `BUG` for adapter/runtime corruption, transport failure, or other unknown terminal states that cannot be honestly classified as plain evaluator error

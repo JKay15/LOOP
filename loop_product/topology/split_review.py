@@ -49,6 +49,14 @@ def _normalized_split_targets(
     return normalized
 
 
+def _target_requires_planned_activation(*, split_mode: str, target_payload: Mapping[str, Any]) -> bool:
+    if split_mode == "deferred":
+        return True
+    depends_on = [str(item).strip() for item in list(target_payload.get("depends_on_node_ids") or []) if str(item).strip()]
+    activation_condition = str(target_payload.get("activation_condition") or "").strip()
+    return bool(depends_on or activation_condition)
+
+
 def _normalize_target_payloads(
     *,
     source_node_id: str,
@@ -144,7 +152,7 @@ def _normalize_target_payloads(
                 "workspace_root": str(target.get("workspace_root") or ""),
                 "codex_home": str(target.get("codex_home") or ""),
                 "depends_on_node_ids": resolved_depends_on,
-                "activation_condition": activation_condition if split_mode == "deferred" else "",
+                "activation_condition": activation_condition,
                 "result_sink_ref": str(target.get("result_sink_ref") or f"artifacts/{node_id}/result.json"),
                 "generation": expected_generation,
             }
@@ -290,7 +298,13 @@ def review_split_request(kernel_state: KernelState, mutation: TopologyMutation) 
     max_active_nodes = int(normalized_budget.get("max_active_nodes") or 0)
     max_child_generations = int(normalized_budget.get("max_child_generations") or 0)
     minimum_target_count = 2 if normalized_split_mode == "parallel" else 1
-    projected_active = active_now + len(normalized_target_nodes) if normalized_split_mode == "parallel" else active_now
+    immediate_parallel_targets = sum(
+        1
+        for item in normalized_target_nodes
+        if normalized_split_mode == "parallel"
+        and not _target_requires_planned_activation(split_mode=normalized_split_mode, target_payload=item)
+    )
+    projected_active = active_now + immediate_parallel_targets if normalized_split_mode == "parallel" else active_now
 
     checks = [
         {

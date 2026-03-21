@@ -67,6 +67,7 @@ The `kernel` is the root supervisory authority for the complete LOOP repo. It ow
 - every runtime `state_root` passed to kernel/gateway/runtime helpers must resolve inside a `.loop/` boundary; roots outside `.loop/` must be rejected before any durable write happens
 - accepted split proposals are not merely audit comments; once kernel accepts them they materialize durable child delegation/state artifacts and block the source node with an auditable reason
 - accepted parallel split children must not stop at state-only materialization; root must derive each child's frozen bootstrap bundle from authoritative source context and emit canonical child-launch materialization for every accepted parallel child
+- accepted `parallel` split does not imply every accepted child launches immediately; dependency-bound targets must materialize truthfully as `PLANNED`, and only dependency-free targets may bootstrap/launch on the initial parallel acceptance
 - split acceptance must be based on kernel-reviewed normalized child data; malformed child payloads, target-id drift, or generation drift must be rejected before acceptance rather than partially mutating `.loop`
 - deferred split is a separate accepted mode: the source remains `ACTIVE`, accepted future children materialize as `PLANNED`, and kernel preserves their dependency/activation metadata for later activation
 - accepted deferred split children require a later activate proposal; `PLANNED` children do not self-start just because the source node wrote about them
@@ -97,6 +98,8 @@ The `kernel` is the root supervisory authority for the complete LOOP repo. It ow
 - accepted terminal node facts must keep `kernel_state.json` and the per-node snapshot under `.loop/state/<node>.json` in sync on terminal status and runtime attachment state rather than updating only the aggregate kernel graph
 - committed authority/status query surfaces must also reconcile authoritative non-evaluator child result sinks back into `kernel_state.json` and `.loop/state/<node>.json`; a child that already wrote a kernel-visible blocked/completed result must not remain falsely `ACTIVE` in the authoritative graph
 - when an authoritative child result records an accepted deferred split, kernel-owned continuation should be able to normalize the completed source segment and submit ready activate proposals for the planned children so deferred continuation does not stall at `PLANNED` forever
+- kernel-owned continuation should also auto-activate any already-materialized `PLANNED` child once its declared dependency set becomes terminal-ready, even when that child originally came from a mixed parallel split rather than a pure deferred split
+- terminal-ready dependency continuation must be outcome-aware: blocked nodes only count as dependency-ready when their authoritative result closes to a consumable terminal outcome such as `PAPER_DEFECT_EXPOSED` or `EXTERNAL_DEPENDENCY_BLOCKED`, not when they merely remain `BLOCKED`
 - `query_kernel_state(...)` must expose:
   - active node graph
   - lifecycle state
