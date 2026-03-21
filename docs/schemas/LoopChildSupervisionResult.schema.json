@@ -27,7 +27,7 @@
     "settled": { "type": "boolean" },
     "settled_reason": {
       "type": "string",
-      "enum": ["pass", "terminal_nonretryable", "retry_budget_exhausted", "timeout"]
+      "enum": ["pass", "terminal_nonretryable", "retry_budget_exhausted", "timeout", "no_substantive_progress"]
     },
     "recoveries_used": { "type": "integer", "minimum": 0 },
     "implementer_result_ref": { "type": "string" },

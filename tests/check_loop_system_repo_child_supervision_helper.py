@@ -561,6 +561,130 @@ def main() -> int:
         if str(incomplete_result.get("latest_launch_result_ref") or "") != str(launch_result_ref_2.resolve()):
             return _fail("incomplete/manual implementer_result recovery path must update the settled launch_result_ref after relaunch")
 
+        workspace_root = ROOT / "workspace" / "test-child-supervision-no-substantive-progress"
+        state_root = ROOT / ".loop" / "test-child-supervision-no-substantive-progress"
+        shutil.rmtree(workspace_root, ignore_errors=True)
+        shutil.rmtree(state_root, ignore_errors=True)
+        bootstrap = bootstrap_first_implementer_node(
+            mode="fresh",
+            task_slug="test-child-supervision-no-substantive-progress",
+            root_goal="bootstrap one implementer node for false-liveness supervision validation",
+            child_goal_slice="stop truthfully when a live child keeps reporting only placeholder staged progress without any substantive change",
+            endpoint_artifact_ref=str(endpoint.resolve()),
+            workspace_root=str(workspace_root),
+            state_root=str(state_root),
+            workspace_mirror_relpath="deliverables/primary_artifact",
+            external_publish_target=str((temp_root / "Desktop" / "out-no-progress").resolve()),
+            context_refs=[],
+        )
+
+        node_id = str(bootstrap["node_id"])
+        launch_result_ref_1 = state_root / "artifacts" / "launches" / node_id / "attempt_001" / "ChildLaunchResult.json"
+        launch_result_ref_1.parent.mkdir(parents=True, exist_ok=True)
+        launch_result_ref_1.write_text(
+            json.dumps(
+                {
+                    "launch_result_ref": str(launch_result_ref_1.resolve()),
+                    "launch_decision": "started",
+                    "node_id": node_id,
+                    "state_root": str(state_root.resolve()),
+                    "workspace_root": str(workspace_root.resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        no_progress_status_calls = {"count": 0}
+        no_progress_recovery_calls: list[dict[str, object]] = []
+        no_progress_launch_calls: list[str] = []
+        no_progress_now = {"t": 1000.0}
+
+        def _no_progress_status_reader(*, result_ref: str | Path, stall_threshold_s: float = 60.0) -> dict[str, object]:
+            launch_result_ref = str(Path(result_ref).resolve())
+            no_progress_status_calls["count"] += 1
+            status_ref = temp_root / f"no-progress-status-{no_progress_status_calls['count']}.json"
+            return {
+                "launch_result_ref": launch_result_ref,
+                "status_result_ref": str(status_ref.resolve()),
+                "node_id": node_id,
+                "state_root": str(state_root.resolve()),
+                "workspace_root": str(workspace_root.resolve()),
+                "pid_alive": True,
+                "recovery_eligible": False,
+                "stall_threshold_s": stall_threshold_s,
+                "lifecycle_status": "ACTIVE",
+                "recovery_reason": "live_pid_still_attached",
+                "latest_log_age_s": 0.1,
+            }
+
+        stagnant_snapshot = {
+            "node_id": node_id,
+            "workspace_root": str(workspace_root.resolve()),
+            "state_root": str(state_root.resolve()),
+            "pid_alive": True,
+            "lifecycle_status": "ACTIVE",
+            "phase_hint": "IMPLEMENTING",
+            "terminal_result_present": False,
+            "implementer_result_ref": "",
+            "implementer_outcome": "",
+            "implementer_verdict": "",
+            "implementer_retryable": False,
+            "evaluator_status": "",
+            "evaluator_running_unit_ids": [],
+            "evaluator_completed_unit_ids": [],
+            "evaluator_blocked_retryable_unit_ids": [],
+            "evaluator_blocked_terminal_unit_ids": [],
+            "evaluator_pending_unit_ids": [],
+            "observed_doc_refs": [
+                str((workspace_root / "deliverables" / "primary_artifact" / "README.md").resolve()),
+                str((workspace_root / "deliverables" / "primary_artifact" / "TRACEABILITY.md").resolve()),
+                str((workspace_root / "deliverables" / "primary_artifact" / "formalization" / "STATUS.md").resolve()),
+            ],
+            "recent_log_lines": [
+                "Workspace-local artifact skeleton created.",
+                "No split has been proposed yet.",
+                "Evaluator has not been run yet for this node.",
+            ],
+        }
+
+        def _no_progress_snapshot_reader(*, result_ref: str | Path, stall_threshold_s: float = 60.0) -> dict[str, object]:
+            del result_ref, stall_threshold_s
+            return dict(stagnant_snapshot)
+
+        def _no_progress_recovery_runner(**payload):
+            no_progress_recovery_calls.append(dict(payload))
+            return {}
+
+        def _no_progress_launcher(*, result_ref: str | Path, startup_probe_ms: int = 1500, startup_health_timeout_ms: int = 12000):
+            del result_ref, startup_probe_ms, startup_health_timeout_ms
+            no_progress_launch_calls.append("unexpected")
+            return {}
+
+        no_progress_result = supervise_child_until_settled(
+            launch_result_ref=launch_result_ref_1,
+            poll_interval_s=0.0,
+            stall_threshold_s=60.0,
+            max_recoveries=2,
+            max_wall_clock_s=0.0,
+            runtime_status_reader=_no_progress_status_reader,
+            recovery_runner=_no_progress_recovery_runner,
+            launcher=_no_progress_launcher,
+            progress_snapshot_reader=_no_progress_snapshot_reader,
+            no_substantive_progress_window_s=5.0,
+            now_fn=lambda: no_progress_now["t"],
+            sleep_fn=lambda seconds: no_progress_now.__setitem__("t", no_progress_now["t"] + float(seconds)),
+        )
+        Draft202012Validator(supervision_schema).validate(no_progress_result)
+        if str(no_progress_result.get("settled_reason") or "") != "no_substantive_progress":
+            return _fail("supervision helper must settle to a truthful no_substantive_progress stop point when a live child shows unchanged placeholder-only progress")
+        if no_progress_recovery_calls:
+            return _fail("no-substantive-progress stop points must not pretend the child is recovery-eligible")
+        if no_progress_launch_calls:
+            return _fail("no-substantive-progress stop points must not relaunch the child automatically")
+
     print("[loop-system-child-supervision-helper] OK")
     return 0
 

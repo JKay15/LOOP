@@ -87,6 +87,36 @@ def main() -> int:
             context="loop-runner skill",
         )
         _require_contains(
+            loop_runner_skill,
+            "at least one non-empty file under the workspace mirror or required artifact/result path",
+            context="loop-runner skill",
+        )
+        _require_contains(
+            loop_runner_skill,
+            "Creating only an empty directory does not satisfy that startup requirement",
+            context="loop-runner skill",
+        )
+        _require_contains(
+            loop_runner_skill,
+            "do not keep retrying the same search family in the opening phase",
+            context="loop-runner skill",
+        )
+        _require_contains(
+            loop_runner_skill,
+            "startup note or checkpoint file alone does not count as substantive startup progress",
+            context="loop-runner skill",
+        )
+        _require_contains(
+            loop_runner_skill,
+            "actual artifact skeleton or first substantive deliverable batch",
+            context="loop-runner skill",
+        )
+        _require_contains(
+            loop_runner_skill,
+            "Do not broad-search repo roots, `.loop/**` history, or unrelated evaluator workspaces",
+            context="loop-runner skill",
+        )
+        _require_contains(
             kernel_contract,
             "the kernel may materialize additional child nodes only after an implementer-authored split proposal passes kernel review",
             context="kernel contract",
@@ -104,6 +134,26 @@ def main() -> int:
         _require_contains(
             node_contract,
             "first concrete workspace action before broad reconnaissance",
+            context="node contract",
+        )
+        _require_contains(
+            node_contract,
+            "at least one non-empty file under the workspace mirror or required artifact/result path",
+            context="node contract",
+        )
+        _require_contains(
+            node_contract,
+            "startup search rate-limit or tool-exhaustion should downgrade",
+            context="node contract",
+        )
+        _require_contains(
+            node_contract,
+            "startup note or checkpoint file alone does not count as substantive startup progress",
+            context="node contract",
+        )
+        _require_contains(
+            node_contract,
+            "Do not broad-search repo roots, `.loop/**` history, or unrelated evaluator workspaces",
             context="node contract",
         )
     except AssertionError as exc:
@@ -148,6 +198,18 @@ def main() -> int:
             return _fail("bootstrap child prompt must treat exact frozen refs as authoritative during startup")
         if "one concrete workspace-local action" not in prompt_text:
             return _fail("bootstrap child prompt must require one concrete startup action before broad reconnaissance")
+        if "at least one non-empty file under the workspace mirror or required artifact/result path" not in prompt_text:
+            return _fail("bootstrap child prompt must require a non-empty file materialization during startup")
+        if "Creating only an empty directory does not satisfy that startup requirement" not in prompt_text:
+            return _fail("bootstrap child prompt must forbid satisfying startup with only an empty directory")
+        if "do not keep retrying the same search family in the opening phase" not in prompt_text:
+            return _fail("bootstrap child prompt must require startup search downgrade after rate-limit or tool exhaustion")
+        if "startup note or checkpoint file alone does not count as substantive startup progress" not in prompt_text:
+            return _fail("bootstrap child prompt must forbid treating a startup note as substantive startup progress")
+        if "actual artifact skeleton or first substantive deliverable batch" not in prompt_text:
+            return _fail("bootstrap child prompt must require substantive artifact startup before broad theorem search")
+        if "Do not broad-search repo roots, `.loop/**` history, or unrelated evaluator workspaces" not in prompt_text:
+            return _fail("bootstrap child prompt must forbid broad history mining when exact frozen refs exist")
 
     print("[loop-system-split-instruction-chain] OK")
     return 0

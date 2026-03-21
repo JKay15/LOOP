@@ -128,15 +128,42 @@ def main() -> int:
         "guess alternates or broad repo scans",
         "fresh workspace with no deliverable yet",
         "one concrete workspace-local action",
+        "at least one non-empty file under the workspace mirror or required artifact/result path",
+        "Creating only an empty directory does not satisfy that startup requirement",
+        "startup search or MCP helper reports rate-limit, tool exhaustion, or validation failure",
+        "do not keep retrying the same search family in the opening phase",
+        "downgrade to direct artifact writing, local proof drafting, or the first build path",
+        "startup note or checkpoint file alone does not count as substantive startup progress",
+        "actual artifact skeleton or first substantive deliverable batch",
+        "If the frozen goal already names staged benchmark phases or required sections",
+        "do not stop after creating a placeholder skeleton for those sections",
+        "After the skeleton exists, materially advance the first incomplete staged phase with source-backed content",
+        "planned outputs, `pending` tables, TODO notes, or placeholder headings alone do not count as substantive staged progress",
+        "Do not broad-search repo roots, `.loop/**` history, or unrelated evaluator workspaces",
         "Do not write the external publish target directly",
         "terminal evaluator `FAIL` caused by unmet product requirements is still unfinished implementer work by default",
         "Do not end the child conversation",
         "RECOVERY_CONTEXT.md",
         "self-attribution",
         "self-repair",
+        "final `deliverables/primary_artifact`",
+        "must not ship runtime-owned heavy trees",
+        "such as `.lake`, `.git`, `.venv`, `.uv-cache`, `build`, or `_lake_build`",
     ):
         if needle not in workspace_text:
             return _fail(f"workspace AGENTS implementer rule missing required text: {needle}")
+
+    loop_runner_text = (ROOT / ".agents" / "skills" / "loop-runner" / "SKILL.md").read_text(encoding="utf-8")
+    for needle in (
+        "final `deliverables/primary_artifact`",
+        "must not ship runtime-owned heavy trees",
+        "such as `.lake`, `.git`, `.venv`, `.uv-cache`, `build`, or `_lake_build`",
+        "If the frozen goal already names staged benchmark phases or required sections",
+        "After the skeleton exists, materially advance the first incomplete staged phase with source-backed content",
+        "planned outputs, `pending` tables, TODO notes, or placeholder headings alone do not count as substantive staged progress",
+    ):
+        if needle not in loop_runner_text:
+            return _fail(f"loop-runner skill missing required text: {needle}")
 
     print("[loop-system-agents-rules] OK")
     return 0

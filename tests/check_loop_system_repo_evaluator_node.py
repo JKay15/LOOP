@@ -1023,6 +1023,92 @@ def main() -> int:
         if str(response_then_fail_report.get("status") or "") != "ERROR":
             return _fail("response-then-fail evaluator reports must stay terminal ERROR")
 
+        retryable_fail_state_root = temp_root / ".loop" / "retryable_fail"
+        ensure_runtime_tree(retryable_fail_state_root)
+        retryable_fail_root_node = NodeSpec(
+            node_id="retryable-fail-root",
+            node_kind="kernel",
+            goal_slice="exercise retryable evaluator FAIL closeout semantics",
+            parent_node_id=None,
+            generation=0,
+            round_id="R0",
+            execution_policy={"mode": "kernel"},
+            reasoning_profile={"role": "kernel", "thinking_budget": "medium"},
+            budget_profile={"max_rounds": 1},
+            allowed_actions=["dispatch", "submit", "audit"],
+            delegation_ref="",
+            result_sink_ref="artifacts/retryable_fail/root_summary.json",
+            lineage_ref="retryable-fail-root",
+            status=NodeStatus.ACTIVE,
+        )
+        retryable_fail_child_node = NodeSpec(
+            node_id="retryable-fail-child",
+            node_kind="implementer",
+            goal_slice="validate retryable evaluator FAIL stays non-terminal",
+            parent_node_id=retryable_fail_root_node.node_id,
+            generation=1,
+            round_id="R1",
+            execution_policy={"sandbox_mode": "danger-full-access"},
+            reasoning_profile={"role": "implementer", "thinking_budget": "high"},
+            budget_profile={"max_rounds": 1},
+            allowed_actions=["evaluate", "report"],
+            delegation_ref="state/delegations/retryable-fail-child.json",
+            result_sink_ref="artifacts/retryable_fail/implementer_result.json",
+            lineage_ref="retryable-fail-root->retryable-fail-child",
+            status=NodeStatus.ACTIVE,
+        )
+        retryable_fail_kernel_state = KernelState(
+            task_id="retryable-fail-evaluator-node",
+            root_goal="exercise retryable FAIL evaluator translation",
+            root_node_id=retryable_fail_root_node.node_id,
+        )
+        retryable_fail_kernel_state.register_node(retryable_fail_root_node)
+        retryable_fail_kernel_state.register_node(retryable_fail_child_node)
+        persist_kernel_state(
+            retryable_fail_state_root,
+            retryable_fail_kernel_state,
+            authority=kernel_internal_authority(),
+        )
+        retryable_fail_submission = build_evaluator_submission_for_endpoint_clarification(
+            target_node=retryable_fail_child_node,
+            workspace_root=ROOT,
+            output_root=retryable_fail_state_root / "artifacts" / "evaluator_node_retryable_fail_runs",
+            role_agent_cmd=_fixture_role_agent_cmd(scenario="terminal_fail"),
+        )
+        retryable_fail_result, retryable_fail_refs = run_evaluator_node(
+            state_root=retryable_fail_state_root,
+            submission=retryable_fail_submission,
+        )
+        if retryable_fail_result.verdict is not EvaluatorVerdict.FAIL:
+            return _fail("terminal-fail fixture must translate to FAIL")
+        if retryable_fail_result.retryable is not True:
+            return _fail("reviewer FAIL must remain retryable repair work by default")
+        retryable_fail_impl_ref = Path(
+            str(
+                retryable_fail_refs.get("workspace_implementer_result_ref")
+                or retryable_fail_refs.get("implementer_result_ref")
+                or ""
+            )
+        )
+        if not retryable_fail_impl_ref.exists():
+            return _fail("retryable FAIL must still materialize an authoritative implementer_result")
+        retryable_fail_impl = json.loads(retryable_fail_impl_ref.read_text(encoding="utf-8"))
+        if str(retryable_fail_impl.get("outcome") or "") != "REPAIR_REQUIRED":
+            return _fail("retryable FAIL implementer_result must preserve REPAIR_REQUIRED outcome")
+        retryable_fail_state = load_kernel_state(retryable_fail_state_root)
+        accepted_retryable_fail = [
+            item
+            for item in retryable_fail_state.accepted_envelopes
+            if item.get("source") == retryable_fail_submission.evaluator_node_id
+        ]
+        if not any(item.get("envelope_type") == "evaluator_result" for item in accepted_retryable_fail):
+            return _fail("retryable FAIL must still submit the evaluator_result envelope")
+        if any(item.get("envelope_type") == "node_terminal_result" for item in accepted_retryable_fail):
+            return _fail("retryable FAIL must not emit node_terminal_result before repair is attempted")
+        retryable_fail_node = dict(retryable_fail_state.nodes.get(retryable_fail_child_node.node_id) or {})
+        if str(retryable_fail_node.get("status") or "") != NodeStatus.ACTIVE.value:
+            return _fail("retryable FAIL must leave the implementer node ACTIVE for repair work")
+
         runtime_closure_only_state_root = temp_root / ".loop" / "runtime_closure_only"
         runtime_closure_only_workspace_root = temp_root / "runtime_closure_only_workspace"
         runtime_closure_only_workspace_root.mkdir(parents=True, exist_ok=True)
@@ -1823,16 +1909,17 @@ def main() -> int:
             return _fail("retryable terminal FAIL materialization must preserve a non-empty self_repair hint")
         fail_kernel_state_after = load_kernel_state(fail_state_root)
         fail_kernel_node_after = dict(fail_kernel_state_after.nodes.get(fail_child_node.node_id) or {})
-        if str(fail_kernel_node_after.get("status") or "") != "FAILED":
-            return _fail("terminal evaluator FAIL must normalize kernel node status to FAILED")
-        if str(dict(fail_kernel_node_after.get("runtime_state") or {}).get("attachment_state") or "") != "TERMINAL":
-            return _fail("terminal evaluator FAIL must mark kernel runtime attachment as TERMINAL")
+        if str(fail_kernel_node_after.get("status") or "") != "ACTIVE":
+            return _fail("retryable terminal FAIL must leave kernel node status ACTIVE for repair work")
+        if str(dict(fail_kernel_node_after.get("runtime_state") or {}).get("attachment_state") or "") == "TERMINAL":
+            return _fail("retryable terminal FAIL must not mark kernel runtime attachment as TERMINAL")
         fail_node_snapshot_ref = fail_state_root / "state" / f"{fail_child_node.node_id}.json"
-        fail_node_snapshot = json.loads(fail_node_snapshot_ref.read_text(encoding="utf-8"))
-        if str(fail_node_snapshot.get("status") or "") != "FAILED":
-            return _fail("terminal evaluator FAIL must persist the per-node snapshot as FAILED")
-        if str(dict(fail_node_snapshot.get("runtime_state") or {}).get("attachment_state") or "") != "TERMINAL":
-            return _fail("terminal evaluator FAIL must persist terminal runtime attachment into the per-node snapshot")
+        if fail_node_snapshot_ref.exists():
+            fail_node_snapshot = json.loads(fail_node_snapshot_ref.read_text(encoding="utf-8"))
+            if str(fail_node_snapshot.get("status") or "") != "ACTIVE":
+                return _fail("retryable terminal FAIL per-node snapshot must stay ACTIVE when it exists")
+            if str(dict(fail_node_snapshot.get("runtime_state") or {}).get("attachment_state") or "") == "TERMINAL":
+                return _fail("retryable terminal FAIL must not persist terminal runtime attachment into the per-node snapshot")
 
         rogue_agent = temp_root / "task_local_eval_agent.py"
         rogue_agent.write_text("#!/usr/bin/env python3\nprint('rogue')\n", encoding="utf-8")

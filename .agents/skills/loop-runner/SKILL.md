@@ -23,9 +23,13 @@ description: Run one bounded LOOP node round using the repo-local kernel, dispat
 
 ## Responsibilities
 - Consume the current node goal slice.
-- In a fresh workspace with no deliverable yet, take one concrete workspace-local action before broad reconnaissance or extra repo scanning.
+- In a fresh workspace with no deliverable yet, take one concrete workspace-local action before broad reconnaissance or extra repo scanning, and make that action materialize at least one non-empty file under the workspace mirror or required artifact/result path.
+- Creating only an empty directory does not satisfy that startup requirement.
+- If the frozen endpoint already determines the artifact shape, a startup note or checkpoint file alone does not count as substantive startup progress; materialize the actual artifact skeleton or first substantive deliverable batch before broad theorem search or helper archaeology.
+- If the frozen goal already names staged benchmark phases or required sections, do not stop after creating a placeholder skeleton for those sections; After the skeleton exists, materially advance the first incomplete staged phase with source-backed content before broadening into later phases or open-ended reconnaissance; planned outputs, `pending` tables, TODO notes, or placeholder headings alone do not count as substantive staged progress.
 - Produce implementation progress and bounded implementation changes.
 - Call the evaluator surface after implementation work for the current round, using the documented evaluator product surface from `docs/contracts/LOOP_EVALUATOR_PROTOTYPE_PRODUCT_MANUAL.md`.
+- Before evaluator or final report, the final `deliverables/primary_artifact` must not ship runtime-owned heavy trees such as `.lake`, `.git`, `.venv`, `.uv-cache`, `build`, or `_lake_build`; if `BUILD.sh` rematerializes them locally, prune them again before treating the shipped artifact as final.
 - Use `initialize_evaluator_runtime(...)` when you need a trusted evaluator runtime bootstrap; do not call `kernel_internal_authority()` or `persist_kernel_state(...)` directly from an ordinary child context.
 - When this repo's adapter path is available, prefer `EvaluatorNodeSubmission` plus `run_evaluator_node_until_terminal(...)` instead of starting from a raw hand-written evaluator request or ad hoc rerun loop.
 - Process the evaluator return.
@@ -33,6 +37,8 @@ description: Run one bounded LOOP node round using the repo-local kernel, dispat
 - Surface `delivered_artifact_ref` in the child completion report and say whether that delivered artifact is exactly the artifact that evaluator PASS was run against.
 - If the delivered artifact changes after PASS, do not silently reuse the old PASS; rerun evaluator or surface a deterministic equality proof for the final delivered artifact.
 - Keep evaluator status and AI review status separate in your report. `AI review status` must not be used as a substitute for evaluator outcome.
+- If a startup search or MCP helper reports rate-limit, tool exhaustion, or validation failure, do not keep retrying the same search family in the opening phase; downgrade to direct artifact writing, local proof drafting, or the first build path already supported by frozen refs.
+- Do not broad-search repo roots, `.loop/**` history, or unrelated evaluator workspaces for helper or template discovery when the exact frozen refs already name the required helper or baseline artifacts.
 - Attempt evaluator before you present a terminal blocked or incomplete round result.
 - A report whose effective meaning is `request_ref: none` and `evaluation_report_ref: none` is non-terminal by default.
 - If you discover a fixable product defect before evaluator starts, treat that as more implementation work, not as a blocked outcome; repair the fixable product defect and continue until you can attempt evaluator.

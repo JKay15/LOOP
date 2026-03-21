@@ -310,6 +310,14 @@ def _submit_terminal_node_result(
     )
 
 
+def _should_submit_terminal_node_result(evaluator_result: EvaluatorResult) -> bool:
+    """Return whether evaluator closure should also close node lifecycle."""
+
+    if evaluator_result.retryable and evaluator_result.verdict is not EvaluatorVerdict.PASS:
+        return False
+    return True
+
+
 def _is_runtime_closure_only_terminal_completion(report: Mapping[str, Any]) -> bool:
     if str(report.get("status") or "").strip().upper() != "COMPLETED":
         return False
@@ -775,12 +783,13 @@ def run_evaluator_node(
                 runtime_refs=runtime_refs,
             )
         )
-        _submit_terminal_node_result(
-            state_root=state_root,
-            submission=submission,
-            evaluator_result=evaluator_result,
-            runtime_refs=runtime_refs,
-        )
+        if _should_submit_terminal_node_result(evaluator_result):
+            _submit_terminal_node_result(
+                state_root=state_root,
+                submission=submission,
+                evaluator_result=evaluator_result,
+                runtime_refs=runtime_refs,
+            )
     return evaluator_result, runtime_refs
 
 

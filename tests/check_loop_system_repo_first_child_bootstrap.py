@@ -229,7 +229,20 @@ def main() -> int:
                 "do not guess alternate repo-root or lookalike paths",
                 "fresh workspace with no deliverable or artifact yet",
                 "one concrete workspace-local action",
+                "at least one non-empty file under the workspace mirror or required artifact/result path",
+                "Creating only an empty directory does not satisfy that startup requirement",
                 "opening phase on broad repo scans",
+                "startup search or MCP helper reports rate-limit, tool exhaustion, or validation failure",
+                "do not keep retrying the same search family in the opening phase",
+                "downgrade to direct artifact writing, local proof drafting, or the first build path",
+                "If the frozen endpoint already determines the artifact shape, a startup note or checkpoint file alone does not count as substantive startup progress",
+                "Materialize the actual artifact skeleton or first substantive deliverable batch before broad theorem search or helper archaeology",
+                "If the frozen goal already names staged benchmark phases or required sections, do not stop after creating a placeholder skeleton for those sections",
+                "After the skeleton exists, materially advance the first incomplete staged phase with source-backed content before broadening into later phases or open-ended reconnaissance",
+                "planned outputs, `pending` tables, TODO notes, or placeholder headings alone do not count as substantive staged progress",
+                "Do not broad-search repo roots, `.loop/**` history, or unrelated evaluator workspaces for helper or template discovery when the exact frozen refs already name the required helper or baseline artifacts",
+                "Before evaluator or final report, the final `deliverables/primary_artifact` must not ship runtime-owned heavy trees",
+                "such as `.lake`, `.git`, `.venv`, `.uv-cache`, `build`, or `_lake_build`",
             ):
                 if needle not in prompt_text:
                     return _fail(f"child prompt must mention {needle!r}")

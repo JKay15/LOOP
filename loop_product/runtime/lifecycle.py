@@ -143,6 +143,7 @@ def supervise_child_until_settled(
     stall_threshold_s: float = 60.0,
     max_recoveries: int = 5,
     max_wall_clock_s: float = 0.0,
+    no_substantive_progress_window_s: float = 300.0,
 ) -> dict[str, Any]:
     """Public trusted surface for committed root-side child supervision."""
 
@@ -152,6 +153,7 @@ def supervise_child_until_settled(
         stall_threshold_s=stall_threshold_s,
         max_recoveries=max_recoveries,
         max_wall_clock_s=max_wall_clock_s,
+        no_substantive_progress_window_s=no_substantive_progress_window_s,
         runtime_status_reader=dispatch_child_runtime_status_from_launch_result_ref,
         recovery_runner=dispatch_recover_orphaned_active_node,
         launcher=dispatch_launch_child_from_result_ref,
@@ -314,6 +316,12 @@ def _build_parser() -> argparse.ArgumentParser:
     supervise.add_argument("--stall-threshold-s", type=float, default=60.0, help="Seconds of log silence before a live child is considered stalled")
     supervise.add_argument("--max-recoveries", type=int, default=5, help="Maximum committed recover/relaunch cycles before settling exhausted")
     supervise.add_argument("--max-wall-clock-s", type=float, default=0.0, help="Optional supervision timeout in seconds; 0 disables timeout")
+    supervise.add_argument(
+        "--no-substantive-progress-window-s",
+        type=float,
+        default=300.0,
+        help="Optional placeholder-only progress window in seconds before supervision returns a truthful no_substantive_progress stop point; 0 disables it",
+    )
     publish = subparsers.add_parser(
         "publish-external-result",
         help="Publish the exact implementer workspace artifact to its frozen external target",
@@ -383,6 +391,7 @@ def _cmd_supervise_child(args: argparse.Namespace) -> int:
         stall_threshold_s=args.stall_threshold_s,
         max_recoveries=args.max_recoveries,
         max_wall_clock_s=args.max_wall_clock_s,
+        no_substantive_progress_window_s=args.no_substantive_progress_window_s,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0

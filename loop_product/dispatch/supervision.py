@@ -7,9 +7,28 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from loop_product.dispatch.child_progress_snapshot import child_progress_snapshot_from_launch_result_ref
 from loop_product.kernel.state import load_kernel_state
 from loop_product.protocols.node import NodeSpec
 from loop_product.protocols.schema import validate_repo_object
+
+_PLACEHOLDER_DOC_BASENAMES = {
+    "readme.md",
+    "traceability.md",
+    "status.md",
+    "implementer_status.md",
+    "paper_manifest.md",
+}
+_PLACEHOLDER_LOG_MARKERS = (
+    "workspace-local artifact skeleton",
+    "no split has been proposed yet",
+    "evaluator has not been run yet",
+    "planned outputs",
+    "`pending`",
+    "pending table",
+    "todo",
+    "placeholder",
+)
 
 
 def _absolute(path: str | Path) -> Path:
@@ -126,6 +145,56 @@ def _recovery_delay_s(*, issue_kind: str, recovery_count: int) -> float:
     return 0.0
 
 
+def _progress_snapshot_fingerprint(snapshot: Mapping[str, Any]) -> str:
+    payload = {
+        "terminal_result_present": bool(snapshot.get("terminal_result_present")),
+        "implementer_result_ref": str(snapshot.get("implementer_result_ref") or ""),
+        "implementer_outcome": str(snapshot.get("implementer_outcome") or ""),
+        "implementer_verdict": str(snapshot.get("implementer_verdict") or ""),
+        "evaluator_status": str(snapshot.get("evaluator_status") or ""),
+        "evaluator_running_unit_ids": list(snapshot.get("evaluator_running_unit_ids") or []),
+        "evaluator_completed_unit_ids": list(snapshot.get("evaluator_completed_unit_ids") or []),
+        "evaluator_blocked_retryable_unit_ids": list(snapshot.get("evaluator_blocked_retryable_unit_ids") or []),
+        "evaluator_blocked_terminal_unit_ids": list(snapshot.get("evaluator_blocked_terminal_unit_ids") or []),
+        "evaluator_pending_unit_ids": list(snapshot.get("evaluator_pending_unit_ids") or []),
+        "observed_doc_refs": list(snapshot.get("observed_doc_refs") or []),
+        "observed_evaluator_doc_refs": list(snapshot.get("observed_evaluator_doc_refs") or []),
+        "recent_log_lines": list(snapshot.get("recent_log_lines") or []),
+    }
+    return json.dumps(payload, sort_keys=True)
+
+
+def _placeholder_only_progress_snapshot(snapshot: Mapping[str, Any]) -> bool:
+    if bool(snapshot.get("terminal_result_present")):
+        return False
+    if str(snapshot.get("implementer_result_ref") or "").strip():
+        return False
+    if str(snapshot.get("implementer_outcome") or "").strip():
+        return False
+    if str(snapshot.get("implementer_verdict") or "").strip():
+        return False
+    if str(snapshot.get("evaluator_status") or "").strip():
+        return False
+    for key in (
+        "evaluator_running_unit_ids",
+        "evaluator_completed_unit_ids",
+        "evaluator_blocked_retryable_unit_ids",
+        "evaluator_blocked_terminal_unit_ids",
+        "evaluator_pending_unit_ids",
+    ):
+        if list(snapshot.get(key) or []):
+            return False
+    observed_doc_refs = [str(ref or "").strip() for ref in list(snapshot.get("observed_doc_refs") or []) if str(ref or "").strip()]
+    if observed_doc_refs:
+        basenames = {Path(ref).name.lower() for ref in observed_doc_refs}
+        if any(name not in _PLACEHOLDER_DOC_BASENAMES for name in basenames):
+            return False
+    recent_lines = [str(line or "").strip().lower() for line in list(snapshot.get("recent_log_lines") or []) if str(line or "").strip()]
+    if not recent_lines:
+        return False
+    return all(any(marker in line for marker in _PLACEHOLDER_LOG_MARKERS) for line in recent_lines)
+
+
 def supervise_child_until_settled(
     *,
     launch_result_ref: str | Path,
@@ -136,12 +205,26 @@ def supervise_child_until_settled(
     runtime_status_reader: Callable[..., dict[str, Any]],
     recovery_runner: Callable[..., dict[str, Any]],
     launcher: Callable[..., dict[str, Any]],
+    progress_snapshot_reader: Callable[..., dict[str, Any]] | None = None,
+    no_substantive_progress_window_s: float = 300.0,
+    now_fn: Callable[[], float] = time.time,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
     current_launch_result_ref = _absolute(launch_result_ref)
     recoveries_used = 0
-    started_at = time.time()
+    started_at = now_fn()
     history: list[dict[str, Any]] = []
+    placeholder_progress_fingerprint = ""
+    placeholder_progress_started_at = 0.0
+    if progress_snapshot_reader is None:
+        def _default_progress_snapshot_reader(*, result_ref: str | Path, stall_threshold_s: float = 60.0) -> dict[str, Any]:
+            return child_progress_snapshot_from_launch_result_ref(
+                result_ref=result_ref,
+                stall_threshold_s=stall_threshold_s,
+                runtime_status_reader=runtime_status_reader,
+            )
+
+        progress_snapshot_reader = _default_progress_snapshot_reader
 
     while True:
         status = runtime_status_reader(
@@ -163,6 +246,47 @@ def supervise_child_until_settled(
                 "result_classification": classification,
             }
         )
+
+        if (
+            float(no_substantive_progress_window_s) > 0.0
+            and bool(status.get("pid_alive"))
+            and not bool(status.get("recovery_eligible"))
+            and classification == "MISSING"
+        ):
+            snapshot = progress_snapshot_reader(
+                result_ref=str(current_launch_result_ref),
+                stall_threshold_s=stall_threshold_s,
+            )
+            if _placeholder_only_progress_snapshot(snapshot):
+                snapshot_fingerprint = _progress_snapshot_fingerprint(snapshot)
+                observed_at = now_fn()
+                if snapshot_fingerprint != placeholder_progress_fingerprint:
+                    placeholder_progress_fingerprint = snapshot_fingerprint
+                    placeholder_progress_started_at = observed_at
+                elif (observed_at - placeholder_progress_started_at) >= float(no_substantive_progress_window_s):
+                    result = {
+                        "launch_result_ref": str(_absolute(launch_result_ref)),
+                        "latest_launch_result_ref": str(current_launch_result_ref),
+                        "node_id": node_id,
+                        "state_root": str(state_root),
+                        "workspace_root": str(status.get("workspace_root") or ""),
+                        "settled": False,
+                        "settled_reason": "no_substantive_progress",
+                        "recoveries_used": recoveries_used,
+                        "implementer_result_ref": "",
+                        "implementer_outcome": "",
+                        "evaluator_verdict": "",
+                        "status_result_ref": str(status.get("status_result_ref") or ""),
+                        "history": history,
+                    }
+                    validate_repo_object("LoopChildSupervisionResult.schema.json", result)
+                    return result
+            else:
+                placeholder_progress_fingerprint = ""
+                placeholder_progress_started_at = 0.0
+        else:
+            placeholder_progress_fingerprint = ""
+            placeholder_progress_started_at = 0.0
 
         if classification == "PASS":
             result = {
@@ -261,9 +385,11 @@ def supervise_child_until_settled(
             relaunched = launcher(result_ref=str(recovery_result["recovery_result_ref"]))
             current_launch_result_ref = _absolute(str(relaunched["launch_result_ref"]))
             recoveries_used += 1
+            placeholder_progress_fingerprint = ""
+            placeholder_progress_started_at = 0.0
             continue
 
-        if max_wall_clock_s > 0 and (time.time() - started_at) >= max_wall_clock_s:
+        if max_wall_clock_s > 0 and (now_fn() - started_at) >= max_wall_clock_s:
             result = {
                 "launch_result_ref": str(_absolute(launch_result_ref)),
                 "latest_launch_result_ref": str(current_launch_result_ref),
