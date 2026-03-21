@@ -553,8 +553,24 @@ def _split_required_outputs_persist_case() -> int:
                 return _fail("only the dependency-free required-output child should bootstrap immediately in this case")
             if bootstrap_calls[0].get("required_output_paths") != required_output_paths:
                 return _fail("split child bootstrap request must surface required_output_paths for frozen handoff generation")
-            if str(bootstrap_calls[0].get("workspace_live_artifact_relpath") or "") != ".tmp_primary_artifact":
-                return _fail("split child bootstrap request must preserve the source live artifact relpath invariant")
+            bootstrap_workspace_root = Path(str(bootstrap_calls[0].get("workspace_root") or "")).expanduser().resolve()
+            bootstrap_live_relpath = str(bootstrap_calls[0].get("workspace_live_artifact_relpath") or "")
+            bootstrap_live_root = (bootstrap_workspace_root / bootstrap_live_relpath).resolve()
+            from loop_product.runtime_paths import node_live_artifact_root
+
+            expected_live_root = node_live_artifact_root(
+                state_root=state_root,
+                node_id="child-appendix-001",
+                workspace_mirror_relpath="deliverables/primary_artifact",
+            )
+            if bootstrap_live_root != expected_live_root:
+                return _fail("split child bootstrap request must move live artifact root into runtime-owned scratch outside the workspace")
+            if expected_live_root.is_relative_to(bootstrap_workspace_root):
+                return _fail("split child live artifact root must not remain under the child workspace root")
+            expected_helper = (ROOT / "scripts" / "ensure_workspace_lake_packages.sh").resolve()
+            context_refs = {str(item) for item in list(bootstrap_calls[0].get("context_refs") or [])}
+            if str(expected_helper) not in context_refs:
+                return _fail("split child bootstrap request must inject the committed shared-cache helper into frozen context refs")
             node_graph = {item["node_id"]: item for item in authority["node_graph"]}
             if node_graph.get("child-followup-001", {}).get("status") != "PLANNED":
                 return _fail("dependency-bound follower child must remain PLANNED in required-output persistence case")
@@ -578,6 +594,7 @@ def _authoritative_child_result_sync_case() -> int:
     from loop_product.kernel.query import query_authority_view
     from loop_product.kernel.state import load_kernel_state
     from loop_product.protocols.node import NodeStatus
+    from loop_product.runtime_paths import node_live_artifact_root
 
     with tempfile.TemporaryDirectory(prefix="loop_system_split_authority_result_sync_") as td:
         state_root = Path(td) / ".loop"
@@ -713,6 +730,89 @@ def _authoritative_child_result_sync_case() -> int:
         if gated_graph.get("child-publication-gated-001", {}).get("status") != NodeStatus.BLOCKED.value:
             return _fail("authoritative child result sync must terminalize the child once a matching publication receipt exists")
         shutil.rmtree(gated_workspace_root, ignore_errors=True)
+
+        external_live_workspace_root = ROOT / "workspace" / "test-child-external-live-gate-sync"
+        shutil.rmtree(external_live_workspace_root, ignore_errors=True)
+        materialize_child(
+            state_root=state_root,
+            kernel_state=load_kernel_state(state_root),
+            parent_node_id="child-implementer-001",
+            node_id="child-external-live-gated-001",
+            goal_slice="formalize a branch only after external live-root hygiene stays clean",
+            round_id="R1.child-external-live-gated-001",
+            execution_policy={"sandbox_mode": "workspace-write", "agent_provider": "codex_cli"},
+            reasoning_profile={"thinking_budget": "medium", "role": "implementer"},
+            budget_profile={"max_rounds": 1},
+            allowed_actions=["implement", "report"],
+            workspace_root=str(external_live_workspace_root.resolve()),
+            codex_home="",
+            depends_on_node_ids=[],
+            activation_condition="",
+            result_sink_ref="artifacts/child-external-live-gated-001/result.json",
+            lineage_ref="root-kernel->child-implementer-001->child-external-live-gated-001",
+            authority=authority,
+        )
+        external_live_root = node_live_artifact_root(
+            state_root=state_root,
+            node_id="child-external-live-gated-001",
+            workspace_mirror_relpath="deliverables/primary_artifact",
+        )
+        external_publish_root = external_live_workspace_root / "deliverables" / "primary_artifact"
+        external_receipt_ref = state_root / "artifacts" / "publication" / "child-external-live-gated-001" / "WorkspaceArtifactPublicationReceipt.json"
+        external_live_root.mkdir(parents=True, exist_ok=True)
+        (external_live_root / "README.md").write_text("# clean external live root\n", encoding="utf-8")
+        (external_live_workspace_root / ".tmp_primary_artifact" / ".lake" / "packages" / "mathlib").mkdir(parents=True, exist_ok=True)
+        (external_live_workspace_root / ".tmp_primary_artifact" / ".lake" / "packages" / "mathlib" / "dummy.txt").write_text(
+            "bad-local-cache\n",
+            encoding="utf-8",
+        )
+        (external_live_workspace_root / "FROZEN_HANDOFF.json").write_text(
+            json.dumps(
+                {
+                    "node_id": "child-external-live-gated-001",
+                    "workspace_live_artifact_ref": str(external_live_root.resolve()),
+                    "workspace_mirror_ref": str(external_publish_root.resolve()),
+                    "artifact_publication_receipt_ref": str(external_receipt_ref.resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        external_result_ref = state_root / "artifacts" / "child-external-live-gated-001" / "result.json"
+        external_result_ref.parent.mkdir(parents=True, exist_ok=True)
+        external_result_ref.write_text(
+            json.dumps(
+                {
+                    "schema": "loop_product.child_result",
+                    "node_id": "child-external-live-gated-001",
+                    "status": "BLOCKED",
+                    "outcome": "BLOCKED",
+                    "summary": "branch is blocked until external-live-root hygiene is restored",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        publish_workspace_artifact_snapshot(
+            node_id="child-external-live-gated-001",
+            live_artifact_ref=external_live_root,
+            publish_artifact_ref=external_publish_root,
+            publication_receipt_ref=external_receipt_ref,
+        )
+        external_authority_view = query_authority_view(state_root)
+        external_graph = {item["node_id"]: item for item in external_authority_view["node_graph"]}
+        if external_graph.get("child-external-live-gated-001", {}).get("status") != NodeStatus.ACTIVE.value:
+            return _fail("authoritative child result sync must refuse terminalization while local workspace heavy trees remain under external-live-root mode")
+        shutil.rmtree(external_live_workspace_root / ".tmp_primary_artifact", ignore_errors=True)
+        external_authority_view = query_authority_view(state_root)
+        external_graph = {item["node_id"]: item for item in external_authority_view["node_graph"]}
+        if external_graph.get("child-external-live-gated-001", {}).get("status") != NodeStatus.BLOCKED.value:
+            return _fail("authoritative child result sync must terminalize once the external-live-root workspace pollution is cleared")
+        shutil.rmtree(external_live_workspace_root, ignore_errors=True)
 
     return 0
 

@@ -87,3 +87,18 @@ def require_runtime_root(state_root: Path) -> Path:
     if ".loop" not in root.resolve().parts:
         raise ValueError(f"runtime state_root must resolve under a .loop boundary: {root}")
     return root
+
+
+def node_live_artifact_root(*, state_root: Path, node_id: str, workspace_mirror_relpath: str) -> Path:
+    """Return a runtime-owned live artifact scratch root for one node.
+
+    This root intentionally lives under the durable state tree instead of the
+    workspace so local package/build hydration does not contaminate the
+    implementer workspace or shipped publish root.
+    """
+
+    runtime_root = require_runtime_root(state_root).resolve()
+    safe_node_id = _safe_workspace_name(node_id)
+    publish_path = Path(str(workspace_mirror_relpath or "").strip() or "deliverables/primary_artifact")
+    leaf_name = publish_path.name or "primary_artifact"
+    return (runtime_root / "artifacts" / "live_artifacts" / safe_node_id / leaf_name).resolve()

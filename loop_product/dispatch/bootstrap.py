@@ -353,6 +353,7 @@ def _render_child_prompt(
             "Do not broad-search repo roots, `.loop/**` history, or unrelated evaluator workspaces for helper or template discovery when the exact frozen refs already name the required helper or baseline artifacts.",
             "If you create or ship a fresh workspace-local Lean package, use any committed shared-cache helper named in the frozen handoff context refs before the first `lake build`.",
             "Run Lean/package tooling only inside the exact live artifact root named below; do not hydrate package trees or build outputs inside the publish root.",
+            "If the exact live artifact root named below is outside the workspace root, do not recreate a local `.tmp_primary_artifact`, root-level `.lake`, or other runtime-owned heavy tree inside the workspace; that is a runtime defect, not an acceptable fallback.",
             "Do not treat live `git clone`, `lake update`, or `lake exe cache get` as the normal first path for artifact-local `.lake/packages`; that path is fallback repair and must be reported as an environment defect.",
             "Before evaluator or final report, the final `deliverables/primary_artifact` must not ship runtime-owned heavy trees such as `.lake`, `.git`, `.venv`, `.uv-cache`, `build`, or `_lake_build`.",
             "If local build support rematerializes those trees inside the publish root, treat that as a runtime defect and republish from the live root instead of hand-waving it away.",

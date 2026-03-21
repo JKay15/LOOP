@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,7 @@ from loop_product.protocols.control_envelope import ControlEnvelope
 from loop_product.protocols.node import NodeStatus, RuntimeAttachmentState, normalize_runtime_state
 from loop_product.protocols.topology import TopologyMutation
 from loop_product.runtime.recover import apply_accepted_recovery_mutation, review_recovery_request
-from loop_product.runtime_paths import require_runtime_root
+from loop_product.runtime_paths import node_live_artifact_root, product_repo_root, require_runtime_root
 from loop_product.topology.activate import review_activate_request
 from loop_product.topology.merge import review_merge_request
 from loop_product.topology.prune import review_reap_request
@@ -60,6 +61,8 @@ def _child_bootstrap_request_from_source_handoff(
     handoff_md_ref = handoff_ref.with_suffix(".md")
     if handoff_md_ref.exists():
         inherited_context_refs.append(str(handoff_md_ref.resolve()))
+    shared_cache_helper = (product_repo_root().resolve() / "scripts" / "ensure_workspace_lake_packages.sh").resolve()
+    inherited_context_refs.append(str(shared_cache_helper))
     deduped_context_refs: list[str] = []
     seen_context_refs: set[str] = set()
     for raw_ref in inherited_context_refs:
@@ -68,6 +71,14 @@ def _child_bootstrap_request_from_source_handoff(
             continue
         seen_context_refs.add(normalized_ref)
         deduped_context_refs.append(normalized_ref)
+    workspace_root_path = Path(workspace_root).expanduser().resolve()
+    workspace_mirror_relpath = str(handoff.get("workspace_mirror_relpath") or "deliverables/primary_artifact")
+    external_live_root = node_live_artifact_root(
+        state_root=state_root,
+        node_id=node_id,
+        workspace_mirror_relpath=workspace_mirror_relpath,
+    )
+    workspace_live_artifact_relpath = os.path.relpath(external_live_root, start=workspace_root_path)
     return {
         "mode": "continue_exact",
         "state_root": str(state_root.resolve()),
@@ -77,8 +88,8 @@ def _child_bootstrap_request_from_source_handoff(
         "root_goal": root_goal,
         "child_goal_slice": goal_slice,
         "endpoint_artifact_ref": endpoint_artifact_ref,
-        "workspace_mirror_relpath": str(handoff.get("workspace_mirror_relpath") or "deliverables/primary_artifact"),
-        "workspace_live_artifact_relpath": str(handoff.get("workspace_live_artifact_relpath") or ".tmp_primary_artifact"),
+        "workspace_mirror_relpath": workspace_mirror_relpath,
+        "workspace_live_artifact_relpath": workspace_live_artifact_relpath,
         "external_publish_target": str(handoff.get("external_publish_target") or ""),
         "required_output_paths": [str(item).strip() for item in list(child_record.get("required_output_paths") or []) if str(item).strip()],
         "context_refs": deduped_context_refs,

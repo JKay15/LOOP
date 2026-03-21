@@ -16,7 +16,9 @@ from typing import Any, Mapping
 from loop_product.artifact_hygiene import canonicalize_workspace_artifact_heavy_trees
 from loop_product.dispatch.publication import (
     inspect_workspace_publication_state,
+    inspect_workspace_local_runtime_state,
     reset_workspace_publish_root,
+    reset_workspace_local_runtime_heavy_roots,
 )
 from loop_product.ai_launch import (
     ai_launch_exit_code,
@@ -144,14 +146,27 @@ def _load_terminal_implementer_result(*, state_root: Path, node_id: str, node_pa
 
 def _live_workspace_artifact_hygiene_sync(*, workspace_root: Path | None) -> dict[str, Any]:
     if workspace_root is None:
-        return {"removed_refs": [], "publication_state": {"applicable": False, "violation": False}}
+        return {
+            "removed_refs": [],
+            "publication_state": {"applicable": False, "violation": False},
+            "local_runtime_state": {"applicable": False, "violation": False},
+        }
     try:
         candidate = workspace_root.expanduser().resolve()
     except Exception:
-        return {"removed_refs": [], "publication_state": {"applicable": False, "violation": False}}
+        return {
+            "removed_refs": [],
+            "publication_state": {"applicable": False, "violation": False},
+            "local_runtime_state": {"applicable": False, "violation": False},
+        }
     if not candidate.exists() or not candidate.is_dir():
-        return {"removed_refs": [], "publication_state": {"applicable": False, "violation": False}}
+        return {
+            "removed_refs": [],
+            "publication_state": {"applicable": False, "violation": False},
+            "local_runtime_state": {"applicable": False, "violation": False},
+        }
     publication_state = inspect_workspace_publication_state(workspace_root=candidate)
+    local_runtime_state = inspect_workspace_local_runtime_state(workspace_root=candidate)
     excluded_roots: list[Path] = []
     publish_ref = str(publication_state.get("publish_artifact_ref") or "").strip()
     if publish_ref:
@@ -160,6 +175,7 @@ def _live_workspace_artifact_hygiene_sync(*, workspace_root: Path | None) -> dic
     return {
         "removed_refs": removed_refs,
         "publication_state": publication_state,
+        "local_runtime_state": local_runtime_state,
     }
 
 
@@ -680,10 +696,14 @@ def _direct_child_runtime_status_from_launch_result_ref(
     runtime_summary = str(runtime_state.get("summary") or "")
     runtime_evidence_refs = list(runtime_state.get("evidence_refs") or [])
     publication_state = dict(hygiene_state.get("publication_state") or {})
+    local_runtime_state = dict(hygiene_state.get("local_runtime_state") or {})
     publish_root_violation = bool(publication_state.get("violation"))
+    local_workspace_violation = bool(local_runtime_state.get("violation"))
     if publish_root_violation:
         reset_workspace_publish_root(workspace_root=workspace_root)
-    if publish_root_violation and pid_alive:
+    if local_workspace_violation:
+        reset_workspace_local_runtime_heavy_roots(workspace_root=workspace_root)
+    if (publish_root_violation or local_workspace_violation) and pid_alive:
         _reap_runtime_owned_launch(launch_result)
         pid_alive = pid > 0 and _pid_alive(pid)
 
@@ -713,6 +733,24 @@ def _direct_child_runtime_status_from_launch_result_ref(
         stalled_hint = False
         recovery_eligible = True
         recovery_reason = str(publication_state.get("violation_reason") or "publish_root_violation")
+    elif local_workspace_violation:
+        lifecycle_status = lifecycle_status or "ACTIVE"
+        runtime_attachment_state = "LOST"
+        runtime_observed_at = _utc_timestamp()
+        runtime_observation_kind = "workspace_runtime_hygiene_violation"
+        runtime_summary = str(
+            local_runtime_state.get("violation_summary")
+            or "workspace-local runtime heavy trees appeared despite an external live artifact root"
+        )
+        runtime_evidence_refs = [
+            *[str(item) for item in list(local_runtime_state.get("workspace_runtime_heavy_root_refs") or [])],
+            *runtime_evidence_refs,
+        ]
+        stalled_hint = False
+        recovery_eligible = True
+        recovery_reason = str(
+            local_runtime_state.get("violation_reason") or "workspace_contains_local_runtime_heavy_trees"
+        )
     else:
         lifecycle_active_like = lifecycle_status in {"", "ACTIVE"}
         runtime_loss_confirmed = bool(

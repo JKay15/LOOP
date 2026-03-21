@@ -35,6 +35,7 @@ def main() -> int:
         persist_node_snapshot,
     )
     from loop_product.protocols.node import NodeSpec, NodeStatus
+    from loop_product.runtime_paths import node_live_artifact_root
 
     with tempfile.TemporaryDirectory(prefix="loop_product_process_hygiene_") as td:
         temp_root = Path(td)
@@ -430,6 +431,147 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 live_proc.kill()
                 live_proc.wait(timeout=5.0)
+
+        external_live_workspace_root = workspace_root / "child-external-live-hygiene-001"
+        external_live_publish_root = external_live_workspace_root / "deliverables" / "primary_artifact"
+        external_live_root = node_live_artifact_root(
+            state_root=state_root,
+            node_id="child-external-live-hygiene-001",
+            workspace_mirror_relpath="deliverables/primary_artifact",
+        )
+        external_live_receipt_ref = (
+            state_root / "artifacts" / "publication" / "child-external-live-hygiene-001" / "WorkspaceArtifactPublicationReceipt.json"
+        )
+        external_live_workspace_root.mkdir(parents=True, exist_ok=True)
+        external_live_root.mkdir(parents=True, exist_ok=True)
+        (external_live_root / "README.md").write_text("# external live root\n", encoding="utf-8")
+        (external_live_workspace_root / "FROZEN_HANDOFF.json").write_text(
+            json.dumps(
+                {
+                    "node_id": "child-external-live-hygiene-001",
+                    "workspace_live_artifact_ref": str(external_live_root.resolve()),
+                    "workspace_mirror_ref": str(external_live_publish_root.resolve()),
+                    "artifact_publication_receipt_ref": str(external_live_receipt_ref.resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (external_live_workspace_root / ".tmp_primary_artifact" / ".lake" / "packages" / "mathlib").mkdir(parents=True, exist_ok=True)
+        (external_live_workspace_root / ".tmp_primary_artifact" / ".lake" / "packages" / "mathlib" / "dummy.txt").write_text(
+            "bad-local-cache\n",
+            encoding="utf-8",
+        )
+        (external_live_workspace_root / ".tmp_primary_artifact" / "build" / "lib").mkdir(parents=True, exist_ok=True)
+        (external_live_workspace_root / ".tmp_primary_artifact" / "build" / "lib" / "artifact.txt").write_text(
+            "bad-local-build\n",
+            encoding="utf-8",
+        )
+        external_live_node = NodeSpec(
+            node_id="child-external-live-hygiene-001",
+            node_kind="implementer",
+            goal_slice="workspace-local heavy trees must fail closed when live root is external",
+            parent_node_id="root-kernel",
+            generation=1,
+            round_id="R1.external",
+            execution_policy={"sandbox_mode": "workspace-write"},
+            reasoning_profile={"thinking_budget": "high", "role": "implementer"},
+            budget_profile={"max_rounds": 2},
+            allowed_actions=["implement", "report"],
+            workspace_root=str(external_live_workspace_root.resolve()),
+            delegation_ref="state/delegations/child-external-live-hygiene-001.json",
+            result_sink_ref="artifacts/child-external-live-hygiene-001/result.json",
+            lineage_ref="root-kernel->child-external-live-hygiene-001",
+            status=NodeStatus.ACTIVE,
+        )
+        external_live_kernel_state = load_kernel_state(state_root)
+        external_live_kernel_state.register_node(external_live_node)
+        persist_kernel_state(state_root, external_live_kernel_state, authority=kernel_internal_authority())
+        persist_node_snapshot(
+            state_root,
+            external_live_kernel_state.nodes[external_live_node.node_id],
+            authority=kernel_internal_authority(),
+        )
+        external_stdout_ref = (
+            state_root / "artifacts" / "launches" / external_live_node.node_id / "attempt_001" / "logs" / "child.stdout.txt"
+        )
+        external_stderr_ref = (
+            state_root / "artifacts" / "launches" / external_live_node.node_id / "attempt_001" / "logs" / "child.stderr.txt"
+        )
+        external_launch_result_ref = (
+            state_root / "artifacts" / "launches" / external_live_node.node_id / "attempt_001" / "ChildLaunchResult.json"
+        )
+        external_stdout_ref.parent.mkdir(parents=True, exist_ok=True)
+        external_stdout_ref.write_text("writing calibration branch package\n", encoding="utf-8")
+        external_stderr_ref.write_text("", encoding="utf-8")
+        external_proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            cwd=str(ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            external_launch_result_ref.write_text(
+                json.dumps(
+                    {
+                        "launch_decision": "started",
+                        "source_result_ref": str((state_root / "artifacts" / "bootstrap" / "FirstImplementerBootstrapResult.json").resolve()),
+                        "node_id": external_live_node.node_id,
+                        "workspace_root": str(external_live_workspace_root.resolve()),
+                        "state_root": str(state_root.resolve()),
+                        "startup_health_timeout_ms": 250,
+                        "startup_retry_limit": 0,
+                        "attempt_count": 1,
+                        "retryable_failure_kind": "",
+                        "attempts": [],
+                        "launch_request_ref": str((external_launch_result_ref.parent / "ChildLaunchRequest.json").resolve()),
+                        "launch_result_ref": str(external_launch_result_ref.resolve()),
+                        "launch_log_dir": str(external_stdout_ref.parent.resolve()),
+                        "stdout_ref": str(external_stdout_ref.resolve()),
+                        "stderr_ref": str(external_stderr_ref.resolve()),
+                        "stdin_ref": str((external_live_workspace_root / "CHILD_PROMPT.md").resolve()),
+                        "wrapped_argv": [sys.executable, "-c", "import time; time.sleep(60)"],
+                        "wrapper_cmd": "",
+                        "pid": int(external_proc.pid),
+                        "exit_code": None,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            previous_runtime_status_mode = os.environ.get("LOOP_CHILD_RUNTIME_STATUS_MODE")
+            os.environ["LOOP_CHILD_RUNTIME_STATUS_MODE"] = "direct"
+            try:
+                external_status_payload = launch_runtime_module.child_runtime_status_from_launch_result_ref(
+                    result_ref=external_launch_result_ref,
+                    stall_threshold_s=60.0,
+                )
+            finally:
+                if previous_runtime_status_mode is None:
+                    os.environ.pop("LOOP_CHILD_RUNTIME_STATUS_MODE", None)
+                else:
+                    os.environ["LOOP_CHILD_RUNTIME_STATUS_MODE"] = previous_runtime_status_mode
+            if str(external_status_payload.get("recovery_reason") or "") != "workspace_contains_local_runtime_heavy_trees":
+                return _fail("external-live-root workspace pollution must surface workspace_contains_local_runtime_heavy_trees")
+            if not bool(external_status_payload.get("recovery_eligible")):
+                return _fail("external-live-root workspace pollution must become recovery-eligible")
+            if bool(external_status_payload.get("pid_alive")):
+                return _fail("runtime status polling must terminate the live child before surfacing external-live-root workspace pollution")
+            if (external_live_workspace_root / ".tmp_primary_artifact").exists():
+                return _fail("runtime status polling must scrub invalid local .tmp_primary_artifact trees when live root is external")
+            if not external_live_root.exists():
+                return _fail("runtime status polling must preserve the external live artifact root while scrubbing invalid workspace-local trees")
+        finally:
+            external_proc.terminate()
+            try:
+                external_proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                external_proc.kill()
+                external_proc.wait(timeout=5.0)
 
     print("[loop-system-process-hygiene] OK")
     return 0

@@ -99,6 +99,7 @@ The `kernel` is the root supervisory authority for the complete LOOP repo. It ow
 - committed authority/status query surfaces must also reconcile authoritative non-evaluator child result sinks back into `kernel_state.json` and `.loop/state/<node>.json`; a child that already wrote a kernel-visible blocked/completed result must not remain falsely `ACTIVE` in the authoritative graph
 - when an authoritative child result records an accepted deferred split, kernel-owned continuation should be able to normalize the completed source segment and submit ready activate proposals for the planned children so deferred continuation does not stall at `PLANNED` forever
 - kernel-owned continuation should also auto-activate any already-materialized `PLANNED` child once its declared dependency set becomes terminal-ready, even when that child originally came from a mixed parallel split rather than a pure deferred split
+- split-child bootstrap may redirect the child live build root into a runtime-owned scratch path under `.loop/...` while preserving the child workspace as the durable publish/context surface; child handoff and prompt must surface that exact external live root explicitly
 - terminal-ready dependency continuation must be outcome-aware: blocked nodes only count as dependency-ready when their authoritative result closes to a consumable terminal outcome such as `PAPER_DEFECT_EXPOSED` or `EXTERNAL_DEPENDENCY_BLOCKED`, not when they merely remain `BLOCKED`
 - `query_kernel_state(...)` must expose:
   - active node graph

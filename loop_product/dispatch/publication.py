@@ -14,6 +14,7 @@ from typing import Any, Mapping
 from loop_product.artifact_hygiene import (
     artifact_fingerprint,
     canonicalize_directory_artifact_heavy_trees,
+    iter_workspace_artifact_roots,
     iter_runtime_heavy_tree_paths,
 )
 from loop_product.protocols.schema import validate_repo_object
@@ -117,6 +118,88 @@ def _load_workspace_publication_context(workspace_root: Path) -> dict[str, Any]:
     }
 
 
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _workspace_local_runtime_heavy_roots(*, workspace_root: Path, publish_path: Path, live_path: Path) -> list[Path]:
+    workspace_root = workspace_root.resolve()
+    publish_path = publish_path.resolve()
+    live_path = live_path.resolve()
+    if _is_relative_to(live_path, workspace_root):
+        return []
+
+    candidates: list[Path] = []
+    for child in workspace_root.iterdir() if workspace_root.exists() else []:
+        if child.name.startswith(".tmp_primary_artifact"):
+            candidates.append(child.resolve())
+
+    for heavy_name in (".lake", ".git", ".venv", ".uv-cache", "build", "_lake_build"):
+        candidate = (workspace_root / heavy_name).resolve()
+        if candidate.exists():
+            candidates.append(candidate)
+
+    for artifact_root in iter_workspace_artifact_roots(workspace_root):
+        artifact_root = artifact_root.resolve()
+        if artifact_root == publish_path:
+            continue
+        if any(iter_runtime_heavy_tree_paths(artifact_root)):
+            candidates.append(artifact_root)
+
+    return sorted({path for path in candidates if path.exists()}, key=lambda item: (len(item.parts), str(item)))
+
+
+def inspect_workspace_local_runtime_state(*, workspace_root: str | Path) -> dict[str, Any]:
+    """Describe whether a workspace-local node leaked runtime-owned heavy trees into the workspace.
+
+    When the exact live artifact root is external to the workspace, any local
+    `.tmp_primary_artifact*` tree or root-level runtime heavy directory under
+    the workspace becomes a product defect rather than an acceptable scratch
+    surface.
+    """
+
+    workspace_path = _absolute(workspace_root)
+    context = _load_workspace_publication_context(workspace_path)
+    if not bool(context.get("applicable")):
+        return {
+            **context,
+            "live_artifact_root_is_external": False,
+            "violation": False,
+            "violation_reason": "",
+            "violation_summary": "",
+            "workspace_runtime_heavy_root_refs": [],
+        }
+
+    publish_path = Path(context["publish_path"]).resolve()
+    live_path = Path(context["live_path"]).resolve()
+    local_heavy_roots = _workspace_local_runtime_heavy_roots(
+        workspace_root=workspace_path,
+        publish_path=publish_path,
+        live_path=live_path,
+    )
+    live_external = not _is_relative_to(live_path, workspace_path)
+    violation_reason = ""
+    violation_summary = ""
+    if live_external and local_heavy_roots:
+        violation_reason = "workspace_contains_local_runtime_heavy_trees"
+        violation_summary = (
+            "workspace-local runtime heavy trees appeared even though the frozen live artifact root is external; "
+            "split-child publication/build roots are mixed again"
+        )
+    return {
+        **{k: v for k, v in context.items() if not k.endswith("_path")},
+        "live_artifact_root_is_external": live_external,
+        "violation": bool(violation_reason),
+        "violation_reason": violation_reason,
+        "violation_summary": violation_summary,
+        "workspace_runtime_heavy_root_refs": [str(item) for item in local_heavy_roots],
+    }
+
+
 def inspect_workspace_publication_state(*, workspace_root: str | Path) -> dict[str, Any]:
     """Describe whether a workspace-local publish root has been mutated outside publication."""
 
@@ -198,9 +281,14 @@ def workspace_publication_ready_for_terminal_state(
     """Return whether a workspace-local node may sync a terminal authoritative result."""
 
     report = inspect_workspace_publication_state(workspace_root=workspace_root)
+    local_runtime_report = inspect_workspace_local_runtime_state(workspace_root=workspace_root)
     if not bool(report.get("applicable")):
         return {
             **report,
+            "local_runtime_violation": False,
+            "local_runtime_violation_reason": "",
+            "local_runtime_violation_summary": "",
+            "workspace_runtime_heavy_root_refs": [],
             "ready": True,
             "ready_reason": "",
             "ready_summary": "",
@@ -211,6 +299,17 @@ def workspace_publication_ready_for_terminal_state(
             "ready": False,
             "ready_reason": str(report.get("violation_reason") or ""),
             "ready_summary": str(report.get("violation_summary") or ""),
+        }
+    if bool(local_runtime_report.get("violation")):
+        return {
+            **report,
+            "local_runtime_violation": True,
+            "local_runtime_violation_reason": str(local_runtime_report.get("violation_reason") or ""),
+            "local_runtime_violation_summary": str(local_runtime_report.get("violation_summary") or ""),
+            "workspace_runtime_heavy_root_refs": list(local_runtime_report.get("workspace_runtime_heavy_root_refs") or []),
+            "ready": False,
+            "ready_reason": str(local_runtime_report.get("violation_reason") or ""),
+            "ready_summary": str(local_runtime_report.get("violation_summary") or ""),
         }
 
     receipt_path = _absolute(str(report.get("publication_receipt_ref") or ""))
@@ -273,6 +372,10 @@ def workspace_publication_ready_for_terminal_state(
 
     return {
         **report,
+        "local_runtime_violation": False,
+        "local_runtime_violation_reason": "",
+        "local_runtime_violation_summary": "",
+        "workspace_runtime_heavy_root_refs": list(local_runtime_report.get("workspace_runtime_heavy_root_refs") or []),
         "ready": True,
         "ready_reason": "",
         "ready_summary": "",
@@ -296,6 +399,27 @@ def reset_workspace_publish_root(*, workspace_root: str | Path) -> dict[str, Any
     return {
         **report,
         "removed_publish_root": removed_publish_root,
+    }
+
+
+def reset_workspace_local_runtime_heavy_roots(*, workspace_root: str | Path) -> dict[str, Any]:
+    """Remove invalid workspace-local heavy trees when the frozen live root is external."""
+
+    report = inspect_workspace_local_runtime_state(workspace_root=workspace_root)
+    removed_roots: list[str] = []
+    if bool(report.get("live_artifact_root_is_external")):
+        for root_ref in list(report.get("workspace_runtime_heavy_root_refs") or []):
+            candidate = _absolute(str(root_ref))
+            if not candidate.exists():
+                continue
+            if candidate.is_dir():
+                shutil.rmtree(candidate)
+            else:
+                candidate.unlink()
+            removed_roots.append(str(candidate))
+    return {
+        **report,
+        "removed_workspace_runtime_heavy_root_refs": removed_roots,
     }
 
 
