@@ -673,6 +673,31 @@ def main() -> int:
             launch_runtime_module.start_ai_launch = original_start_ai_launch
             launch_runtime_module._observe_startup_health = original_observe_startup_health
             launch_runtime_module.detach_ai_launch_handle = original_detach_ai_launch_handle
+        terminate_result_ref = state_root / "artifacts" / "bootstrap" / "TerminateLaunchResult.json"
+        terminate_result_ref.write_text(
+            json.dumps(
+                {
+                    "launch_result_ref": str(terminate_result_ref.resolve()),
+                    "node_id": "test-child-launch-helper",
+                    "workspace_root": str(workspace_root.resolve()),
+                    "state_root": str(state_root.resolve()),
+                    "pid": 424242,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        terminated_pids: list[int] = []
+        original_terminate_pid = launch_runtime_module._terminate_pid
+        try:
+            launch_runtime_module._terminate_pid = lambda pid, grace_s=5.0: terminated_pids.append(int(pid))
+            launch_runtime_module.terminate_runtime_owned_launch_result_ref(result_ref=terminate_result_ref)
+        finally:
+            launch_runtime_module._terminate_pid = original_terminate_pid
+        if terminated_pids != [424242]:
+            return _fail("runtime-owned launch terminator must terminate the recorded pid without crashing")
         try:
             os.kill(live_pid, signal.SIGTERM)
         except ProcessLookupError:

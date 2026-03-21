@@ -60,6 +60,13 @@ def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _load_optional_json(path: Path) -> dict[str, Any]:
+    try:
+        return _load_json(path)
+    except Exception:
+        return {}
+
+
 def _authoritative_result_ref(*, state_root: Path, node_id: str, node_payload: dict[str, Any]) -> Path:
     sink = str(node_payload.get("result_sink_ref") or "").strip()
     if not sink:
