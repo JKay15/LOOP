@@ -79,6 +79,7 @@ def _child_bootstrap_request_from_source_handoff(
         "endpoint_artifact_ref": endpoint_artifact_ref,
         "workspace_mirror_relpath": str(handoff.get("workspace_mirror_relpath") or "deliverables/primary_artifact"),
         "external_publish_target": str(handoff.get("external_publish_target") or ""),
+        "required_output_paths": [str(item).strip() for item in list(child_record.get("required_output_paths") or []) if str(item).strip()],
         "context_refs": deduped_context_refs,
         "result_sink_ref": result_sink_ref,
     }
@@ -315,6 +316,7 @@ def apply_accepted_topology_mutation(
             node_kind=str(target.get("node_kind") or "implementer"),
             generation=int(target.get("generation") or int(source_record.get("generation") or 0) + 1),
             allowed_actions=list(target.get("allowed_actions") or []),
+            required_output_paths=list(target.get("required_output_paths") or []),
             workspace_root=str(target.get("workspace_root") or ""),
             codex_home=str(target.get("codex_home") or ""),
             depends_on_node_ids=list(target.get("depends_on_node_ids") or []),

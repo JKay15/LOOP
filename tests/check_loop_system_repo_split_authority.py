@@ -460,6 +460,105 @@ def _parallel_split_with_dependency_bound_child_case() -> int:
     return 0
 
 
+def _split_required_outputs_persist_case() -> int:
+    import loop_product.kernel.topology as topology_module
+
+    from loop_product.kernel.query import query_authority_view
+    from loop_product.kernel.submit import submit_topology_mutation
+    from loop_product.protocols.control_envelope import EnvelopeStatus
+    from loop_product.topology.split_review import build_split_request
+
+    with tempfile.TemporaryDirectory(prefix="loop_system_split_required_outputs_") as td:
+        state_root = Path(td) / ".loop"
+        _persist_base_state(state_root)
+        source_node = _base_source_node()
+        bootstrap_calls: list[dict[str, object]] = []
+        launch_calls: list[dict[str, object]] = []
+        original_bootstrap = getattr(topology_module, "bootstrap_first_implementer_node", None)
+        original_launch = getattr(topology_module, "launch_child_from_result_ref", None)
+
+        def _fake_bootstrap(**kwargs):
+            bootstrap_calls.append(dict(kwargs))
+            bootstrap_ref = state_root / "artifacts" / "bootstrap" / f"{kwargs['node_id']}__bootstrap.json"
+            bootstrap_ref.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "bootstrap_result_ref": str(bootstrap_ref.resolve()),
+                "node_id": kwargs["node_id"],
+                "state_root": str(state_root.resolve()),
+                "workspace_root": str(kwargs["workspace_root"]),
+            }
+            bootstrap_ref.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            return payload
+
+        def _fake_launch_child_from_result_ref(**kwargs):
+            launch_calls.append(dict(kwargs))
+            return {"launch_decision": "test-only", "source_result_ref": str(kwargs.get("result_ref") or "")}
+
+        topology_module.bootstrap_first_implementer_node = _fake_bootstrap
+        topology_module.launch_child_from_result_ref = _fake_launch_child_from_result_ref
+        required_output_paths = [
+            "formalization/appendix_claim_inventory.json",
+            "formalization/appendix_claims.lean",
+            "PARTITION/external_dependency_candidates.json",
+            "WHOLE_PAPER_STATUS.json",
+        ]
+        mutation = build_split_request(
+            source_node=source_node,
+            target_nodes=[
+                {
+                    "node_id": "child-appendix-001",
+                    "goal_slice": "formalize appendix support claims and close named external dependencies",
+                    "required_output_paths": required_output_paths,
+                },
+                {
+                    "node_id": "child-followup-001",
+                    "goal_slice": "continue after appendix block is complete",
+                    "depends_on_node_ids": ["child-appendix-001"],
+                },
+            ],
+            split_mode="parallel",
+            reason="preserve required outputs from split proposal into durable child state",
+        )
+        envelope = submit_topology_mutation(
+            state_root,
+            mutation,
+            round_id=source_node.round_id,
+            generation=source_node.generation,
+        )
+        try:
+            if envelope.status is not EnvelopeStatus.ACCEPTED:
+                return _fail(f"split required-output persistence case must be accepted, got {envelope.status.value!r}")
+            authority = query_authority_view(state_root)
+            appendix_state_path = state_root / "state" / "child-appendix-001.json"
+            appendix_delegation_path = state_root / "state" / "delegations" / "child-appendix-001.json"
+            if not appendix_state_path.exists() or not appendix_delegation_path.exists():
+                return _fail("accepted split must persist child node/delegation snapshots before checking required outputs")
+            appendix_state = json.loads(appendix_state_path.read_text(encoding="utf-8"))
+            appendix_delegation = json.loads(appendix_delegation_path.read_text(encoding="utf-8"))
+            if appendix_state.get("required_output_paths") != required_output_paths:
+                return _fail("accepted split child node state must preserve required_output_paths from the reviewed target payload")
+            if appendix_delegation.get("required_output_paths") != required_output_paths:
+                return _fail("accepted split child delegation must preserve required_output_paths from the reviewed target payload")
+            if len(bootstrap_calls) != 1 or len(launch_calls) != 1:
+                return _fail("only the dependency-free required-output child should bootstrap immediately in this case")
+            if bootstrap_calls[0].get("required_output_paths") != required_output_paths:
+                return _fail("split child bootstrap request must surface required_output_paths for frozen handoff generation")
+            node_graph = {item["node_id"]: item for item in authority["node_graph"]}
+            if node_graph.get("child-followup-001", {}).get("status") != "PLANNED":
+                return _fail("dependency-bound follower child must remain PLANNED in required-output persistence case")
+        finally:
+            if original_bootstrap is not None:
+                topology_module.bootstrap_first_implementer_node = original_bootstrap
+            else:
+                delattr(topology_module, "bootstrap_first_implementer_node")
+            if original_launch is not None:
+                topology_module.launch_child_from_result_ref = original_launch
+            else:
+                delattr(topology_module, "launch_child_from_result_ref")
+
+    return 0
+
+
 def _authoritative_child_result_sync_case() -> int:
     from loop_product.dispatch.child_dispatch import materialize_child
     from loop_product.kernel.authority import kernel_internal_authority
@@ -536,6 +635,9 @@ def main() -> int:
         if rc:
             return rc
         rc = _parallel_split_with_dependency_bound_child_case()
+        if rc:
+            return rc
+        rc = _split_required_outputs_persist_case()
         if rc:
             return rc
         rc = _authoritative_child_result_sync_case()

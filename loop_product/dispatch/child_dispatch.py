@@ -45,6 +45,7 @@ def materialize_child(
     node_kind: str = "implementer",
     generation: int | None = None,
     allowed_actions: list[str] | None = None,
+    required_output_paths: list[str] | None = None,
     workspace_root: str | Path | None = None,
     codex_home: str | Path | None = None,
     depends_on_node_ids: list[str] | None = None,
@@ -64,6 +65,7 @@ def materialize_child(
     parent_snapshot = dict(kernel_state.nodes.get(parent_node_id) or {})
     resolved_generation = int(generation) if generation is not None else int(parent_snapshot.get("generation") or 0) + 1
     resolved_allowed_actions = list(allowed_actions or _default_allowed_actions_for_node_kind(node_kind))
+    resolved_required_output_paths = [str(item).strip() for item in (required_output_paths or []) if str(item).strip()]
     resolved_depends_on = [str(item).strip() for item in (depends_on_node_ids or []) if str(item).strip()]
     resolved_result_sink_ref = result_sink_ref or f"artifacts/{node_id}/result.json"
     resolved_lineage_ref = lineage_ref or f"{parent_snapshot.get('lineage_ref') or parent_node_id}->{node_id}"
@@ -80,6 +82,7 @@ def materialize_child(
         reasoning_profile=dict(reasoning_profile),
         budget_profile=dict(budget_profile),
         allowed_actions=resolved_allowed_actions,
+        required_output_paths=resolved_required_output_paths,
         workspace_root=str(resolved_workspace_root),
         codex_home="",
         depends_on_node_ids=resolved_depends_on,
@@ -101,6 +104,7 @@ def materialize_child(
         "reasoning_profile": dict(node_record["reasoning_profile"]),
         "budget_profile": dict(node_record["budget_profile"]),
         "allowed_actions": list(node.allowed_actions),
+        "required_output_paths": list(node.required_output_paths),
         "workspace_root": str(node.workspace_root),
         "codex_home": str(node.codex_home),
         "depends_on_node_ids": list(node.depends_on_node_ids),

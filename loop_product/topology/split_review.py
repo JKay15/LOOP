@@ -85,6 +85,7 @@ def _normalize_target_payloads(
         budget_profile_raw = target.get("budget_profile") or {}
         allowed_actions_raw = target.get("allowed_actions")
         depends_on_raw = target.get("depends_on_node_ids")
+        required_output_paths_raw = target.get("required_output_paths")
         explicit_generation = target.get("generation")
         activation_condition = str(target.get("activation_condition") or "").strip()
 
@@ -113,6 +114,13 @@ def _normalize_target_payloads(
             continue
         if split_mode == "deferred" and not activation_condition:
             activation_condition = f"after:{source_node_id}:terminal"
+        if required_output_paths_raw in (None, ""):
+            resolved_required_output_paths: list[str] = []
+        elif isinstance(required_output_paths_raw, SequenceABC) and not isinstance(required_output_paths_raw, (str, bytes)):
+            resolved_required_output_paths = [str(item).strip() for item in required_output_paths_raw if str(item).strip()]
+        else:
+            errors.append(f"target {node_id or index} required_output_paths must be a list of strings")
+            continue
         if explicit_generation not in {None, ""}:
             try:
                 candidate_generation = int(explicit_generation)
@@ -149,6 +157,7 @@ def _normalize_target_payloads(
                     **dict(budget_profile_raw),
                 },
                 "allowed_actions": resolved_allowed_actions,
+                "required_output_paths": resolved_required_output_paths,
                 "workspace_root": str(target.get("workspace_root") or ""),
                 "codex_home": str(target.get("codex_home") or ""),
                 "depends_on_node_ids": resolved_depends_on,

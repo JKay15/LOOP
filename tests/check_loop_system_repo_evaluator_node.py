@@ -1345,6 +1345,145 @@ def main() -> int:
         else:
             return _fail("whole-paper final integration must fail closed before evaluator launch when dependency nodes are not terminal-ready")
 
+        split_child_required_output_gate_state_root = temp_root / ".loop" / "split_child_required_output_gate"
+        split_child_required_output_gate_workspace_root = temp_root / "split_child_required_output_gate_workspace"
+        split_child_required_output_gate_artifact_root = (
+            split_child_required_output_gate_workspace_root / "deliverables" / "primary_artifact"
+        )
+        (split_child_required_output_gate_artifact_root / "PARTITION").mkdir(parents=True, exist_ok=True)
+        (split_child_required_output_gate_artifact_root / "formalization").mkdir(parents=True, exist_ok=True)
+        ensure_runtime_tree(split_child_required_output_gate_state_root)
+        split_child_gate_root_node = NodeSpec(
+            node_id="split-child-gate-root",
+            node_kind="kernel",
+            goal_slice="exercise split-child required output evaluator gate",
+            parent_node_id=None,
+            generation=0,
+            round_id="R0",
+            execution_policy={"mode": "kernel"},
+            reasoning_profile={"role": "kernel", "thinking_budget": "medium"},
+            budget_profile={"max_rounds": 1},
+            allowed_actions=["dispatch", "submit", "audit"],
+            delegation_ref="",
+            result_sink_ref="artifacts/split_child_gate/root_summary.json",
+            lineage_ref="split-child-gate-root",
+            status=NodeStatus.ACTIVE,
+        )
+        split_child_gate_node = NodeSpec(
+            node_id="split-child-gate-appendix",
+            node_kind="implementer",
+            goal_slice="formalize appendix support slice faithfully and only report terminal status after required outputs exist",
+            parent_node_id=split_child_gate_root_node.node_id,
+            generation=1,
+            round_id="R1.S1",
+            execution_policy={"sandbox_mode": "danger-full-access"},
+            reasoning_profile={"role": "implementer", "thinking_budget": "high"},
+            budget_profile={"max_rounds": 1},
+            allowed_actions=["evaluate", "report", "split_request"],
+            delegation_ref="state/delegations/split-child-gate-appendix.json",
+            result_sink_ref="artifacts/split_child_gate/implementer_result.json",
+            lineage_ref="split-child-gate-root->split-child-gate-appendix",
+            status=NodeStatus.ACTIVE,
+        )
+        split_child_gate_kernel_state = KernelState(
+            task_id="split-child-required-output-gate",
+            root_goal="reject split-child evaluator launch when declared required outputs are still missing",
+            root_node_id=split_child_gate_root_node.node_id,
+        )
+        split_child_gate_kernel_state.register_node(split_child_gate_root_node)
+        split_child_gate_kernel_state.register_node(split_child_gate_node)
+        persist_kernel_state(
+            split_child_required_output_gate_state_root,
+            split_child_gate_kernel_state,
+            authority=kernel_internal_authority(),
+        )
+        (split_child_required_output_gate_artifact_root / "README.md").write_text("# README\n", encoding="utf-8")
+        (split_child_required_output_gate_artifact_root / "TRACEABILITY.md").write_text("# Traceability\n", encoding="utf-8")
+        (
+            split_child_required_output_gate_artifact_root / "formalization" / "appendix_claim_inventory.json"
+        ).write_text("{\"count\": 22}\n", encoding="utf-8")
+        (
+            split_child_required_output_gate_artifact_root / "PARTITION" / "external_dependency_candidates.json"
+        ).write_text("[]\n", encoding="utf-8")
+        (
+            split_child_required_output_gate_artifact_root / "PARTITION" / "partition_plan.json"
+        ).write_text(
+            json.dumps(
+                {
+                    "blocks": [
+                        {
+                            "block_id": "appendix_support_and_proofs",
+                            "owner": split_child_gate_node.node_id,
+                            "required_outputs": [
+                                "formalization/appendix_claim_inventory.json",
+                                "formalization/appendix_claims.lean",
+                                "PARTITION/external_dependency_candidates.json",
+                                "WHOLE_PAPER_STATUS.json",
+                            ],
+                        }
+                    ]
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (split_child_required_output_gate_artifact_root / "WHOLE_PAPER_STATUS.json").write_text(
+            json.dumps(
+                {
+                    "status": "TERMINAL",
+                    "terminal_classification": "external dependency blocked",
+                    "implementation_progress": {
+                        "appendix_claim_inventory": "complete",
+                        "lean_formalization": "not_started_due_to_external_block",
+                    },
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        split_child_gate_manual_ref = split_child_required_output_gate_workspace_root / "PRODUCT_MANUAL.md"
+        split_child_gate_manual_ref.write_text("# Manual\n\nSplit child appendix lane.\n", encoding="utf-8")
+        split_child_gate_final_effects_ref = split_child_required_output_gate_workspace_root / "FINAL_EFFECTS.md"
+        split_child_gate_final_effects_ref.write_text(
+            "\n".join(
+                [
+                    "# Final Effects",
+                    "",
+                    "- whole-paper faithful complete formalization",
+                    "- paper defect exposed",
+                    "- external dependency blocked",
+                    "- split child lanes may not enter evaluator before their declared required outputs are satisfied",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        split_child_gate_submission = build_evaluator_submission_for_frozen_task(
+            target_node=split_child_gate_node,
+            workspace_root=split_child_required_output_gate_workspace_root,
+            output_root=split_child_required_output_gate_state_root / "artifacts" / "evaluator_split_child_gate_runs",
+            implementation_package_ref=split_child_required_output_gate_artifact_root,
+            product_manual_ref=split_child_gate_manual_ref,
+            final_effects_text_ref=split_child_gate_final_effects_ref,
+            role_agent_cmd=_fixture_role_agent_cmd(scenario="wave_sequence"),
+        )
+        try:
+            run_evaluator_node_until_terminal(
+                state_root=split_child_required_output_gate_state_root,
+                submission=split_child_gate_submission,
+                max_same_run_recovery_attempts=0,
+            )
+        except ValueError as exc:
+            msg = str(exc)
+            if "required output" not in msg.lower() or "appendix_claims.lean" not in msg:
+                return _fail("split-child evaluator preflight rejection must explain which required output is still missing")
+        else:
+            return _fail("split-child evaluator launch must fail closed when declared required outputs are still missing")
+
         runtime_closure_only_state_root = temp_root / ".loop" / "runtime_closure_only"
         runtime_closure_only_workspace_root = temp_root / "runtime_closure_only_workspace"
         runtime_closure_only_workspace_root.mkdir(parents=True, exist_ok=True)

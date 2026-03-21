@@ -122,6 +122,47 @@ def _whole_paper_terminal_status_path(artifact_root: Path) -> Path:
     return artifact_root / "WHOLE_PAPER_STATUS.json"
 
 
+def _required_output_paths_from_partition_plan(*, artifact_root: Path, target_node_id: str) -> list[str]:
+    partition_plan_path = artifact_root / "PARTITION" / "partition_plan.json"
+    if not partition_plan_path.exists():
+        return []
+    try:
+        payload = json.loads(partition_plan_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    blocks = list(payload.get("blocks") or [])
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for block in blocks:
+        if not isinstance(block, Mapping):
+            continue
+        owner = str(block.get("owner") or "").strip()
+        if owner and owner != target_node_id:
+            continue
+        for raw_item in list(block.get("required_outputs") or []):
+            item = str(raw_item or "").strip()
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            resolved.append(item)
+    return resolved
+
+
+def _resolve_required_output_paths(submission: EvaluatorNodeSubmission) -> list[str]:
+    explicit = [str(item).strip() for item in list(submission.required_output_paths or []) if str(item).strip()]
+    if explicit:
+        return explicit
+    artifact_root = Path(submission.implementation_package_ref).expanduser().resolve()
+    if not artifact_root.exists() or not artifact_root.is_dir():
+        return []
+    return _required_output_paths_from_partition_plan(
+        artifact_root=artifact_root,
+        target_node_id=submission.target_node_id,
+    )
+
+
 def _enforce_directory_artifact_hygiene_preflight(submission: EvaluatorNodeSubmission) -> None:
     artifact_root = Path(submission.implementation_package_ref).expanduser().resolve()
     if not artifact_root.exists() or not artifact_root.is_dir():
@@ -135,6 +176,24 @@ def _derive_state_root_from_submission(submission: EvaluatorNodeSubmission) -> P
         if (candidate / "state" / "kernel_state.json").exists():
             return require_runtime_root(candidate)
     raise ValueError(f"evaluator submission output_root does not resolve under a .loop boundary: {output_root}")
+
+
+def _enforce_required_output_preflight(submission: EvaluatorNodeSubmission) -> None:
+    artifact_root = Path(submission.implementation_package_ref).expanduser().resolve()
+    if not artifact_root.exists() or not artifact_root.is_dir():
+        return
+    required_output_paths = _resolve_required_output_paths(submission)
+    if not required_output_paths:
+        return
+    missing: list[str] = []
+    for relpath in required_output_paths:
+        if not (artifact_root / relpath).exists():
+            missing.append(relpath)
+    if missing:
+        raise ValueError(
+            "split-child evaluator preflight requires declared required outputs before evaluator launch; "
+            f"missing required output paths: {', '.join(missing)}"
+        )
 
 
 def _enforce_whole_paper_preflight(submission: EvaluatorNodeSubmission) -> None:
@@ -452,6 +511,7 @@ def build_evaluator_submission_for_frozen_task(
     output_root: Path,
     implementation_package_ref: str | Path,
     product_manual_ref: str | Path,
+    required_output_paths: Sequence[str] | None = None,
     final_effects_text_ref: str | Path = "",
     final_effect_requirements: Sequence[Mapping[str, Any]] | None = None,
     role_requirements: Mapping[str, Any] | None = None,
@@ -476,6 +536,7 @@ def build_evaluator_submission_for_frozen_task(
         for item in (context_refs or [])
         if str(item).strip()
     ]
+    normalized_required_output_paths = [str(item).strip() for item in (required_output_paths or []) if str(item).strip()]
     submission_role_requirements = dict(role_requirements or _GENERIC_IMPLEMENTER_ROLE_REQUIREMENTS)
     normalized_output_root = Path(output_root).resolve()
     normalized_workspace_root = Path(workspace_root).resolve()
@@ -493,6 +554,7 @@ def build_evaluator_submission_for_frozen_task(
         output_root=str(normalized_output_root),
         implementation_package_ref=normalized_impl_ref,
         product_manual_ref=normalized_manual_ref,
+        required_output_paths=normalized_required_output_paths,
         final_effects_text_ref=normalized_final_effects_ref,
         final_effect_requirements=normalized_requirements,
         role_requirements=submission_role_requirements,
@@ -686,6 +748,7 @@ def run_evaluator_node(
     """Run the simple evaluator as a node-local evaluator boundary."""
 
     _enforce_directory_artifact_hygiene_preflight(submission)
+    _enforce_required_output_preflight(submission)
     _enforce_whole_paper_preflight(submission)
     request_ref, request_obj = materialize_evaluator_request(state_root=state_root, submission=submission)
     del poll_interval_s, no_progress_timeout_s, supervisor_child_argv_override

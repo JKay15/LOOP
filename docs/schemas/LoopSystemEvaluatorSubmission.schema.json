@@ -70,6 +70,12 @@
       "type": "string",
       "minLength": 1
     },
+    "required_output_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "final_effects_text_ref": {
       "type": "string"
     },

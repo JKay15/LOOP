@@ -252,6 +252,8 @@ def main() -> int:
                 "If kernel accepts a deferred split, do not assume the planned children will start automatically",
                 "materialize a structured activate proposal and call the exact activate helper named in this prompt",
                 "Do not start evaluator for a staged whole-paper benchmark until the artifact carries structured terminal-classification evidence in `WHOLE_PAPER_STATUS.json`",
+                "If your split slice carries declared required outputs",
+                "do not start evaluator or mark the slice terminal until those required outputs exist",
                 "Before evaluator or final report, the final `deliverables/primary_artifact` must not ship runtime-owned heavy trees",
                 "such as `.lake`, `.git`, `.venv`, `.uv-cache`, `build`, or `_lake_build`",
             ):

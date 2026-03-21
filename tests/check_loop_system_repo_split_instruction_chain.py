@@ -80,6 +80,11 @@ def main() -> int:
             context="workspace rules",
         )
         _require_contains(
+            workspace_agents,
+            "required outputs",
+            context="workspace rules",
+        )
+        _require_contains(
             child_dispatch_skill,
             "Only the current implementer may propose that the task should split",
             context="child-dispatch skill",
@@ -112,6 +117,11 @@ def main() -> int:
         _require_contains(
             loop_runner_skill,
             "WHOLE_PAPER_STATUS.json",
+            context="loop-runner skill",
+        )
+        _require_contains(
+            loop_runner_skill,
+            "required outputs",
             context="loop-runner skill",
         )
         _require_contains(
@@ -218,6 +228,16 @@ def main() -> int:
             node_contract,
             "WHOLE_PAPER_STATUS.json",
             context="node contract",
+        )
+        _require_contains(
+            node_contract,
+            "required outputs",
+            context="node contract",
+        )
+        _require_contains(
+            evaluator_node_contract,
+            "required outputs",
+            context="evaluator node contract",
         )
         _require_contains(
             evaluator_node_contract,

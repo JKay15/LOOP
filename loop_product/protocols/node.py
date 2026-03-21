@@ -45,6 +45,7 @@ class NodeSpec:
     reasoning_profile: dict[str, Any]
     budget_profile: dict[str, Any]
     allowed_actions: list[str] = field(default_factory=list)
+    required_output_paths: list[str] = field(default_factory=list)
     workspace_root: str = ""
     codex_home: str = ""
     depends_on_node_ids: list[str] = field(default_factory=list)
@@ -77,6 +78,7 @@ class NodeSpec:
             reasoning_profile=normalize_reasoning_profile(dict(data.get("reasoning_profile") or {}), node_kind=node_kind),
             budget_profile=dict(data.get("budget_profile") or {}),
             allowed_actions=list(data.get("allowed_actions") or []),
+            required_output_paths=[str(item) for item in (data.get("required_output_paths") or []) if str(item).strip()],
             workspace_root=str(data.get("workspace_root") or ""),
             codex_home=str(data.get("codex_home") or ""),
             depends_on_node_ids=[str(item) for item in (data.get("depends_on_node_ids") or [])],

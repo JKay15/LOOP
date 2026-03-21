@@ -208,6 +208,7 @@ def _build_handoff_payload(
     workspace_root: Path,
     workspace_mirror_relpath: str,
     external_publish_target: str,
+    required_output_paths: list[str],
     context_refs: list[str],
     result_sink_ref: str,
     workspace_result_sink_relpath: str,
@@ -233,6 +234,7 @@ def _build_handoff_payload(
         "workspace_mirror_relpath": workspace_mirror_relpath,
         "workspace_mirror_ref": workspace_mirror_ref,
         "external_publish_target": external_publish_target,
+        "required_output_paths": [str(item).strip() for item in list(required_output_paths or []) if str(item).strip()],
         "context_refs": list(context_refs),
         "result_sink_ref": result_sink_ref,
         "workspace_result_sink_relpath": workspace_result_sink_relpath,
@@ -276,6 +278,10 @@ def _render_handoff_md(payload: dict[str, Any]) -> str:
         f"- external_input_policy: `{payload['external_input_policy']}`",
     ]
     context_refs = [str(item) for item in payload.get("context_refs") or []]
+    required_output_paths = [str(item) for item in payload.get("required_output_paths") or [] if str(item).strip()]
+    if required_output_paths:
+        lines.extend(["", "## Required Outputs", ""])
+        lines.extend(f"- `{item}`" for item in required_output_paths)
     if context_refs:
         lines.extend(["", "## Context Refs", ""])
         lines.extend(f"- `{item}`" for item in context_refs)
@@ -342,6 +348,7 @@ def _render_child_prompt(
             "When a deferred child is genuinely ready, materialize a structured activate proposal and call the exact activate helper named in this prompt instead of treating `PLANNED` child state as self-starting.",
             "A text-only split recommendation is not a submitted kernel proposal.",
             "Do not start evaluator for a staged whole-paper benchmark until the artifact carries structured terminal-classification evidence in `WHOLE_PAPER_STATUS.json`.",
+            "If your split slice carries declared required outputs, do not start evaluator or mark the slice terminal until those required outputs exist in the artifact or the frozen slice contract explicitly justifies every missing required output under the same allowed blocked classification.",
             "Extraction inventories, partition plans, intermediate block ledgers, or prose stating that whole-paper closure is still pending remain non-terminal evidence and are not evaluator-ready whole-paper closeout.",
             "For the repo-root reads required by `workspace/AGENTS.md`, use these exact refs instead of guessing relative paths from the project folder:",
             "",
@@ -379,6 +386,7 @@ def _materialize_evaluator_bundle(
     artifact_payload: dict[str, Any],
     workspace_mirror_relpath: str,
     external_publish_target: str,
+    required_output_paths: list[str],
     handoff_json_path: Path,
     context_refs: list[str],
 ) -> tuple[Path, Path]:
@@ -414,6 +422,7 @@ def _materialize_evaluator_bundle(
         output_root=output_root,
         implementation_package_ref=workspace_mirror_ref,
         product_manual_ref=manual_path,
+        required_output_paths=required_output_paths,
         final_effects_text_ref=final_effects_path,
         context_refs=[*list(context_refs), endpoint_artifact_ref, str(handoff_json_path.resolve())],
     )
@@ -490,6 +499,7 @@ def _normalize_bootstrap_request(payload: dict[str, Any]) -> dict[str, Any]:
         "workspace_mirror_relpath": _nonempty(payload.get("workspace_mirror_relpath")),
         "external_publish_target": _nonempty(payload.get("external_publish_target")),
         "context_refs": [str(item) for item in (payload.get("context_refs") or [])],
+        "required_output_paths": [str(item).strip() for item in (payload.get("required_output_paths") or []) if str(item).strip()],
         "result_sink_ref": _nonempty(payload.get("result_sink_ref")),
     }
     validate_repo_object("LoopFirstImplementerBootstrapRequest.schema.json", normalized)
@@ -653,6 +663,7 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
             execution_policy=implementer_execution_policy(),
             reasoning_profile=implementer_reasoning_profile(),
             budget_profile=implementer_budget_profile(),
+            required_output_paths=request["required_output_paths"],
             workspace_root=workspace_root,
             result_sink_ref=result_sink_ref,
             authority=authority,
@@ -689,6 +700,7 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
         artifact_payload=endpoint_artifact_payload,
         workspace_mirror_relpath=request["workspace_mirror_relpath"],
         external_publish_target=request["external_publish_target"],
+        required_output_paths=request["required_output_paths"],
         handoff_json_path=handoff_json_path,
         context_refs=request["context_refs"],
     )
@@ -701,6 +713,7 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
         workspace_root=workspace_root,
         workspace_mirror_relpath=request["workspace_mirror_relpath"],
         external_publish_target=request["external_publish_target"],
+        required_output_paths=request["required_output_paths"],
         context_refs=request["context_refs"],
         result_sink_ref=result_sink_ref,
         workspace_result_sink_relpath=workspace_result_sink_relpath,
