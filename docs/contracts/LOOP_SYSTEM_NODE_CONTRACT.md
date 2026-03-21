@@ -49,6 +49,7 @@ Every LOOP execution unit is a `node`, and child materialization must pass throu
 
 - kernel freezes delegation before the child starts
 - the serialized node protocol must carry execution-strategy data explicitly: `execution_policy.agent_provider`, `execution_policy.sandbox_mode`, and `reasoning_profile.thinking_budget` cannot stay only in prose
+- the generic first implementer child should default to `reasoning_profile.thinking_budget = "xhigh"` unless a frozen task or accepted topology mutation explicitly overrides that budget
 - child-dispatch materializes the child from frozen inputs
 - the committed endpoint-driven first-child bootstrap helper and wrapper should derive the normal first-child bootstrap request from the clarified endpoint artifact so root-chat does not need to probe `--help`, inspect request schemas, rediscover helper internals, or pre-create guessed workspace folders during the ordinary path
 - when the clarified endpoint already names exact existing local files or directories, the committed endpoint-driven first-child bootstrap helper should preserve those explicit local refs in the derived `context_refs` instead of forcing the child to rediscover them from prose

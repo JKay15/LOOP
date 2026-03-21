@@ -25,7 +25,7 @@ def implementer_execution_policy() -> dict[str, str]:
 
 
 def implementer_reasoning_profile() -> dict[str, str]:
-    return {"thinking_budget": "high", "role": "implementer"}
+    return {"thinking_budget": "xhigh", "role": "implementer"}
 
 
 def implementer_budget_profile() -> dict[str, int]:

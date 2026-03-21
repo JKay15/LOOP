@@ -51,7 +51,7 @@ The evaluator is a graph participant, not an oracle outside the graph.
 - when a delegated evaluator role has already produced a non-empty authoritative terminal response artifact and a committed provider terminal marker has also been observed on the configured launch streams, the runtime may settle that role from the artifact instead of waiting indefinitely for provider-side exit cleanup
 - response-file stability alone is not terminal success; post-response non-zero exits without that terminal marker must still translate to evaluator `ERROR`
 - evaluator node runtime must still fail closed when no authoritative terminal response artifact exists; stderr/stdout chatter alone is not terminal success
-- generic evaluator-node submissions should default delegated evaluator reasoning to `high` unless the caller explicitly overrides it
+- generic evaluator-node submissions should default every delegated evaluator AI role (`checker`, ordinary-test, `AI-as-User`, and `reviewer`) to `high` unless the caller explicitly overrides it
 - retryable provider-side evaluator failures must stay distinct from path/config mistakes; `provider_transport`, `provider_capacity`, and startup-level `provider_runtime` failures are evaluator-owned diagnostics and should receive bounded lane retry before the evaluator settles on a recovery-required stop
 - provider quota exhaustion must surface explicitly as `provider_quota`; it may require waiting for a reset window rather than immediate bounded lane retry, but it still remains evaluator-owned recovery work instead of generic path or implementation failure
 - bounded lane retry must preserve retry history in the delegated role artifacts instead of silently discarding the first failed attempt

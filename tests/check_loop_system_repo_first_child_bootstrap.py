@@ -297,6 +297,8 @@ def main() -> int:
                 return _fail("bootstrap result node_id must match the materialized node snapshot")
             if "split_request" not in set(node.allowed_actions or []):
                 return _fail("ordinary implementer bootstrap must materialize split_request on the child node")
+            if str((node.reasoning_profile or {}).get("thinking_budget") or "") != "xhigh":
+                return _fail("ordinary implementer bootstrap must default the primary implementer child to xhigh reasoning")
             runtime_context = load_child_runtime_context(state_root, node.node_id)
             if Path(str(runtime_context.get("workspace_root") or "")).resolve() != workspace_root.resolve():
                 return _fail("child runtime context must point at the materialized workspace root")
@@ -312,6 +314,8 @@ def main() -> int:
                 return _fail("bootstrap launch spec must pin cwd to the workspace root")
             if str(launch_spec.get("stdin_path") or "") != str(child_prompt.resolve()):
                 return _fail("bootstrap launch spec must point stdin_path at CHILD_PROMPT.md")
+            if 'model_reasoning_effort="xhigh"' not in argv:
+                return _fail("bootstrap launch spec must request xhigh Codex reasoning for the default implementer child")
 
             continue_request = dict(request)
             continue_request.update(
