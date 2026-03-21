@@ -200,6 +200,12 @@ def _required_workspace_artifact_materialized(snapshot: Mapping[str, Any]) -> bo
     workspace_root = _absolute(workspace_root_raw)
     handoff = _load_frozen_handoff(workspace_root)
     candidates: list[Path] = []
+    workspace_live_artifact_ref = str(handoff.get("workspace_live_artifact_ref") or "").strip()
+    if workspace_live_artifact_ref:
+        candidates.append(_absolute(workspace_live_artifact_ref))
+    workspace_live_artifact_relpath = str(handoff.get("workspace_live_artifact_relpath") or "").strip()
+    if workspace_live_artifact_relpath:
+        candidates.append((workspace_root / workspace_live_artifact_relpath).resolve())
     workspace_mirror_ref = str(handoff.get("workspace_mirror_ref") or "").strip()
     if workspace_mirror_ref:
         candidates.append(_absolute(workspace_mirror_ref))

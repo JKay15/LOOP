@@ -1092,6 +1092,138 @@ def main() -> int:
         if xhigh_terminator_calls != [str(launch_result_ref_1.resolve())]:
             return _fail("xhigh startup no-substantive-progress stop points must terminate the live child before returning")
 
+        workspace_root = ROOT / "workspace" / "test-child-supervision-live-root-progress"
+        state_root = ROOT / ".loop" / "test-child-supervision-live-root-progress"
+        shutil.rmtree(workspace_root, ignore_errors=True)
+        shutil.rmtree(state_root, ignore_errors=True)
+        bootstrap = bootstrap_first_implementer_node(
+            mode="fresh",
+            task_slug="test-child-supervision-live-root-progress",
+            root_goal="bootstrap one implementer node for live-root progress validation",
+            child_goal_slice="treat non-empty live artifact roots as substantive startup progress even before publication",
+            endpoint_artifact_ref=str(endpoint.resolve()),
+            workspace_root=str(workspace_root),
+            state_root=str(state_root),
+            workspace_live_artifact_relpath=".tmp_primary_artifact",
+            workspace_mirror_relpath="deliverables/primary_artifact",
+            external_publish_target=str((temp_root / "Desktop" / "out-live-root").resolve()),
+            context_refs=[],
+        )
+
+        node_id = str(bootstrap["node_id"])
+        launch_result_ref_1 = state_root / "artifacts" / "launches" / node_id / "attempt_001" / "ChildLaunchResult.json"
+        launch_result_ref_1.parent.mkdir(parents=True, exist_ok=True)
+        launch_result_ref_1.write_text(
+            json.dumps(
+                {
+                    "launch_result_ref": str(launch_result_ref_1.resolve()),
+                    "launch_decision": "started",
+                    "node_id": node_id,
+                    "state_root": str(state_root.resolve()),
+                    "workspace_root": str(workspace_root.resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        live_root = workspace_root / ".tmp_primary_artifact"
+        live_root.mkdir(parents=True, exist_ok=True)
+        (live_root / "README.md").write_text("# extraction batch\n", encoding="utf-8")
+
+        live_root_status_calls = {"count": 0}
+        live_root_recovery_calls: list[dict[str, object]] = []
+        live_root_launch_calls: list[str] = []
+        live_root_terminator_calls: list[str] = []
+        live_root_now = {"t": 4000.0}
+        live_root_pid_alive = {"value": True}
+
+        def _live_root_status_reader(*, result_ref: str | Path, stall_threshold_s: float = 60.0) -> dict[str, object]:
+            launch_result_ref = str(Path(result_ref).resolve())
+            live_root_status_calls["count"] += 1
+            status_ref = temp_root / f"live-root-status-{live_root_status_calls['count']}.json"
+            return {
+                "launch_result_ref": launch_result_ref,
+                "status_result_ref": str(status_ref.resolve()),
+                "node_id": node_id,
+                "state_root": str(state_root.resolve()),
+                "workspace_root": str(workspace_root.resolve()),
+                "pid_alive": bool(live_root_pid_alive["value"]),
+                "recovery_eligible": False,
+                "stall_threshold_s": stall_threshold_s,
+                "lifecycle_status": "ACTIVE" if live_root_pid_alive["value"] else "BLOCKED",
+                "recovery_reason": "live_pid_still_attached",
+                "latest_log_age_s": 0.1,
+            }
+
+        live_root_snapshot = {
+            "node_id": node_id,
+            "workspace_root": str(workspace_root.resolve()),
+            "state_root": str(state_root.resolve()),
+            "pid_alive": True,
+            "lifecycle_status": "ACTIVE",
+            "phase_hint": "IMPLEMENTING",
+            "terminal_result_present": False,
+            "implementer_result_ref": "",
+            "implementer_outcome": "",
+            "implementer_verdict": "",
+            "implementer_retryable": False,
+            "evaluator_status": "",
+            "evaluator_running_unit_ids": [],
+            "evaluator_completed_unit_ids": [],
+            "evaluator_blocked_retryable_unit_ids": [],
+            "evaluator_blocked_terminal_unit_ids": [],
+            "evaluator_pending_unit_ids": [],
+            "observed_doc_refs": [
+                str((workspace_root / "FROZEN_HANDOFF.md").resolve()),
+                str((ROOT / ".cache" / "leanatlas" / "tmp" / "arxiv_2602_11505v2" / "source" / "main.tex").resolve()),
+            ],
+            "recent_log_lines": [
+                "I’m writing the first real source-backed extraction batch into the live artifact root now.",
+                "The publish root is intentionally still empty because publication has not happened yet.",
+                "The next step is to extend the extraction and decide whether a structured split proposal is warranted.",
+            ],
+        }
+
+        def _live_root_snapshot_reader(*, result_ref: str | Path, stall_threshold_s: float = 60.0) -> dict[str, object]:
+            del result_ref, stall_threshold_s
+            return dict(live_root_snapshot)
+
+        def _live_root_recovery_runner(**payload):
+            live_root_recovery_calls.append(dict(payload))
+            return {}
+
+        def _live_root_launcher(*, result_ref: str | Path, startup_probe_ms: int = 1500, startup_health_timeout_ms: int = 12000):
+            del result_ref, startup_probe_ms, startup_health_timeout_ms
+            live_root_launch_calls.append("unexpected")
+            return {}
+
+        def _live_root_terminator(*, result_ref: str | Path):
+            live_root_terminator_calls.append(str(Path(result_ref).resolve()))
+            live_root_pid_alive["value"] = False
+
+        live_root_result = supervise_child_until_settled(
+            launch_result_ref=launch_result_ref_1,
+            poll_interval_s=10.0,
+            stall_threshold_s=60.0,
+            max_recoveries=2,
+            max_wall_clock_s=70.0,
+            runtime_status_reader=_live_root_status_reader,
+            recovery_runner=_live_root_recovery_runner,
+            launcher=_live_root_launcher,
+            launch_terminator=_live_root_terminator,
+            progress_snapshot_reader=_live_root_snapshot_reader,
+            no_substantive_progress_window_s=300.0,
+            now_fn=lambda: live_root_now["t"],
+            sleep_fn=lambda seconds: live_root_now.__setitem__("t", live_root_now["t"] + float(seconds)),
+        )
+        Draft202012Validator(supervision_schema).validate(live_root_result)
+        if str(live_root_result.get("settled_reason") or "") != "timeout":
+            return _fail("non-empty live artifact roots must satisfy required-progress detection even while the publish root is still empty")
+        if live_root_recovery_calls or live_root_launch_calls or live_root_terminator_calls:
+            return _fail("live-root startup progress must not trigger recovery, relaunch, or termination before the bounded wall clock expires")
+
     print("[loop-system-child-supervision-helper] OK")
     return 0
 
