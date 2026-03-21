@@ -685,6 +685,281 @@ def main() -> int:
         if no_progress_launch_calls:
             return _fail("no-substantive-progress stop points must not relaunch the child automatically")
 
+        workspace_root = ROOT / "workspace" / "test-child-supervision-empty-workspace-false-liveness"
+        state_root = ROOT / ".loop" / "test-child-supervision-empty-workspace-false-liveness"
+        shutil.rmtree(workspace_root, ignore_errors=True)
+        shutil.rmtree(state_root, ignore_errors=True)
+        bootstrap = bootstrap_first_implementer_node(
+            mode="fresh",
+            task_slug="test-child-supervision-empty-workspace-false-liveness",
+            root_goal="bootstrap one implementer node for empty-workspace false-liveness validation",
+            child_goal_slice="stop truthfully when a live child keeps promising the first artifact batch but never materializes anything under the frozen workspace mirror",
+            endpoint_artifact_ref=str(endpoint.resolve()),
+            workspace_root=str(workspace_root),
+            state_root=str(state_root),
+            workspace_mirror_relpath="deliverables/primary_artifact",
+            external_publish_target=str((temp_root / "Desktop" / "out-empty-workspace").resolve()),
+            context_refs=[],
+        )
+
+        node_id = str(bootstrap["node_id"])
+        launch_result_ref_1 = state_root / "artifacts" / "launches" / node_id / "attempt_001" / "ChildLaunchResult.json"
+        launch_result_ref_1.parent.mkdir(parents=True, exist_ok=True)
+        launch_result_ref_1.write_text(
+            json.dumps(
+                {
+                    "launch_result_ref": str(launch_result_ref_1.resolve()),
+                    "launch_decision": "started",
+                    "node_id": node_id,
+                    "state_root": str(state_root.resolve()),
+                    "workspace_root": str(workspace_root.resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        empty_workspace_status_calls = {"count": 0}
+        empty_workspace_recovery_calls: list[dict[str, object]] = []
+        empty_workspace_launch_calls: list[str] = []
+        empty_workspace_now = {"t": 2000.0}
+
+        def _empty_workspace_status_reader(*, result_ref: str | Path, stall_threshold_s: float = 60.0) -> dict[str, object]:
+            launch_result_ref = str(Path(result_ref).resolve())
+            empty_workspace_status_calls["count"] += 1
+            status_ref = temp_root / f"empty-workspace-status-{empty_workspace_status_calls['count']}.json"
+            return {
+                "launch_result_ref": launch_result_ref,
+                "status_result_ref": str(status_ref.resolve()),
+                "node_id": node_id,
+                "state_root": str(state_root.resolve()),
+                "workspace_root": str(workspace_root.resolve()),
+                "pid_alive": True,
+                "recovery_eligible": False,
+                "stall_threshold_s": stall_threshold_s,
+                "lifecycle_status": "ACTIVE",
+                "recovery_reason": "live_pid_still_attached",
+                "latest_log_age_s": 0.1,
+            }
+
+        empty_workspace_snapshot = {
+            "node_id": node_id,
+            "workspace_root": str(workspace_root.resolve()),
+            "state_root": str(state_root.resolve()),
+            "pid_alive": True,
+            "lifecycle_status": "ACTIVE",
+            "phase_hint": "IMPLEMENTING",
+            "terminal_result_present": False,
+            "implementer_result_ref": "",
+            "implementer_outcome": "",
+            "implementer_verdict": "",
+            "implementer_retryable": False,
+            "evaluator_status": "",
+            "evaluator_running_unit_ids": [],
+            "evaluator_completed_unit_ids": [],
+            "evaluator_blocked_retryable_unit_ids": [],
+            "evaluator_blocked_terminal_unit_ids": [],
+            "evaluator_pending_unit_ids": [],
+            "observed_doc_refs": [
+                str((ROOT / "loop_product_repo" / ".agents" / "skills" / "loop-runner" / "SKILL.md").resolve()),
+                str((ROOT / "loop_product_repo" / "workspace" / "AGENTS.md").resolve()),
+                str((workspace_root / "FROZEN_HANDOFF.md").resolve()),
+                str((ROOT / ".cache" / "leanatlas" / "tmp" / "arxiv_2602_11505v2" / "source" / "main.tex").resolve()),
+                str((ROOT / "loop_product_repo" / ".agents" / "skills" / "evaluator-exec" / "SKILL.md").resolve()),
+                str((ROOT / "loop_product_repo" / "docs" / "contracts" / "LOOP_EVALUATOR_PROTOTYPE_PRODUCT_MANUAL.md").resolve()),
+            ],
+            "recent_log_lines": [
+                "Plan update",
+                "Inspect the frozen TeX source and extract theorem/definition/section structure needed for the first artifact batch",
+                "Materialize the workspace mirror artifact with source-backed extraction outputs and whole-paper status evidence",
+                "I’m writing the first real artifact batch now: a source-derived inventory of sections, theorem-like statements, labels, refs, and an initial whole-paper status file inside `deliverables/primary_artifact`.",
+            ],
+        }
+
+        def _empty_workspace_snapshot_reader(*, result_ref: str | Path, stall_threshold_s: float = 60.0) -> dict[str, object]:
+            del result_ref, stall_threshold_s
+            return dict(empty_workspace_snapshot)
+
+        def _empty_workspace_recovery_runner(**payload):
+            empty_workspace_recovery_calls.append(dict(payload))
+            return {}
+
+        def _empty_workspace_launcher(*, result_ref: str | Path, startup_probe_ms: int = 1500, startup_health_timeout_ms: int = 12000):
+            del result_ref, startup_probe_ms, startup_health_timeout_ms
+            empty_workspace_launch_calls.append("unexpected")
+            return {}
+
+        empty_workspace_result = supervise_child_until_settled(
+            launch_result_ref=launch_result_ref_1,
+            poll_interval_s=0.0,
+            stall_threshold_s=60.0,
+            max_recoveries=2,
+            max_wall_clock_s=6.0,
+            runtime_status_reader=_empty_workspace_status_reader,
+            recovery_runner=_empty_workspace_recovery_runner,
+            launcher=_empty_workspace_launcher,
+            progress_snapshot_reader=_empty_workspace_snapshot_reader,
+            no_substantive_progress_window_s=5.0,
+            now_fn=lambda: empty_workspace_now["t"],
+            sleep_fn=lambda seconds: empty_workspace_now.__setitem__("t", empty_workspace_now["t"] + float(seconds)),
+        )
+        Draft202012Validator(supervision_schema).validate(empty_workspace_result)
+        if str(empty_workspace_result.get("settled_reason") or "") != "no_substantive_progress":
+            return _fail("supervision helper must stop a live child that keeps the workspace mirror empty while repeatedly claiming it is writing the first artifact batch")
+        if empty_workspace_recovery_calls:
+            return _fail("empty-workspace false-liveness stop points must not pretend the child is recovery-eligible")
+        if empty_workspace_launch_calls:
+            return _fail("empty-workspace false-liveness stop points must not relaunch the child automatically")
+
+        workspace_root = ROOT / "workspace" / "test-child-supervision-xhigh-startup-grace"
+        state_root = ROOT / ".loop" / "test-child-supervision-xhigh-startup-grace"
+        shutil.rmtree(workspace_root, ignore_errors=True)
+        shutil.rmtree(state_root, ignore_errors=True)
+        bootstrap = bootstrap_first_implementer_node(
+            mode="fresh",
+            task_slug="test-child-supervision-xhigh-startup-grace",
+            root_goal="bootstrap one implementer node for reasoning-aware startup grace validation",
+            child_goal_slice="allow bounded xhigh startup reading before declaring empty-workspace no substantive progress",
+            endpoint_artifact_ref=str(endpoint.resolve()),
+            workspace_root=str(workspace_root),
+            state_root=str(state_root),
+            workspace_mirror_relpath="deliverables/primary_artifact",
+            external_publish_target=str((temp_root / "Desktop" / "out-xhigh-startup").resolve()),
+            context_refs=[],
+        )
+
+        node_id = str(bootstrap["node_id"])
+        launch_result_ref_1 = state_root / "artifacts" / "launches" / node_id / "attempt_001" / "ChildLaunchResult.json"
+        launch_result_ref_1.parent.mkdir(parents=True, exist_ok=True)
+        launch_result_ref_1.write_text(
+            json.dumps(
+                {
+                    "launch_result_ref": str(launch_result_ref_1.resolve()),
+                    "launch_decision": "started",
+                    "node_id": node_id,
+                    "state_root": str(state_root.resolve()),
+                    "workspace_root": str(workspace_root.resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        xhigh_status_calls = {"count": 0}
+        xhigh_recovery_calls: list[dict[str, object]] = []
+        xhigh_launch_calls: list[str] = []
+        xhigh_now = {"t": 3000.0}
+
+        def _xhigh_status_reader(*, result_ref: str | Path, stall_threshold_s: float = 60.0) -> dict[str, object]:
+            launch_result_ref = str(Path(result_ref).resolve())
+            xhigh_status_calls["count"] += 1
+            status_ref = temp_root / f"xhigh-startup-status-{xhigh_status_calls['count']}.json"
+            return {
+                "launch_result_ref": launch_result_ref,
+                "status_result_ref": str(status_ref.resolve()),
+                "node_id": node_id,
+                "state_root": str(state_root.resolve()),
+                "workspace_root": str(workspace_root.resolve()),
+                "pid_alive": True,
+                "recovery_eligible": False,
+                "stall_threshold_s": stall_threshold_s,
+                "lifecycle_status": "ACTIVE",
+                "recovery_reason": "live_pid_still_attached",
+                "latest_log_age_s": 0.1,
+            }
+
+        xhigh_snapshot = {
+            "node_id": node_id,
+            "workspace_root": str(workspace_root.resolve()),
+            "state_root": str(state_root.resolve()),
+            "pid_alive": True,
+            "lifecycle_status": "ACTIVE",
+            "phase_hint": "IMPLEMENTING",
+            "terminal_result_present": False,
+            "implementer_result_ref": "",
+            "implementer_outcome": "",
+            "implementer_verdict": "",
+            "implementer_retryable": False,
+            "evaluator_status": "",
+            "evaluator_running_unit_ids": [],
+            "evaluator_completed_unit_ids": [],
+            "evaluator_blocked_retryable_unit_ids": [],
+            "evaluator_blocked_terminal_unit_ids": [],
+            "evaluator_pending_unit_ids": [],
+            "observed_doc_refs": [
+                str((workspace_root / "FROZEN_HANDOFF.md").resolve()),
+                str((ROOT / ".cache" / "leanatlas" / "tmp" / "arxiv_2602_11505v2" / "source" / "main.tex").resolve()),
+                str((ROOT / "loop_product_repo" / ".agents" / "skills" / "loop-runner" / "SKILL.md").resolve()),
+                str((ROOT / "loop_product_repo" / "docs" / "contracts" / "LOOP_EVALUATOR_PROTOTYPE_PRODUCT_MANUAL.md").resolve()),
+            ],
+            "recent_log_lines": [
+                "Read the frozen handoff and the exact whole-paper benchmark docs before starting the first extraction batch.",
+                "Inspect the whole-paper source and baseline refs needed for the first source-backed extraction artifact batch.",
+                "I am still in the bounded xhigh startup pass and have not written the first artifact batch yet.",
+            ],
+        }
+
+        def _xhigh_snapshot_reader(*, result_ref: str | Path, stall_threshold_s: float = 60.0) -> dict[str, object]:
+            del result_ref, stall_threshold_s
+            return dict(xhigh_snapshot)
+
+        def _xhigh_recovery_runner(**payload):
+            xhigh_recovery_calls.append(dict(payload))
+            return {}
+
+        def _xhigh_launcher(*, result_ref: str | Path, startup_probe_ms: int = 1500, startup_health_timeout_ms: int = 12000):
+            del result_ref, startup_probe_ms, startup_health_timeout_ms
+            xhigh_launch_calls.append("unexpected")
+            return {}
+
+        xhigh_not_yet_result = supervise_child_until_settled(
+            launch_result_ref=launch_result_ref_1,
+            poll_interval_s=10.0,
+            stall_threshold_s=60.0,
+            max_recoveries=2,
+            max_wall_clock_s=70.0,
+            runtime_status_reader=_xhigh_status_reader,
+            recovery_runner=_xhigh_recovery_runner,
+            launcher=_xhigh_launcher,
+            progress_snapshot_reader=_xhigh_snapshot_reader,
+            no_substantive_progress_window_s=300.0,
+            now_fn=lambda: xhigh_now["t"],
+            sleep_fn=lambda seconds: xhigh_now.__setitem__("t", xhigh_now["t"] + float(seconds)),
+        )
+        Draft202012Validator(supervision_schema).validate(xhigh_not_yet_result)
+        if str(xhigh_not_yet_result.get("settled_reason") or "") != "timeout":
+            return _fail("xhigh startup should keep a larger bounded grace window before empty-workspace no-substantive-progress fires")
+        if xhigh_recovery_calls or xhigh_launch_calls:
+            return _fail("xhigh startup grace should not trigger recovery or relaunch in the pre-grace fixture")
+
+        xhigh_now["t"] = 3000.0
+        xhigh_status_calls["count"] = 0
+        xhigh_recovery_calls.clear()
+        xhigh_launch_calls.clear()
+        xhigh_stop_result = supervise_child_until_settled(
+            launch_result_ref=launch_result_ref_1,
+            poll_interval_s=10.0,
+            stall_threshold_s=60.0,
+            max_recoveries=2,
+            max_wall_clock_s=220.0,
+            runtime_status_reader=_xhigh_status_reader,
+            recovery_runner=_xhigh_recovery_runner,
+            launcher=_xhigh_launcher,
+            progress_snapshot_reader=_xhigh_snapshot_reader,
+            no_substantive_progress_window_s=300.0,
+            now_fn=lambda: xhigh_now["t"],
+            sleep_fn=lambda seconds: xhigh_now.__setitem__("t", xhigh_now["t"] + float(seconds)),
+        )
+        Draft202012Validator(supervision_schema).validate(xhigh_stop_result)
+        if str(xhigh_stop_result.get("settled_reason") or "") != "no_substantive_progress":
+            return _fail("xhigh startup must still settle to no_substantive_progress after the larger bounded grace window expires")
+        if xhigh_recovery_calls or xhigh_launch_calls:
+            return _fail("xhigh startup no-substantive-progress stop points must not pretend the child is recovery-eligible")
+
     print("[loop-system-child-supervision-helper] OK")
     return 0
 
