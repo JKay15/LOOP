@@ -377,6 +377,14 @@ def _dependency_snapshot_ready(snapshot: dict[str, Any]) -> bool:
     return outcome not in _NON_READY_TERMINAL_OUTCOMES
 
 
+def _required_output_paths_for_node_payload(node_payload: dict[str, Any]) -> list[str]:
+    return [
+        str(item).strip()
+        for item in list(node_payload.get("required_output_paths") or [])
+        if str(item).strip()
+    ]
+
+
 def authoritative_result_payload_dependency_ready(payload: dict[str, Any]) -> bool:
     status = str(payload.get("status") or "").strip().upper()
     outcome = str(payload.get("outcome") or "").strip().upper()
@@ -390,6 +398,8 @@ def authoritative_result_payload_dependency_ready(payload: dict[str, Any]) -> bo
 
 
 def authoritative_node_dependency_ready(*, state_root: Path, node_payload: dict[str, Any]) -> bool:
+    from loop_product.dispatch.publication import workspace_publication_ready_for_terminal_state
+
     status = str(node_payload.get("status") or "").strip().upper()
     if status not in _TERMINAL_DEPENDENCY_NODE_STATUSES:
         return False
@@ -407,10 +417,20 @@ def authoritative_node_dependency_ready(*, state_root: Path, node_payload: dict[
         result_payload = json.loads(result_ref.read_text(encoding="utf-8"))
     except Exception:
         return False
+    workspace_root = str(node_payload.get("workspace_root") or "").strip()
+    if workspace_root:
+        publication_gate = workspace_publication_ready_for_terminal_state(
+            workspace_root=workspace_root,
+            required_output_paths=_required_output_paths_for_node_payload(node_payload),
+        )
+        if not bool(publication_gate.get("ready")):
+            return False
     return authoritative_result_payload_dependency_ready(dict(result_payload or {}))
 
 
 def _workspace_artifact_hygiene_sync(*, kernel_state: KernelState) -> None:
+    from loop_product.dispatch.publication import inspect_workspace_publication_state
+
     for node_payload in kernel_state.nodes.values():
         workspace_root = str(node_payload.get("workspace_root") or "").strip()
         if not workspace_root:
@@ -418,7 +438,12 @@ def _workspace_artifact_hygiene_sync(*, kernel_state: KernelState) -> None:
         artifact_workspace = Path(workspace_root).expanduser().resolve()
         if not artifact_workspace.exists() or not artifact_workspace.is_dir():
             continue
-        canonicalize_workspace_artifact_heavy_trees(artifact_workspace)
+        publication_state = inspect_workspace_publication_state(workspace_root=artifact_workspace)
+        excluded_roots: list[Path] = []
+        publish_ref = str(publication_state.get("publish_artifact_ref") or "").strip()
+        if publish_ref:
+            excluded_roots.append(Path(publish_ref).expanduser().resolve())
+        canonicalize_workspace_artifact_heavy_trees(artifact_workspace, exclude_roots=excluded_roots)
 
 
 def _dependency_unblocked_resume_candidates(*, state_root: Path, kernel_state: KernelState) -> list[str]:
@@ -477,6 +502,7 @@ def synchronize_authoritative_node_results(
     authority: KernelMutationAuthority | None = None,
 ) -> KernelState:
     """Normalize durable node state from authoritative child result sinks."""
+    from loop_product.dispatch.publication import workspace_publication_ready_for_terminal_state
 
     require_kernel_authority(authority, surface="synchronize_authoritative_node_results")
     state_root = require_runtime_root(state_root)
@@ -500,6 +526,19 @@ def synchronize_authoritative_node_results(
             current_status=str(node_payload.get("status") or ""),
             payload=result_payload,
         )
+        if desired_status in {
+            NodeStatus.BLOCKED.value,
+            NodeStatus.COMPLETED.value,
+            NodeStatus.FAILED.value,
+        }:
+            workspace_root = str(node_payload.get("workspace_root") or "").strip()
+            if workspace_root:
+                publication_gate = workspace_publication_ready_for_terminal_state(
+                    workspace_root=workspace_root,
+                    required_output_paths=_required_output_paths_for_node_payload(node_payload),
+                )
+                if not bool(publication_gate.get("ready")):
+                    continue
         if desired_status != str(node_payload.get("status") or ""):
             node_payload["status"] = desired_status
             dirty = True

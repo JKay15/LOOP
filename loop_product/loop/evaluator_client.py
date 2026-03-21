@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from loop_product import build_endpoint_clarification_part1_input, run_evaluator
-from loop_product.artifact_hygiene import canonicalize_directory_artifact_heavy_trees
+from loop_product.artifact_hygiene import (
+    artifact_fingerprint,
+    canonicalize_directory_artifact_heavy_trees,
+    iter_runtime_heavy_tree_paths,
+)
 from loop_product.evaluator.agent_execution_policy import validate_evaluator_agent_execution, validate_repo_shipped_role_agent_cmd
 from loop_product.kernel.state import authoritative_node_dependency_ready, load_kernel_state
 from loop_product.kernel.submit import submit_control_envelope
@@ -21,6 +25,7 @@ from loop_product.protocols.control_envelope import ControlEnvelope, EnvelopeSta
 from loop_product.protocols.control_objects import NodeTerminalOutcome, NodeTerminalResult
 from loop_product.protocols.evaluator import EvaluatorNodeSubmission, EvaluatorResult, EvaluatorVerdict
 from loop_product.protocols.node import NodeSpec
+from loop_product.protocols.schema import validate_repo_object
 from loop_product.runtime_paths import (
     product_contract_path,
     product_package_root,
@@ -161,6 +166,55 @@ def _resolve_required_output_paths(submission: EvaluatorNodeSubmission) -> list[
         artifact_root=artifact_root,
         target_node_id=submission.target_node_id,
     )
+
+
+def _submission_requires_publication_receipt(submission: EvaluatorNodeSubmission) -> bool:
+    artifact_root = Path(submission.implementation_package_ref).expanduser().resolve()
+    workspace_root = Path(submission.workspace_root).expanduser().resolve()
+    deliverables_root = workspace_root / "deliverables"
+    try:
+        artifact_root.relative_to(deliverables_root)
+    except ValueError:
+        return False
+    return True
+
+
+def _enforce_publication_receipt_preflight(submission: EvaluatorNodeSubmission) -> None:
+    if not _submission_requires_publication_receipt(submission):
+        return
+    artifact_root = Path(submission.implementation_package_ref).expanduser().resolve()
+    receipt_ref = str(submission.artifact_publication_receipt_ref or "").strip()
+    if not receipt_ref:
+        raise ValueError(
+            "evaluator preflight requires a runtime-owned publication receipt before launch for workspace-local artifacts"
+        )
+    receipt_path = Path(receipt_ref).expanduser().resolve()
+    if not receipt_path.exists():
+        raise ValueError(f"evaluator preflight requires a runtime-owned publication receipt before launch: {receipt_path}")
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    validate_repo_object("LoopWorkspaceArtifactPublicationReceipt.schema.json", payload)
+    receipt_publish_ref = str(payload.get("publish_artifact_ref") or "").strip()
+    if not receipt_publish_ref or Path(receipt_publish_ref).expanduser().resolve() != artifact_root:
+        raise ValueError("evaluator publication receipt does not match the current published artifact root")
+    if artifact_root.exists() and artifact_root.is_dir():
+        heavy = [str(item) for item in iter_runtime_heavy_tree_paths(artifact_root)]
+        if heavy:
+            raise ValueError(
+                "evaluator preflight requires the published artifact root to stay free of runtime-owned heavy trees; "
+                f"republish before evaluator launch: {', '.join(heavy)}"
+            )
+    publish_fingerprint = artifact_fingerprint(artifact_root, ignore_runtime_heavy=False)
+    if str(payload.get("publish_artifact_fingerprint") or "").strip() != str(publish_fingerprint["fingerprint"]):
+        raise ValueError("evaluator preflight rejected a stale publication receipt for the published artifact root")
+    live_artifact_ref = str(payload.get("live_artifact_ref") or "").strip()
+    if not live_artifact_ref:
+        raise ValueError("evaluator publication receipt must include live_artifact_ref")
+    live_path = Path(live_artifact_ref).expanduser().resolve()
+    if not live_path.exists():
+        raise ValueError(f"evaluator publication receipt points at a missing live artifact root: {live_path}")
+    live_fingerprint = artifact_fingerprint(live_path, ignore_runtime_heavy=True)
+    if str(payload.get("live_artifact_fingerprint") or "").strip() != str(live_fingerprint["fingerprint"]):
+        raise ValueError("evaluator preflight rejected a stale publication receipt because the live artifact changed")
 
 
 def _enforce_directory_artifact_hygiene_preflight(submission: EvaluatorNodeSubmission) -> None:
@@ -511,6 +565,7 @@ def build_evaluator_submission_for_frozen_task(
     output_root: Path,
     implementation_package_ref: str | Path,
     product_manual_ref: str | Path,
+    artifact_publication_receipt_ref: str | Path = "",
     required_output_paths: Sequence[str] | None = None,
     final_effects_text_ref: str | Path = "",
     final_effect_requirements: Sequence[Mapping[str, Any]] | None = None,
@@ -541,6 +596,11 @@ def build_evaluator_submission_for_frozen_task(
     normalized_output_root = Path(output_root).resolve()
     normalized_workspace_root = Path(workspace_root).resolve()
     normalized_impl_ref = str(Path(implementation_package_ref).resolve())
+    normalized_receipt_ref = (
+        str(Path(artifact_publication_receipt_ref).resolve())
+        if str(artifact_publication_receipt_ref or "").strip()
+        else ""
+    )
     return EvaluatorNodeSubmission(
         evaluation_id=evaluation_id or f"implementer_task_{target_node.node_id}",
         evaluator_node_id=f"{target_node.node_id}__evaluator",
@@ -553,6 +613,7 @@ def build_evaluator_submission_for_frozen_task(
         workspace_root=str(normalized_workspace_root),
         output_root=str(normalized_output_root),
         implementation_package_ref=normalized_impl_ref,
+        artifact_publication_receipt_ref=normalized_receipt_ref,
         product_manual_ref=normalized_manual_ref,
         required_output_paths=normalized_required_output_paths,
         final_effects_text_ref=normalized_final_effects_ref,
@@ -747,6 +808,7 @@ def run_evaluator_node(
 ) -> tuple[EvaluatorResult, dict[str, str]]:
     """Run the simple evaluator as a node-local evaluator boundary."""
 
+    _enforce_publication_receipt_preflight(submission)
     _enforce_directory_artifact_hygiene_preflight(submission)
     _enforce_required_output_preflight(submission)
     _enforce_whole_paper_preflight(submission)

@@ -78,6 +78,12 @@ def _write_source_handoff(*, state_root: Path, workspace_root: Path, source_node
     handoff_md_ref = workspace_root / "FROZEN_HANDOFF.md"
     workspace_result_sink = workspace_root / "artifacts" / source_node.node_id / "result.json"
     kernel_result_sink = state_root / "artifacts" / source_node.node_id / "result.json"
+    workspace_live_artifact_relpath = ".tmp_primary_artifact"
+    workspace_live_artifact_ref = workspace_root / workspace_live_artifact_relpath
+    artifact_publication_receipt_ref = (
+        state_root / "artifacts" / "publication" / source_node.node_id / "WorkspaceArtifactPublicationReceipt.json"
+    )
+    artifact_publication_runner_ref = workspace_root / "PUBLISH_WORKSPACE_ARTIFACT.sh"
     payload = {
         "node_id": source_node.node_id,
         "round_id": source_node.round_id,
@@ -87,11 +93,15 @@ def _write_source_handoff(*, state_root: Path, workspace_root: Path, source_node
         "child_goal_slice": source_node.goal_slice,
         "workspace_root": str(workspace_root.resolve()),
         "workspace_mirror_relpath": "deliverables/primary_artifact",
+        "workspace_live_artifact_relpath": workspace_live_artifact_relpath,
+        "workspace_live_artifact_ref": str(workspace_live_artifact_ref.resolve()),
         "external_publish_target": "",
         "context_refs": [str(endpoint_artifact_ref.resolve())],
         "result_sink_ref": source_node.result_sink_ref,
         "workspace_result_sink_ref": str(workspace_result_sink.resolve()),
         "kernel_result_sink_ref": str(kernel_result_sink.resolve()),
+        "artifact_publication_receipt_ref": str(artifact_publication_receipt_ref.resolve()),
+        "artifact_publication_runner_ref": str(artifact_publication_runner_ref.resolve()),
         "evaluator_submission_ref": str((state_root / "artifacts" / "bootstrap" / "EvaluatorNodeSubmission.json").resolve()),
         "evaluator_runner_ref": str((workspace_root / "RUN_EVALUATOR_NODE_UNTIL_TERMINAL.sh").resolve()),
     }
@@ -543,6 +553,8 @@ def _split_required_outputs_persist_case() -> int:
                 return _fail("only the dependency-free required-output child should bootstrap immediately in this case")
             if bootstrap_calls[0].get("required_output_paths") != required_output_paths:
                 return _fail("split child bootstrap request must surface required_output_paths for frozen handoff generation")
+            if str(bootstrap_calls[0].get("workspace_live_artifact_relpath") or "") != ".tmp_primary_artifact":
+                return _fail("split child bootstrap request must preserve the source live artifact relpath invariant")
             node_graph = {item["node_id"]: item for item in authority["node_graph"]}
             if node_graph.get("child-followup-001", {}).get("status") != "PLANNED":
                 return _fail("dependency-bound follower child must remain PLANNED in required-output persistence case")
@@ -561,6 +573,7 @@ def _split_required_outputs_persist_case() -> int:
 
 def _authoritative_child_result_sync_case() -> int:
     from loop_product.dispatch.child_dispatch import materialize_child
+    from loop_product.dispatch.publication import publish_workspace_artifact_snapshot
     from loop_product.kernel.authority import kernel_internal_authority
     from loop_product.kernel.query import query_authority_view
     from loop_product.kernel.state import load_kernel_state
@@ -625,6 +638,81 @@ def _authoritative_child_result_sync_case() -> int:
         if runtime_state.get("attachment_state") != "TERMINAL":
             return _fail("authoritative child result sync must mark the stopped child runtime as TERMINAL")
         shutil.rmtree(child_workspace_root, ignore_errors=True)
+
+        gated_workspace_root = ROOT / "workspace" / "test-child-publication-gate-sync"
+        shutil.rmtree(gated_workspace_root, ignore_errors=True)
+        materialize_child(
+            state_root=state_root,
+            kernel_state=kernel_state,
+            parent_node_id="child-implementer-001",
+            node_id="child-publication-gated-001",
+            goal_slice="formalize the gated theorem segment only after published mirror exists",
+            round_id="R1.child-publication-gated-001",
+            execution_policy={"sandbox_mode": "workspace-write", "agent_provider": "codex_cli"},
+            reasoning_profile={"thinking_budget": "medium", "role": "implementer"},
+            budget_profile={"max_rounds": 1},
+            allowed_actions=["implement", "report"],
+            workspace_root=str(gated_workspace_root.resolve()),
+            codex_home="",
+            depends_on_node_ids=[],
+            activation_condition="",
+            result_sink_ref="artifacts/child-publication-gated-001/result.json",
+            lineage_ref="root-kernel->child-implementer-001->child-publication-gated-001",
+            authority=authority,
+        )
+        gated_live_root = gated_workspace_root / ".tmp_primary_artifact"
+        gated_publish_root = gated_workspace_root / "deliverables" / "primary_artifact"
+        gated_receipt_ref = state_root / "artifacts" / "publication" / "child-publication-gated-001" / "WorkspaceArtifactPublicationReceipt.json"
+        gated_live_root.mkdir(parents=True, exist_ok=True)
+        (gated_live_root / "README.md").write_text("# child\n", encoding="utf-8")
+        (gated_workspace_root / "FROZEN_HANDOFF.json").write_text(
+            json.dumps(
+                {
+                    "node_id": "child-publication-gated-001",
+                    "workspace_live_artifact_ref": str(gated_live_root.resolve()),
+                    "workspace_mirror_ref": str(gated_publish_root.resolve()),
+                    "artifact_publication_receipt_ref": str(gated_receipt_ref.resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        gated_result_ref = state_root / "artifacts" / "child-publication-gated-001" / "result.json"
+        gated_result_ref.parent.mkdir(parents=True, exist_ok=True)
+        gated_result_ref.write_text(
+            json.dumps(
+                {
+                    "schema": "loop_product.child_result",
+                    "node_id": "child-publication-gated-001",
+                    "status": "BLOCKED",
+                    "outcome": "BLOCKED",
+                    "summary": "branch is ready to block only after the published mirror exists",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        gated_authority_view = query_authority_view(state_root)
+        gated_graph = {item["node_id"]: item for item in gated_authority_view["node_graph"]}
+        if gated_graph.get("child-publication-gated-001", {}).get("status") != NodeStatus.ACTIVE.value:
+            return _fail("authoritative child result sync must not terminalize a workspace-local child before publication receipt exists")
+
+        publish_workspace_artifact_snapshot(
+            node_id="child-publication-gated-001",
+            live_artifact_ref=gated_live_root,
+            publish_artifact_ref=gated_publish_root,
+            publication_receipt_ref=gated_receipt_ref,
+        )
+        gated_authority_view = query_authority_view(state_root)
+        gated_graph = {item["node_id"]: item for item in gated_authority_view["node_graph"]}
+        if gated_graph.get("child-publication-gated-001", {}).get("status") != NodeStatus.BLOCKED.value:
+            return _fail("authoritative child result sync must terminalize the child once a matching publication receipt exists")
+        shutil.rmtree(gated_workspace_root, ignore_errors=True)
 
     return 0
 

@@ -66,6 +66,9 @@
       "type": "string",
       "minLength": 1
     },
+    "artifact_publication_receipt_ref": {
+      "type": "string"
+    },
     "product_manual_ref": {
       "type": "string",
       "minLength": 1

@@ -29,7 +29,9 @@ description: Run one bounded LOOP node round using the repo-local kernel, dispat
 - If the frozen goal already names staged benchmark phases or required sections, do not stop after creating a placeholder skeleton for those sections; After the skeleton exists, materially advance the first incomplete staged phase with source-backed content before broadening into later phases or open-ended reconnaissance; planned outputs, `pending` tables, TODO notes, or placeholder headings alone do not count as substantive staged progress.
 - Produce implementation progress and bounded implementation changes.
 - Call the evaluator surface after implementation work for the current round, using the documented evaluator product surface from `docs/contracts/LOOP_EVALUATOR_PROTOTYPE_PRODUCT_MANUAL.md`.
-- Before evaluator or final report, the final `deliverables/primary_artifact` must not ship runtime-owned heavy trees such as `.lake`, `.git`, `.venv`, `.uv-cache`, `build`, or `_lake_build`; if `BUILD.sh` rematerializes them locally, prune them again before treating the shipped artifact as final.
+- Treat the live artifact root named in the frozen handoff as the only valid build root. `deliverables/primary_artifact` is a publish-only mirror, not a scratch package root.
+- Publish through the repo-shipped publication runner before evaluator or terminal reporting; a child-authored README, branch status file, or `WHOLE_PAPER_STATUS.json` is not a publication receipt.
+- Before evaluator or final report, the final `deliverables/primary_artifact` must be a published mirror with a matching runtime-owned publication receipt and no runtime-owned heavy trees such as `.lake`, `.git`, `.venv`, `.uv-cache`, `build`, or `_lake_build`.
 - Use `initialize_evaluator_runtime(...)` when you need a trusted evaluator runtime bootstrap; do not call `kernel_internal_authority()` or `persist_kernel_state(...)` directly from an ordinary child context.
 - When this repo's adapter path is available, prefer `EvaluatorNodeSubmission` plus `run_evaluator_node_until_terminal(...)` instead of starting from a raw hand-written evaluator request or ad hoc rerun loop.
 - Process the evaluator return.

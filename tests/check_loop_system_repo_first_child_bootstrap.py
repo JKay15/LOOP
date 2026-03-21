@@ -167,6 +167,12 @@ def main() -> int:
                 return _fail("frozen handoff must persist the exact state_root for topology helpers")
             if str(handoff_payload.get("workspace_mirror_relpath") or "") != "deliverables/gon_birthday_poster.html":
                 return _fail("frozen handoff must persist the workspace mirror relpath")
+            expected_live_artifact_relpath = ".tmp_primary_artifact/gon_birthday_poster.html"
+            expected_live_artifact_ref = str((workspace_root / expected_live_artifact_relpath).resolve())
+            if str(handoff_payload.get("workspace_live_artifact_relpath") or "") != expected_live_artifact_relpath:
+                return _fail("frozen handoff must persist the exact live artifact relpath separate from the publish root")
+            if str(handoff_payload.get("workspace_live_artifact_ref") or "") != expected_live_artifact_ref:
+                return _fail("frozen handoff must persist the exact live artifact ref separate from the publish root")
             if str(handoff_payload.get("external_publish_target") or "") != "/Users/example/Desktop/gon_birthday_poster.html":
                 return _fail("frozen handoff must persist the external publish target")
             expected_workspace_sink_relpath = f"artifacts/{str(result.get('node_id') or '')}/implementer_result.json"
@@ -174,6 +180,10 @@ def main() -> int:
             expected_kernel_sink_ref = str((state_root / expected_workspace_sink_relpath).resolve())
             expected_evaluator_submission_ref = str((state_root / "artifacts" / "bootstrap" / "EvaluatorNodeSubmission.json").resolve())
             expected_evaluator_runner_ref = str((workspace_root / "RUN_EVALUATOR_NODE_UNTIL_TERMINAL.sh").resolve())
+            expected_publication_receipt_ref = str(
+                (state_root / "artifacts" / "publication" / str(result.get("node_id") or "") / "WorkspaceArtifactPublicationReceipt.json").resolve()
+            )
+            expected_publication_runner_ref = str((workspace_root / "PUBLISH_WORKSPACE_ARTIFACT.sh").resolve())
             expected_evaluator_manual_ref = str((state_root / "artifacts" / "bootstrap" / "EvaluatorProductManual.md").resolve())
             expected_evaluator_final_effects_ref = str((state_root / "artifacts" / "bootstrap" / "EvaluatorFinalEffects.md").resolve())
             if str(handoff_payload.get("workspace_result_sink_relpath") or "") != expected_workspace_sink_relpath:
@@ -186,6 +196,10 @@ def main() -> int:
                 return _fail("frozen handoff must persist the exact evaluator submission ref")
             if str(handoff_payload.get("evaluator_runner_ref") or "") != expected_evaluator_runner_ref:
                 return _fail("frozen handoff must persist the exact evaluator runner ref")
+            if str(handoff_payload.get("artifact_publication_receipt_ref") or "") != expected_publication_receipt_ref:
+                return _fail("frozen handoff must persist the exact artifact publication receipt ref")
+            if str(handoff_payload.get("artifact_publication_runner_ref") or "") != expected_publication_runner_ref:
+                return _fail("frozen handoff must persist the exact workspace-local publication runner ref")
             if str(handoff_payload.get("external_publication_owner") or "") != "root-kernel":
                 return _fail("frozen handoff must persist root-kernel as the normal external publication owner")
             if str(handoff_payload.get("external_input_policy") or "") != "read_only_external_inputs_allowed_when_required_by_frozen_endpoint":
@@ -198,9 +212,17 @@ def main() -> int:
                 return _fail("bootstrap result must surface the exact evaluator submission ref")
             if str(result.get("evaluator_runner_ref") or "") != expected_evaluator_runner_ref:
                 return _fail("bootstrap result must surface the exact evaluator runner ref")
+            if str(result.get("workspace_live_artifact_ref") or "") != expected_live_artifact_ref:
+                return _fail("bootstrap result must surface the exact live artifact ref separate from the publish root")
+            if str(result.get("artifact_publication_receipt_ref") or "") != expected_publication_receipt_ref:
+                return _fail("bootstrap result must surface the exact artifact publication receipt ref")
+            if str(result.get("artifact_publication_runner_ref") or "") != expected_publication_runner_ref:
+                return _fail("bootstrap result must surface the exact workspace-local publication runner ref")
             handoff_md_text = handoff_md.read_text(encoding="utf-8")
             if f"- state_root: `{state_root.resolve()}`" not in handoff_md_text:
                 return _fail("frozen handoff markdown must include the exact state_root for helper replay")
+            if f"- workspace_live_artifact_ref: `{expected_live_artifact_ref}`" not in handoff_md_text:
+                return _fail("frozen handoff markdown must include the exact live artifact ref")
 
             prompt_text = child_prompt.read_text(encoding="utf-8")
             for needle in (
@@ -225,9 +247,15 @@ def main() -> int:
                 str((ROOT / "scripts" / "find_local_input_candidates.sh").resolve()),
                 str((ROOT / "scripts" / "submit_split_request_from_handoff.sh").resolve()),
                 str((ROOT / "scripts" / "submit_activate_request_from_handoff.sh").resolve()),
+                expected_live_artifact_ref,
+                expected_publication_receipt_ref,
+                expected_publication_runner_ref,
                 expected_kernel_sink_ref,
                 expected_workspace_sink_ref,
                 "fresh workspace-local Lean package",
+                "Build in the live artifact root first and treat the workspace mirror as publish-only",
+                "Publish through the exact publication runner before evaluator or terminal report",
+                "A child-authored WHOLE_PAPER_STATUS.json or branch README is not a publication receipt",
                 "shared-cache helper named in the frozen handoff context refs",
                 "before the first `lake build`",
                 "live `git clone`, `lake update`, or `lake exe cache get`",
@@ -264,6 +292,8 @@ def main() -> int:
                     return _fail(f"child prompt must explain {needle!r}")
             if not Path(expected_evaluator_runner_ref).exists():
                 return _fail("bootstrap must materialize the exact evaluator runner script")
+            if not Path(expected_publication_runner_ref).exists():
+                return _fail("bootstrap must materialize the exact publication runner script")
             if not Path(expected_evaluator_submission_ref).exists():
                 return _fail("bootstrap must materialize the exact evaluator submission artifact")
             if not Path(expected_evaluator_manual_ref).exists():
@@ -284,6 +314,8 @@ def main() -> int:
                 return _fail("ordinary implementer bootstrap must not hardcode endpoint-clarification final effects refs")
             if str(submission_payload.get("implementation_package_ref") or "") != str((workspace_root / "deliverables" / "gon_birthday_poster.html").resolve()):
                 return _fail("ordinary implementer bootstrap must point implementation_package_ref at the workspace mirror artifact")
+            if str(submission_payload.get("artifact_publication_receipt_ref") or "") != expected_publication_receipt_ref:
+                return _fail("ordinary implementer bootstrap must point evaluator submission at the exact publication receipt ref")
             role_requirements = dict(submission_payload.get("role_requirements") or {})
             for role_id in ("checker", "test_designer", "ai_user", "reviewer"):
                 if not str(role_requirements.get(role_id) or "").strip():
@@ -377,6 +409,8 @@ def main() -> int:
                 return _fail(
                     "endpoint-driven bootstrap must derive workspace_mirror_relpath from the external publish target basename"
                 )
+            if str(derived_handoff_payload.get("workspace_live_artifact_relpath") or "") != ".tmp_primary_artifact/gon_birthday_poster.html":
+                return _fail("endpoint-driven bootstrap must derive a distinct live artifact relpath from the publish target")
             if "offline music playback" not in str(derived_handoff_payload.get("child_goal_slice") or ""):
                 return _fail("endpoint-driven bootstrap must derive child_goal_slice from the endpoint requirement artifact")
             derived_workspace_sink_relpath = f"artifacts/{str(derived.get('node_id') or '')}/implementer_result.json"

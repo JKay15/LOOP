@@ -227,7 +227,30 @@ def main() -> int:
             return _fail("runtime status must surface terminal lifecycle_status once authoritative terminal result exists")
 
         active_hygiene_workspace_root = workspace_root / "child-hygiene-live-001"
+        active_hygiene_live_root = active_hygiene_workspace_root / ".tmp_primary_artifact"
         active_hygiene_artifact_root = active_hygiene_workspace_root / "deliverables" / "primary_artifact"
+        active_hygiene_receipt_ref = (
+            state_root / "artifacts" / "publication" / "child-hygiene-live-001" / "WorkspaceArtifactPublicationReceipt.json"
+        )
+        active_hygiene_workspace_root.mkdir(parents=True, exist_ok=True)
+        (active_hygiene_workspace_root / "FROZEN_HANDOFF.json").write_text(
+            json.dumps(
+                {
+                    "node_id": "child-hygiene-live-001",
+                    "workspace_live_artifact_ref": str(active_hygiene_live_root.resolve()),
+                    "workspace_mirror_ref": str(active_hygiene_artifact_root.resolve()),
+                    "artifact_publication_receipt_ref": str(active_hygiene_receipt_ref.resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (active_hygiene_live_root / ".lake" / "packages" / "mathlib").mkdir(parents=True, exist_ok=True)
+        (active_hygiene_live_root / ".lake" / "packages" / "mathlib" / "dummy.txt").write_text("live-cache\n", encoding="utf-8")
+        (active_hygiene_live_root / "build" / "lib").mkdir(parents=True, exist_ok=True)
+        (active_hygiene_live_root / "build" / "lib" / "artifact.txt").write_text("live-build\n", encoding="utf-8")
         (active_hygiene_artifact_root / ".lake" / "packages" / "mathlib").mkdir(parents=True, exist_ok=True)
         (active_hygiene_artifact_root / ".lake" / "packages" / "mathlib" / "dummy.txt").write_text("cached\n", encoding="utf-8")
         (active_hygiene_artifact_root / ".git").mkdir(parents=True, exist_ok=True)
@@ -262,14 +285,43 @@ def main() -> int:
         persist_kernel_state(state_root, active_hygiene_kernel_state, authority=kernel_internal_authority())
         _ = query_authority_view(state_root)
         for heavyweight_relpath in (".lake", ".git", ".venv", ".uv-cache", "build", "_lake_build"):
-            if (active_hygiene_artifact_root / heavyweight_relpath).exists():
+            if not (active_hygiene_artifact_root / heavyweight_relpath).exists():
                 return _fail(
-                    "authority sync must scrub runtime-owned heavy trees from live child deliverables, "
-                    f"but left {heavyweight_relpath} behind"
+                    "authority sync must not silently scrub the current publish root for an ACTIVE node; "
+                    f"it unexpectedly removed {heavyweight_relpath}"
+                )
+        for live_relpath in (".lake", "build"):
+            if not (active_hygiene_live_root / live_relpath).exists():
+                return _fail(
+                    "authority sync must leave the distinct live build root intact instead of canonicalizing it as a publish root, "
+                    f"but removed {live_relpath} from .tmp_primary_artifact"
                 )
 
         active_runtime_hygiene_workspace_root = workspace_root / "child-hygiene-live-status-001"
+        active_runtime_hygiene_live_root = active_runtime_hygiene_workspace_root / ".tmp_primary_artifact"
         active_runtime_hygiene_artifact_root = active_runtime_hygiene_workspace_root / "deliverables" / "primary_artifact"
+        active_runtime_hygiene_receipt_ref = (
+            state_root / "artifacts" / "publication" / "child-hygiene-live-status-001" / "WorkspaceArtifactPublicationReceipt.json"
+        )
+        active_runtime_hygiene_workspace_root.mkdir(parents=True, exist_ok=True)
+        (active_runtime_hygiene_workspace_root / "FROZEN_HANDOFF.json").write_text(
+            json.dumps(
+                {
+                    "node_id": "child-hygiene-live-status-001",
+                    "workspace_live_artifact_ref": str(active_runtime_hygiene_live_root.resolve()),
+                    "workspace_mirror_ref": str(active_runtime_hygiene_artifact_root.resolve()),
+                    "artifact_publication_receipt_ref": str(active_runtime_hygiene_receipt_ref.resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (active_runtime_hygiene_live_root / ".lake" / "packages" / "mathlib").mkdir(parents=True, exist_ok=True)
+        (active_runtime_hygiene_live_root / ".lake" / "packages" / "mathlib" / "dummy.txt").write_text("live-cache\n", encoding="utf-8")
+        (active_runtime_hygiene_live_root / "build" / "lib").mkdir(parents=True, exist_ok=True)
+        (active_runtime_hygiene_live_root / "build" / "lib" / "artifact.txt").write_text("live-build\n", encoding="utf-8")
         (active_runtime_hygiene_artifact_root / ".lake" / "packages" / "mathlib").mkdir(parents=True, exist_ok=True)
         (active_runtime_hygiene_artifact_root / ".lake" / "packages" / "mathlib" / "dummy.txt").write_text("cached\n", encoding="utf-8")
         (active_runtime_hygiene_artifact_root / "build" / "lib").mkdir(parents=True, exist_ok=True)
@@ -357,13 +409,19 @@ def main() -> int:
                     os.environ["LOOP_CHILD_RUNTIME_STATUS_MODE"] = previous_runtime_status_mode
             if str(status_payload.get("lifecycle_status") or "") != "ACTIVE":
                 return _fail("live runtime-status hygiene fixture must stay ACTIVE while the child pid is still attached")
-            if str(status_payload.get("recovery_reason") or "") != "live_pid_still_attached":
-                return _fail("live runtime-status hygiene fixture must remain a live-pid status check, not recovery")
-            for heavyweight_relpath in (".lake", "build"):
-                if (active_runtime_hygiene_artifact_root / heavyweight_relpath).exists():
+            if str(status_payload.get("recovery_reason") or "") != "publish_root_materialized_without_publication_receipt":
+                return _fail("runtime status polling must classify direct publish-root mutation as a publication violation")
+            if not bool(status_payload.get("recovery_eligible")):
+                return _fail("publish-root publication violation must become recovery-eligible")
+            if bool(status_payload.get("pid_alive")):
+                return _fail("runtime status polling must terminate the live child before surfacing publish-root violation recovery")
+            if active_runtime_hygiene_artifact_root.exists():
+                return _fail("runtime status polling must clear the invalid publish root after publication-violation detection")
+            for live_relpath in (".lake", "build"):
+                if not (active_runtime_hygiene_live_root / live_relpath).exists():
                     return _fail(
-                        "runtime status polling must scrub runtime-owned heavy trees from active child deliverables "
-                        f"before returning, but left {heavyweight_relpath} behind"
+                        "runtime status polling must preserve the live build root while invalidating the publish root, "
+                        f"but removed {live_relpath} from .tmp_primary_artifact"
                     )
         finally:
             live_proc.terminate()

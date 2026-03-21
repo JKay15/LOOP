@@ -78,6 +78,7 @@ def _child_bootstrap_request_from_source_handoff(
         "child_goal_slice": goal_slice,
         "endpoint_artifact_ref": endpoint_artifact_ref,
         "workspace_mirror_relpath": str(handoff.get("workspace_mirror_relpath") or "deliverables/primary_artifact"),
+        "workspace_live_artifact_relpath": str(handoff.get("workspace_live_artifact_relpath") or ".tmp_primary_artifact"),
         "external_publish_target": str(handoff.get("external_publish_target") or ""),
         "required_output_paths": [str(item).strip() for item in list(child_record.get("required_output_paths") or []) if str(item).strip()],
         "context_refs": deduped_context_refs,

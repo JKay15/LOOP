@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopWorkspaceArtifactPublicationReceipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "node_id",
+    "published_at_utc",
+    "live_artifact_ref",
+    "publish_artifact_ref",
+    "live_artifact_kind",
+    "publish_artifact_kind",
+    "live_artifact_fingerprint",
+    "publish_artifact_fingerprint",
+    "removed_runtime_heavy_trees",
+    "publication_receipt_ref"
+  ],
+  "properties": {
+    "node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "published_at_utc": {
+      "type": "string",
+      "minLength": 1
+    },
+    "live_artifact_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "publish_artifact_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "live_artifact_kind": {
+      "type": "string",
+      "enum": [
+        "file",
+        "directory"
+      ]
+    },
+    "publish_artifact_kind": {
+      "type": "string",
+      "enum": [
+        "file",
+        "directory"
+      ]
+    },
+    "live_artifact_fingerprint": {
+      "type": "string",
+      "minLength": 1
+    },
+    "publish_artifact_fingerprint": {
+      "type": "string",
+      "minLength": 1
+    },
+    "removed_runtime_heavy_trees": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "publication_receipt_ref": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

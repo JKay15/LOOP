@@ -53,6 +53,10 @@
       "type": "string",
       "minLength": 1
     },
+    "workspace_live_artifact_relpath": {
+      "type": "string",
+      "minLength": 1
+    },
     "external_publish_target": {
       "type": "string"
     },

@@ -552,6 +552,34 @@ def _write_unknown_reviewer_agent(path: Path) -> None:
     path.chmod(0o755)
 
 
+def _write_publication_receipt(
+    path: Path,
+    *,
+    node_id: str,
+    live_artifact_ref: Path,
+    publish_artifact_ref: Path,
+) -> Path:
+    from loop_product.artifact_hygiene import artifact_fingerprint
+
+    live_fp = artifact_fingerprint(live_artifact_ref, ignore_runtime_heavy=True)
+    publish_fp = artifact_fingerprint(publish_artifact_ref, ignore_runtime_heavy=False)
+    payload = {
+        "node_id": node_id,
+        "published_at_utc": "2026-03-22T00:00:00Z",
+        "live_artifact_ref": str(live_artifact_ref.resolve()),
+        "publish_artifact_ref": str(publish_artifact_ref.resolve()),
+        "live_artifact_kind": str(live_fp["artifact_kind"]),
+        "publish_artifact_kind": str(publish_fp["artifact_kind"]),
+        "live_artifact_fingerprint": str(live_fp["fingerprint"]),
+        "publish_artifact_fingerprint": str(publish_fp["fingerprint"]),
+        "removed_runtime_heavy_trees": [],
+        "publication_receipt_ref": str(path.resolve()),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
 def main() -> int:
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
@@ -1185,11 +1213,18 @@ def main() -> int:
             + "\n",
             encoding="utf-8",
         )
+        whole_paper_gate_receipt_ref = _write_publication_receipt(
+            whole_paper_gate_state_root / "artifacts" / "publication" / whole_paper_gate_child_node.node_id / "WorkspaceArtifactPublicationReceipt.json",
+            node_id=whole_paper_gate_child_node.node_id,
+            live_artifact_ref=whole_paper_gate_artifact_root,
+            publish_artifact_ref=whole_paper_gate_artifact_root,
+        )
         whole_paper_gate_submission = build_evaluator_submission_for_frozen_task(
             target_node=whole_paper_gate_child_node,
             workspace_root=whole_paper_gate_workspace_root,
             output_root=whole_paper_gate_state_root / "artifacts" / "evaluator_node_whole_paper_gate_runs",
             implementation_package_ref=whole_paper_gate_artifact_root,
+            artifact_publication_receipt_ref=whole_paper_gate_receipt_ref,
             product_manual_ref=manual_ref,
             final_effects_text_ref=final_effects_ref,
             role_agent_cmd=_fixture_role_agent_cmd(scenario="wave_sequence"),
@@ -1323,11 +1358,22 @@ def main() -> int:
             + "\n",
             encoding="utf-8",
         )
+        whole_paper_dependency_gate_receipt_ref = _write_publication_receipt(
+            whole_paper_dependency_gate_state_root
+            / "artifacts"
+            / "publication"
+            / final_integration_node.node_id
+            / "WorkspaceArtifactPublicationReceipt.json",
+            node_id=final_integration_node.node_id,
+            live_artifact_ref=whole_paper_dependency_gate_artifact_root,
+            publish_artifact_ref=whole_paper_dependency_gate_artifact_root,
+        )
         whole_paper_dependency_gate_submission = build_evaluator_submission_for_frozen_task(
             target_node=final_integration_node,
             workspace_root=whole_paper_dependency_gate_workspace_root,
             output_root=whole_paper_dependency_gate_state_root / "artifacts" / "evaluator_node_whole_paper_dependency_gate_runs",
             implementation_package_ref=whole_paper_dependency_gate_artifact_root,
+            artifact_publication_receipt_ref=whole_paper_dependency_gate_receipt_ref,
             product_manual_ref=dependency_gate_manual_ref,
             final_effects_text_ref=dependency_gate_final_effects_ref,
             role_agent_cmd=_fixture_role_agent_cmd(scenario="wave_sequence"),
@@ -1462,11 +1508,22 @@ def main() -> int:
             + "\n",
             encoding="utf-8",
         )
+        split_child_gate_receipt_ref = _write_publication_receipt(
+            split_child_required_output_gate_state_root
+            / "artifacts"
+            / "publication"
+            / split_child_gate_node.node_id
+            / "WorkspaceArtifactPublicationReceipt.json",
+            node_id=split_child_gate_node.node_id,
+            live_artifact_ref=split_child_required_output_gate_artifact_root,
+            publish_artifact_ref=split_child_required_output_gate_artifact_root,
+        )
         split_child_gate_submission = build_evaluator_submission_for_frozen_task(
             target_node=split_child_gate_node,
             workspace_root=split_child_required_output_gate_workspace_root,
             output_root=split_child_required_output_gate_state_root / "artifacts" / "evaluator_split_child_gate_runs",
             implementation_package_ref=split_child_required_output_gate_artifact_root,
+            artifact_publication_receipt_ref=split_child_gate_receipt_ref,
             product_manual_ref=split_child_gate_manual_ref,
             final_effects_text_ref=split_child_gate_final_effects_ref,
             role_agent_cmd=_fixture_role_agent_cmd(scenario="wave_sequence"),
@@ -1483,6 +1540,109 @@ def main() -> int:
                 return _fail("split-child evaluator preflight rejection must explain which required output is still missing")
         else:
             return _fail("split-child evaluator launch must fail closed when declared required outputs are still missing")
+
+        publication_receipt_gate_state_root = temp_root / ".loop" / "publication_receipt_gate"
+        publication_receipt_gate_workspace_root = temp_root / "publication_receipt_gate_workspace"
+        publication_receipt_gate_artifact_root = publication_receipt_gate_workspace_root / "deliverables" / "primary_artifact"
+        publication_receipt_gate_artifact_root.mkdir(parents=True, exist_ok=True)
+        ensure_runtime_tree(publication_receipt_gate_state_root)
+        publication_gate_root_node = NodeSpec(
+            node_id="publication-receipt-gate-root",
+            node_kind="kernel",
+            goal_slice="exercise publication receipt evaluator gate",
+            parent_node_id=None,
+            generation=0,
+            round_id="R0",
+            execution_policy={"mode": "kernel"},
+            reasoning_profile={"role": "kernel", "thinking_budget": "medium"},
+            budget_profile={"max_rounds": 1},
+            allowed_actions=["dispatch", "submit", "audit"],
+            delegation_ref="",
+            result_sink_ref="artifacts/publication_receipt_gate/root_summary.json",
+            lineage_ref="publication-receipt-gate-root",
+            status=NodeStatus.ACTIVE,
+        )
+        publication_gate_node = NodeSpec(
+            node_id="publication-receipt-gate-child",
+            node_kind="implementer",
+            goal_slice="formalize the bounded split branch and only launch evaluator after runtime-owned publication",
+            parent_node_id=publication_gate_root_node.node_id,
+            generation=1,
+            round_id="R1.S1",
+            execution_policy={"sandbox_mode": "danger-full-access"},
+            reasoning_profile={"role": "implementer", "thinking_budget": "high"},
+            budget_profile={"max_rounds": 1},
+            allowed_actions=["evaluate", "report"],
+            delegation_ref="state/delegations/publication-receipt-gate-child.json",
+            result_sink_ref="artifacts/publication_receipt_gate/implementer_result.json",
+            lineage_ref="publication-receipt-gate-root->publication-receipt-gate-child",
+            status=NodeStatus.ACTIVE,
+        )
+        publication_gate_kernel_state = KernelState(
+            task_id="publication-receipt-gate",
+            root_goal="reject evaluator launch until runtime-owned publication receipt exists",
+            root_node_id=publication_gate_root_node.node_id,
+        )
+        publication_gate_kernel_state.register_node(publication_gate_root_node)
+        publication_gate_kernel_state.register_node(publication_gate_node)
+        persist_kernel_state(
+            publication_receipt_gate_state_root,
+            publication_gate_kernel_state,
+            authority=kernel_internal_authority(),
+        )
+        (publication_receipt_gate_artifact_root / "README.md").write_text("# README\n", encoding="utf-8")
+        (publication_receipt_gate_artifact_root / "TRACEABILITY.md").write_text("# Traceability\n", encoding="utf-8")
+        (publication_receipt_gate_artifact_root / "appendix_claims.lean").write_text("-- placeholder\n", encoding="utf-8")
+        (publication_receipt_gate_artifact_root / "WHOLE_PAPER_STATUS.json").write_text(
+            json.dumps(
+                {
+                    "status": "TERMINAL",
+                    "terminal_classification": "paper defect exposed",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        publication_gate_manual_ref = publication_receipt_gate_workspace_root / "PRODUCT_MANUAL.md"
+        publication_gate_manual_ref.write_text("# Manual\n\nPublication receipt gate fixture.\n", encoding="utf-8")
+        publication_gate_final_effects_ref = publication_receipt_gate_workspace_root / "FINAL_EFFECTS.md"
+        publication_gate_final_effects_ref.write_text(
+            "\n".join(
+                [
+                    "# Final Effects",
+                    "",
+                    "- whole-paper faithful complete formalization",
+                    "- paper defect exposed",
+                    "- evaluator launch requires a runtime-owned publication receipt",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        publication_gate_submission = build_evaluator_submission_for_frozen_task(
+            target_node=publication_gate_node,
+            workspace_root=publication_receipt_gate_workspace_root,
+            output_root=publication_receipt_gate_state_root / "artifacts" / "evaluator_publication_receipt_gate_runs",
+            implementation_package_ref=publication_receipt_gate_artifact_root,
+            required_output_paths=["README.md", "TRACEABILITY.md", "appendix_claims.lean", "WHOLE_PAPER_STATUS.json"],
+            product_manual_ref=publication_gate_manual_ref,
+            final_effects_text_ref=publication_gate_final_effects_ref,
+            role_agent_cmd=_fixture_role_agent_cmd(scenario="wave_sequence"),
+        )
+        try:
+            run_evaluator_node_until_terminal(
+                state_root=publication_receipt_gate_state_root,
+                submission=publication_gate_submission,
+                max_same_run_recovery_attempts=0,
+            )
+        except ValueError as exc:
+            msg = str(exc)
+            if "publication receipt" not in msg.lower():
+                return _fail("evaluator preflight must explain that publication receipt is missing before launch")
+        else:
+            return _fail("evaluator launch must fail closed when the publication receipt is missing")
 
         runtime_closure_only_state_root = temp_root / ".loop" / "runtime_closure_only"
         runtime_closure_only_workspace_root = temp_root / "runtime_closure_only_workspace"
@@ -1727,31 +1887,32 @@ def main() -> int:
 
         artifact_workspace_root = temp_root / "artifact_workspace"
         artifact_root = artifact_workspace_root / "deliverables" / "primary_artifact"
-        (artifact_root / "LinearlyBiasedPredictorChain").mkdir(parents=True, exist_ok=True)
+        artifact_live_root = artifact_workspace_root / ".tmp_primary_artifact"
+        (artifact_live_root / "LinearlyBiasedPredictorChain").mkdir(parents=True, exist_ok=True)
         (artifact_workspace_root / "artifacts").mkdir(parents=True, exist_ok=True)
         (artifact_workspace_root / "workspace").mkdir(parents=True, exist_ok=True)
-        (artifact_root / "README.md").write_text("# README\n", encoding="utf-8")
-        (artifact_root / "TRACEABILITY.md").write_text("# TRACEABILITY\n", encoding="utf-8")
-        (artifact_root / "BUILD.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-        (artifact_root / "LinearlyBiasedPredictorChain" / "Core.lean").write_text("def stub : Nat := 0\n", encoding="utf-8")
-        (artifact_root / ".lake" / "packages" / "mathlib").mkdir(parents=True, exist_ok=True)
-        (artifact_root / ".lake" / "packages" / "mathlib" / "dummy.txt").write_text("cached\n", encoding="utf-8")
-        (artifact_root / ".git").mkdir(parents=True, exist_ok=True)
-        (artifact_root / ".git" / "config").write_text("[core]\n\trepositoryformatversion = 0\n", encoding="utf-8")
-        (artifact_root / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
-        (artifact_root / ".venv" / "bin" / "python").write_text("# stub\n", encoding="utf-8")
-        (artifact_root / ".uv-cache").mkdir(parents=True, exist_ok=True)
-        (artifact_root / ".uv-cache" / "cache.txt").write_text("cache\n", encoding="utf-8")
-        (artifact_root / "build" / "lib").mkdir(parents=True, exist_ok=True)
-        (artifact_root / "build" / "lib" / "artifact.txt").write_text("build\n", encoding="utf-8")
-        (artifact_root / "_lake_build" / "lib").mkdir(parents=True, exist_ok=True)
-        (artifact_root / "_lake_build" / "lib" / "artifact.txt").write_text("lake-build\n", encoding="utf-8")
+        (artifact_live_root / "README.md").write_text("# README\n", encoding="utf-8")
+        (artifact_live_root / "TRACEABILITY.md").write_text("# TRACEABILITY\n", encoding="utf-8")
+        (artifact_live_root / "BUILD.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (artifact_live_root / "LinearlyBiasedPredictorChain" / "Core.lean").write_text("def stub : Nat := 0\n", encoding="utf-8")
+        (artifact_live_root / ".lake" / "packages" / "mathlib").mkdir(parents=True, exist_ok=True)
+        (artifact_live_root / ".lake" / "packages" / "mathlib" / "dummy.txt").write_text("cached\n", encoding="utf-8")
+        (artifact_live_root / ".git").mkdir(parents=True, exist_ok=True)
+        (artifact_live_root / ".git" / "config").write_text("[core]\n\trepositoryformatversion = 0\n", encoding="utf-8")
+        (artifact_live_root / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+        (artifact_live_root / ".venv" / "bin" / "python").write_text("# stub\n", encoding="utf-8")
+        (artifact_live_root / ".uv-cache").mkdir(parents=True, exist_ok=True)
+        (artifact_live_root / ".uv-cache" / "cache.txt").write_text("cache\n", encoding="utf-8")
+        (artifact_live_root / "build" / "lib").mkdir(parents=True, exist_ok=True)
+        (artifact_live_root / "build" / "lib" / "artifact.txt").write_text("build\n", encoding="utf-8")
+        (artifact_live_root / "_lake_build" / "lib").mkdir(parents=True, exist_ok=True)
+        (artifact_live_root / "_lake_build" / "lib" / "artifact.txt").write_text("lake-build\n", encoding="utf-8")
         artifact_manual_ref = artifact_workspace_root / "PRODUCT_MANUAL.md"
         artifact_manual_ref.write_text("# Manual\n\nInspect the staged deliverable only.\n", encoding="utf-8")
-        if not (artifact_root / ".lake").exists():
-            return _fail("nested-heavy-tree regression fixture must materialize source deliverable .lake")
-        if not (artifact_root / ".git").exists():
-            return _fail("nested-heavy-tree regression fixture must materialize source deliverable .git")
+        if not (artifact_live_root / ".lake").exists():
+            return _fail("nested-heavy-tree regression fixture must materialize live artifact root .lake")
+        if not (artifact_live_root / ".git").exists():
+            return _fail("nested-heavy-tree regression fixture must materialize live artifact root .git")
 
         artifact_kernel_state = load_kernel_state(state_root)
         artifact_child_node = NodeSpec(
@@ -1772,12 +1933,22 @@ def main() -> int:
         )
         artifact_kernel_state.register_node(artifact_child_node)
         persist_kernel_state(state_root, artifact_kernel_state, authority=kernel_internal_authority())
+        from loop_product.dispatch.publication import publish_workspace_artifact_snapshot
+
+        artifact_receipt_ref = state_root / "artifacts" / "publication" / artifact_child_node.node_id / "WorkspaceArtifactPublicationReceipt.json"
+        publish_workspace_artifact_snapshot(
+            node_id=artifact_child_node.node_id,
+            live_artifact_ref=artifact_live_root,
+            publish_artifact_ref=artifact_root,
+            publication_receipt_ref=artifact_receipt_ref,
+        )
 
         artifact_copy_submission = build_evaluator_submission_for_frozen_task(
             target_node=artifact_child_node,
             workspace_root=artifact_workspace_root,
             output_root=state_root / "artifacts" / "evaluator_node_artifact_copy_runs",
             implementation_package_ref=artifact_root,
+            artifact_publication_receipt_ref=artifact_receipt_ref,
             product_manual_ref=artifact_manual_ref,
             final_effect_requirements=[
                 {
@@ -1802,10 +1973,15 @@ def main() -> int:
             Path("build"),
             Path("_lake_build"),
         ):
+            if (artifact_live_root / heavyweight_relpath).exists() is False:
+                return _fail(
+                    "workspace publication must preserve the live build root, including its heavyweight runtime trees, "
+                    f"but removed {heavyweight_relpath} from .tmp_primary_artifact"
+                )
             if (artifact_root / heavyweight_relpath).exists():
                 return _fail(
-                    "evaluator-node runtime must canonicalize the source deliverable itself and prune "
-                    f"runtime-owned heavy tree {heavyweight_relpath} before a successful evaluation"
+                    "workspace publication must canonicalize the published artifact root before evaluator launch and keep "
+                    f"runtime-owned heavy tree {heavyweight_relpath} out of deliverables/primary_artifact"
                 )
         artifact_copy_run_root = Path(str(artifact_copy_refs["evaluation_report_ref"])).resolve().parent
         for expected_workspace in (

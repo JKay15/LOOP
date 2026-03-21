@@ -14,6 +14,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from loop_product.artifact_hygiene import canonicalize_workspace_artifact_heavy_trees
+from loop_product.dispatch.publication import (
+    inspect_workspace_publication_state,
+    reset_workspace_publish_root,
+)
 from loop_product.ai_launch import (
     ai_launch_exit_code,
     detach_ai_launch_handle,
@@ -44,6 +48,10 @@ def _nonempty(value: Any) -> str:
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _utc_timestamp() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -134,16 +142,25 @@ def _load_terminal_implementer_result(*, state_root: Path, node_id: str, node_pa
     return result_ref, payload
 
 
-def _live_workspace_artifact_hygiene_sync(*, workspace_root: Path | None) -> list[str]:
+def _live_workspace_artifact_hygiene_sync(*, workspace_root: Path | None) -> dict[str, Any]:
     if workspace_root is None:
-        return []
+        return {"removed_refs": [], "publication_state": {"applicable": False, "violation": False}}
     try:
         candidate = workspace_root.expanduser().resolve()
     except Exception:
-        return []
+        return {"removed_refs": [], "publication_state": {"applicable": False, "violation": False}}
     if not candidate.exists() or not candidate.is_dir():
-        return []
-    return canonicalize_workspace_artifact_heavy_trees(candidate)
+        return {"removed_refs": [], "publication_state": {"applicable": False, "violation": False}}
+    publication_state = inspect_workspace_publication_state(workspace_root=candidate)
+    excluded_roots: list[Path] = []
+    publish_ref = str(publication_state.get("publish_artifact_ref") or "").strip()
+    if publish_ref:
+        excluded_roots.append(Path(publish_ref).expanduser().resolve())
+    removed_refs = canonicalize_workspace_artifact_heavy_trees(candidate, exclude_roots=excluded_roots)
+    return {
+        "removed_refs": removed_refs,
+        "publication_state": publication_state,
+    }
 
 
 def _terminal_evaluation_report_ref(payload: Mapping[str, Any]) -> Path | None:
@@ -634,7 +651,7 @@ def _direct_child_runtime_status_from_launch_result_ref(
     state_root = require_runtime_root(Path(str(launch_result["state_root"])).expanduser().resolve())
     node_id = str(launch_result["node_id"])
     workspace_root = Path(str(launch_result.get("workspace_root") or "")).expanduser()
-    _live_workspace_artifact_hygiene_sync(workspace_root=workspace_root)
+    hygiene_state = _live_workspace_artifact_hygiene_sync(workspace_root=workspace_root)
     node_ref = state_root / "state" / f"{node_id}.json"
     node_payload = _load_json(node_ref) if node_ref.exists() else {}
     runtime_state = normalize_runtime_state(dict(node_payload.get("runtime_state") or {}))
@@ -662,6 +679,13 @@ def _direct_child_runtime_status_from_launch_result_ref(
     runtime_observation_kind = str(runtime_state.get("observation_kind") or "")
     runtime_summary = str(runtime_state.get("summary") or "")
     runtime_evidence_refs = list(runtime_state.get("evidence_refs") or [])
+    publication_state = dict(hygiene_state.get("publication_state") or {})
+    publish_root_violation = bool(publication_state.get("violation"))
+    if publish_root_violation:
+        reset_workspace_publish_root(workspace_root=workspace_root)
+    if publish_root_violation and pid_alive:
+        _reap_runtime_owned_launch(launch_result)
+        pid_alive = pid > 0 and _pid_alive(pid)
 
     if terminal_result_payload:
         _reap_runtime_owned_launch(launch_result)
@@ -678,6 +702,17 @@ def _direct_child_runtime_status_from_launch_result_ref(
         stalled_hint = False
         recovery_eligible = False
         recovery_reason = "authoritative_terminal_result"
+    elif publish_root_violation:
+        lifecycle_status = lifecycle_status or "ACTIVE"
+        runtime_attachment_state = "LOST"
+        runtime_observed_at = _utc_timestamp()
+        runtime_observation_kind = "publish_root_violation"
+        runtime_summary = str(publication_state.get("violation_summary") or "publish root violated runtime publication invariants")
+        violation_evidence = str(publication_state.get("publish_artifact_ref") or "").strip()
+        runtime_evidence_refs = [item for item in [violation_evidence, *runtime_evidence_refs] if item]
+        stalled_hint = False
+        recovery_eligible = True
+        recovery_reason = str(publication_state.get("violation_reason") or "publish_root_violation")
     else:
         lifecycle_active_like = lifecycle_status in {"", "ACTIVE"}
         runtime_loss_confirmed = bool(
@@ -752,9 +787,18 @@ def child_runtime_status_from_launch_result_ref(
             launch_result_ref=str(Path(result_ref).expanduser().resolve()),
             stall_threshold_s=float(stall_threshold_s),
         )
-        _live_workspace_artifact_hygiene_sync(
+        hygiene_state = _live_workspace_artifact_hygiene_sync(
             workspace_root=Path(str(payload.get("workspace_root") or "")).expanduser()
         )
+        publication_state = dict(hygiene_state.get("publication_state") or {})
+        if bool(publication_state.get("violation")):
+            launch_payload = _load_optional_json(Path(result_ref).expanduser().resolve())
+            if launch_payload:
+                _reap_runtime_owned_launch(launch_payload)
+            return _direct_child_runtime_status_from_launch_result_ref(
+                result_ref=result_ref,
+                stall_threshold_s=stall_threshold_s,
+            )
         pid = int(payload.get("pid") or 0)
         if bool(payload.get("pid_alive")) and pid > 0 and not _pid_alive(pid):
             return _direct_child_runtime_status_from_launch_result_ref(

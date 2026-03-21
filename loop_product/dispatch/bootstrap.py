@@ -207,6 +207,7 @@ def _build_handoff_payload(
     child_goal_slice: str,
     workspace_root: Path,
     workspace_mirror_relpath: str,
+    workspace_live_artifact_relpath: str,
     external_publish_target: str,
     required_output_paths: list[str],
     context_refs: list[str],
@@ -214,6 +215,8 @@ def _build_handoff_payload(
     workspace_result_sink_relpath: str,
     workspace_result_sink_ref: str,
     kernel_result_sink_ref: str,
+    artifact_publication_receipt_ref: str,
+    artifact_publication_runner_ref: str,
     evaluator_submission_ref: str,
     evaluator_runner_ref: str,
 ) -> dict[str, Any]:
@@ -221,6 +224,10 @@ def _build_handoff_payload(
     if not workspace_mirror_relpath:
         raise ValueError("workspace_mirror_relpath must be non-empty")
     workspace_mirror_ref = str((workspace_root / workspace_mirror_relpath).resolve())
+    workspace_live_artifact_relpath = _nonempty(workspace_live_artifact_relpath)
+    if not workspace_live_artifact_relpath:
+        raise ValueError("workspace_live_artifact_relpath must be non-empty")
+    workspace_live_artifact_ref = str((workspace_root / workspace_live_artifact_relpath).resolve())
     return {
         "node_id": node.node_id,
         "parent_node_id": node.parent_node_id,
@@ -233,6 +240,8 @@ def _build_handoff_payload(
         "child_goal_slice": child_goal_slice,
         "workspace_mirror_relpath": workspace_mirror_relpath,
         "workspace_mirror_ref": workspace_mirror_ref,
+        "workspace_live_artifact_relpath": workspace_live_artifact_relpath,
+        "workspace_live_artifact_ref": workspace_live_artifact_ref,
         "external_publish_target": external_publish_target,
         "required_output_paths": [str(item).strip() for item in list(required_output_paths or []) if str(item).strip()],
         "context_refs": list(context_refs),
@@ -240,6 +249,8 @@ def _build_handoff_payload(
         "workspace_result_sink_relpath": workspace_result_sink_relpath,
         "workspace_result_sink_ref": workspace_result_sink_ref,
         "kernel_result_sink_ref": kernel_result_sink_ref,
+        "artifact_publication_receipt_ref": artifact_publication_receipt_ref,
+        "artifact_publication_runner_ref": artifact_publication_runner_ref,
         "evaluator_submission_ref": evaluator_submission_ref,
         "evaluator_runner_ref": evaluator_runner_ref,
         "external_publication_owner": "root-kernel",
@@ -267,11 +278,15 @@ def _render_handoff_md(payload: dict[str, Any]) -> str:
         "",
         f"- workspace_mirror_relpath: `{payload['workspace_mirror_relpath']}`",
         f"- workspace_mirror_ref: `{payload['workspace_mirror_ref']}`",
+        f"- workspace_live_artifact_relpath: `{payload['workspace_live_artifact_relpath']}`",
+        f"- workspace_live_artifact_ref: `{payload['workspace_live_artifact_ref']}`",
         f"- external_publish_target: `{payload['external_publish_target']}`",
         f"- result_sink_ref: `{payload['result_sink_ref']}`",
         f"- workspace_result_sink_relpath: `{payload['workspace_result_sink_relpath']}`",
         f"- workspace_result_sink_ref: `{payload['workspace_result_sink_ref']}`",
         f"- kernel_result_sink_ref: `{payload['kernel_result_sink_ref']}`",
+        f"- artifact_publication_receipt_ref: `{payload['artifact_publication_receipt_ref']}`",
+        f"- artifact_publication_runner_ref: `{payload['artifact_publication_runner_ref']}`",
         f"- evaluator_submission_ref: `{payload['evaluator_submission_ref']}`",
         f"- evaluator_runner_ref: `{payload['evaluator_runner_ref']}`",
         f"- external_publication_owner: `{payload['external_publication_owner']}`",
@@ -293,6 +308,9 @@ def _render_child_prompt(
     workspace_root: Path,
     handoff_md_path: Path,
     node: NodeSpec,
+    workspace_live_artifact_abs: Path,
+    artifact_publication_receipt_abs: Path,
+    artifact_publication_runner_abs: Path,
     workspace_result_sink_abs: Path,
     kernel_result_sink_abs: Path,
     evaluator_submission_abs: Path,
@@ -317,6 +335,9 @@ def _render_child_prompt(
             f"You are the implementer LOOP node `{node.node_id}`.",
             "",
             "Keep durable implementation writes inside the current workspace root, except for the exact authoritative kernel-visible result sink frozen in the handoff.",
+            "Build in the live artifact root first and treat the workspace mirror as publish-only.",
+            "Publish through the exact publication runner before evaluator or terminal report.",
+            "A child-authored WHOLE_PAPER_STATUS.json or branch README is not a publication receipt.",
             "Do not inspect sibling workspace task folders or historical deliverables as templates, evidence, or reuse context unless the frozen handoff explicitly names that exact reuse target.",
             "When this prompt names a committed repo-shipped wrapper or helper, call it directly before reading its source or tests unless the direct path fails.",
             "Treat exact frozen refs in the handoff/prompt as authoritative and do not guess alternate repo-root or lookalike paths before using them.",
@@ -331,9 +352,10 @@ def _render_child_prompt(
             "Do not spend the opening phase on broad repo scans when the exact frozen evaluator runner, evaluator submission, baseline refs, or helper refs are already named.",
             "Do not broad-search repo roots, `.loop/**` history, or unrelated evaluator workspaces for helper or template discovery when the exact frozen refs already name the required helper or baseline artifacts.",
             "If you create or ship a fresh workspace-local Lean package, use any committed shared-cache helper named in the frozen handoff context refs before the first `lake build`.",
+            "Run Lean/package tooling only inside the exact live artifact root named below; do not hydrate package trees or build outputs inside the publish root.",
             "Do not treat live `git clone`, `lake update`, or `lake exe cache get` as the normal first path for artifact-local `.lake/packages`; that path is fallback repair and must be reported as an environment defect.",
             "Before evaluator or final report, the final `deliverables/primary_artifact` must not ship runtime-owned heavy trees such as `.lake`, `.git`, `.venv`, `.uv-cache`, `build`, or `_lake_build`.",
-            "If local build support rematerializes those trees during `BUILD.sh`, prune them again before treating the shipped artifact as final.",
+            "If local build support rematerializes those trees inside the publish root, treat that as a runtime defect and republish from the live root instead of hand-waving it away.",
             "If a startup search or MCP helper reports rate-limit, tool exhaustion, or validation failure, do not keep retrying the same search family in the opening phase.",
             "Instead downgrade to direct artifact writing, local proof drafting, or the first build path supported by the frozen refs already in hand.",
             "If the frozen endpoint needs repo-local or user-local inputs that are not already materialized in the workspace, inspect the necessary repo-local or user-local paths directly and materialize the required copies into the workspace when useful.",
@@ -357,6 +379,12 @@ def _render_child_prompt(
             f"- `{evaluator_manual}`",
             f"- `{split_submit_helper}`",
             f"- `{activate_submit_helper}`",
+            "",
+            "Exact live/publish refs for this node:",
+            "",
+            f"- live artifact root: `{workspace_live_artifact_abs.resolve()}`",
+            f"- publish runner: `{artifact_publication_runner_abs.resolve()}`",
+            f"- publication receipt ref: `{artifact_publication_receipt_abs.resolve()}`",
             "",
             "If endpoint-required local file discovery is needed, prefer the committed filename/path helper with targeted --root/--term/--ext flags over ad hoc content grep or one broad prose query:",
             "",
@@ -385,6 +413,7 @@ def _materialize_evaluator_bundle(
     endpoint_artifact_ref: str,
     artifact_payload: dict[str, Any],
     workspace_mirror_relpath: str,
+    artifact_publication_receipt_ref: Path,
     external_publish_target: str,
     required_output_paths: list[str],
     handoff_json_path: Path,
@@ -421,6 +450,7 @@ def _materialize_evaluator_bundle(
         workspace_root=workspace_root,
         output_root=output_root,
         implementation_package_ref=workspace_mirror_ref,
+        artifact_publication_receipt_ref=artifact_publication_receipt_ref,
         product_manual_ref=manual_path,
         required_output_paths=required_output_paths,
         final_effects_text_ref=final_effects_path,
@@ -439,6 +469,22 @@ def _materialize_evaluator_bundle(
         ),
     )
     return submission_path, runner_path
+
+
+def _materialize_publication_runner(*, workspace_root: Path, handoff_json_path: Path) -> Path:
+    repo_runner = (product_repo_root().resolve() / "scripts" / "publish_workspace_artifact_from_handoff.sh").resolve()
+    runner_path = workspace_root / "PUBLISH_WORKSPACE_ARTIFACT.sh"
+    _write_executable_text(
+        runner_path,
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "set -euo pipefail",
+                f'exec "{repo_runner}" --handoff-ref "{handoff_json_path.resolve()}" "$@"',
+            ]
+        ),
+    )
+    return runner_path
 
 
 def _persist_bootstrap_result(*, state_root: Path, request_payload: dict[str, Any], result_payload: dict[str, Any]) -> Path:
@@ -461,6 +507,9 @@ def _fresh_result_payload(
     handoff_md_path: Path,
     child_prompt_path: Path,
     launch_spec: dict[str, Any],
+    workspace_live_artifact_ref: Path,
+    artifact_publication_receipt_ref: Path,
+    artifact_publication_runner_ref: Path,
     workspace_result_sink_ref: Path,
     kernel_result_sink_ref: Path,
     evaluator_submission_ref: Path,
@@ -477,6 +526,9 @@ def _fresh_result_payload(
         "handoff_json_ref": str(handoff_json_path.resolve()),
         "handoff_md_ref": str(handoff_md_path.resolve()),
         "child_prompt_ref": str(child_prompt_path.resolve()),
+        "workspace_live_artifact_ref": str(workspace_live_artifact_ref.resolve()),
+        "artifact_publication_receipt_ref": str(artifact_publication_receipt_ref.resolve()),
+        "artifact_publication_runner_ref": str(artifact_publication_runner_ref.resolve()),
         "workspace_result_sink_ref": str(workspace_result_sink_ref.resolve()),
         "kernel_result_sink_ref": str(kernel_result_sink_ref.resolve()),
         "evaluator_submission_ref": str(evaluator_submission_ref.resolve()),
@@ -486,6 +538,7 @@ def _fresh_result_payload(
 
 
 def _normalize_bootstrap_request(payload: dict[str, Any]) -> dict[str, Any]:
+    workspace_mirror_relpath = _nonempty(payload.get("workspace_mirror_relpath"))
     normalized = {
         "mode": _nonempty(payload.get("mode") or "fresh") or "fresh",
         "task_slug": _nonempty(payload.get("task_slug")),
@@ -496,7 +549,9 @@ def _normalize_bootstrap_request(payload: dict[str, Any]) -> dict[str, Any]:
         "state_root": _nonempty(payload.get("state_root")),
         "node_id": _nonempty(payload.get("node_id")),
         "round_id": _nonempty(payload.get("round_id") or "R1") or "R1",
-        "workspace_mirror_relpath": _nonempty(payload.get("workspace_mirror_relpath")),
+        "workspace_mirror_relpath": workspace_mirror_relpath,
+        "workspace_live_artifact_relpath": _nonempty(payload.get("workspace_live_artifact_relpath"))
+        or _default_workspace_live_artifact_relpath(workspace_mirror_relpath),
         "external_publish_target": _nonempty(payload.get("external_publish_target")),
         "context_refs": [str(item) for item in (payload.get("context_refs") or [])],
         "required_output_paths": [str(item).strip() for item in (payload.get("required_output_paths") or []) if str(item).strip()],
@@ -559,6 +614,13 @@ def _default_workspace_mirror_relpath(external_publish_target: str) -> str:
     if publish_name:
         return f"deliverables/{publish_name}"
     return "deliverables/primary_artifact"
+
+
+def _default_workspace_live_artifact_relpath(workspace_mirror_relpath: str) -> str:
+    publish_path = Path(workspace_mirror_relpath)
+    if publish_path.suffix:
+        return str(Path(".tmp_primary_artifact") / publish_path.name)
+    return ".tmp_primary_artifact"
 
 
 def _render_task_scoped_evaluator_final_effects_text(*, artifact_payload: dict[str, Any], workspace_mirror_ref: str) -> str:
@@ -688,9 +750,17 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
     handoff_json_path = workspace_root / "FROZEN_HANDOFF.json"
     handoff_md_path = workspace_root / "FROZEN_HANDOFF.md"
     child_prompt_path = workspace_root / "CHILD_PROMPT.md"
+    workspace_live_artifact_relpath = request["workspace_live_artifact_relpath"] or _default_workspace_live_artifact_relpath(
+        request["workspace_mirror_relpath"]
+    )
+    request["workspace_live_artifact_relpath"] = workspace_live_artifact_relpath
+    workspace_live_artifact_abs = (workspace_root / workspace_live_artifact_relpath).resolve()
     workspace_result_sink_relpath = result_sink_ref
     workspace_result_sink_abs = (workspace_root / workspace_result_sink_relpath).resolve()
     kernel_result_sink_abs = (state_root / result_sink_ref).resolve()
+    artifact_publication_receipt_abs = (
+        state_root / "artifacts" / "publication" / child_node.node_id / "WorkspaceArtifactPublicationReceipt.json"
+    ).resolve()
     endpoint_artifact_payload = json.loads(Path(request["endpoint_artifact_ref"]).read_text(encoding="utf-8"))
     evaluator_submission_path, evaluator_runner_path = _materialize_evaluator_bundle(
         state_root=state_root,
@@ -699,10 +769,15 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
         endpoint_artifact_ref=request["endpoint_artifact_ref"],
         artifact_payload=endpoint_artifact_payload,
         workspace_mirror_relpath=request["workspace_mirror_relpath"],
+        artifact_publication_receipt_ref=artifact_publication_receipt_abs,
         external_publish_target=request["external_publish_target"],
         required_output_paths=request["required_output_paths"],
         handoff_json_path=handoff_json_path,
         context_refs=request["context_refs"],
+    )
+    artifact_publication_runner_path = _materialize_publication_runner(
+        workspace_root=workspace_root,
+        handoff_json_path=handoff_json_path,
     )
     handoff_payload = _build_handoff_payload(
         node=child_node,
@@ -712,6 +787,7 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
         child_goal_slice=request["child_goal_slice"],
         workspace_root=workspace_root,
         workspace_mirror_relpath=request["workspace_mirror_relpath"],
+        workspace_live_artifact_relpath=workspace_live_artifact_relpath,
         external_publish_target=request["external_publish_target"],
         required_output_paths=request["required_output_paths"],
         context_refs=request["context_refs"],
@@ -719,6 +795,8 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
         workspace_result_sink_relpath=workspace_result_sink_relpath,
         workspace_result_sink_ref=str(workspace_result_sink_abs),
         kernel_result_sink_ref=str(kernel_result_sink_abs),
+        artifact_publication_receipt_ref=str(artifact_publication_receipt_abs),
+        artifact_publication_runner_ref=str(artifact_publication_runner_path.resolve()),
         evaluator_submission_ref=str(evaluator_submission_path.resolve()),
         evaluator_runner_ref=str(evaluator_runner_path.resolve()),
     )
@@ -730,6 +808,9 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
             workspace_root=workspace_root,
             handoff_md_path=handoff_md_path,
             node=child_node,
+            workspace_live_artifact_abs=workspace_live_artifact_abs,
+            artifact_publication_receipt_abs=artifact_publication_receipt_abs,
+            artifact_publication_runner_abs=artifact_publication_runner_path,
             workspace_result_sink_abs=workspace_result_sink_abs,
             kernel_result_sink_abs=kernel_result_sink_abs,
             evaluator_submission_abs=evaluator_submission_path,
@@ -753,6 +834,9 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
         handoff_md_path=handoff_md_path,
         child_prompt_path=child_prompt_path,
         launch_spec=launch_spec,
+        workspace_live_artifact_ref=workspace_live_artifact_abs,
+        artifact_publication_receipt_ref=artifact_publication_receipt_abs,
+        artifact_publication_runner_ref=artifact_publication_runner_path,
         workspace_result_sink_ref=workspace_result_sink_abs,
         kernel_result_sink_ref=kernel_result_sink_abs,
         evaluator_submission_ref=evaluator_submission_path,
@@ -800,6 +884,10 @@ def bootstrap_first_implementer_from_endpoint(*, authority: KernelMutationAuthor
         "node_id": _nonempty(payload.get("node_id")),
         "round_id": _nonempty(payload.get("round_id") or "R1") or "R1",
         "workspace_mirror_relpath": workspace_mirror_relpath or _default_workspace_mirror_relpath(external_publish_target),
+        "workspace_live_artifact_relpath": _nonempty(payload.get("workspace_live_artifact_relpath"))
+        or _default_workspace_live_artifact_relpath(
+            workspace_mirror_relpath or _default_workspace_mirror_relpath(external_publish_target)
+        ),
         "external_publish_target": external_publish_target,
         "context_refs": context_refs,
         "result_sink_ref": _nonempty(payload.get("result_sink_ref")),

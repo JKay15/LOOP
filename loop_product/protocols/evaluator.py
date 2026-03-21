@@ -64,6 +64,7 @@ class EvaluatorNodeSubmission:
     output_root: str
     implementation_package_ref: str
     product_manual_ref: str
+    artifact_publication_receipt_ref: str = ""
     required_output_paths: list[str] = field(default_factory=list)
     final_effects_text_ref: str = ""
     final_effect_requirements: list[dict[str, Any]] = field(default_factory=list)
@@ -74,7 +75,14 @@ class EvaluatorNodeSubmission:
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
-        for key in ("required_output_paths", "final_effects_text_ref", "final_effect_requirements", "ai_user_scheduler", "context_refs"):
+        for key in (
+            "artifact_publication_receipt_ref",
+            "required_output_paths",
+            "final_effects_text_ref",
+            "final_effect_requirements",
+            "ai_user_scheduler",
+            "context_refs",
+        ):
             value = data.get(key)
             if value in ("", [], {}):
                 data.pop(key, None)
@@ -94,6 +102,7 @@ class EvaluatorNodeSubmission:
             workspace_root=str(data["workspace_root"]),
             output_root=str(data["output_root"]),
             implementation_package_ref=str(data["implementation_package_ref"]),
+            artifact_publication_receipt_ref=str(data.get("artifact_publication_receipt_ref") or ""),
             product_manual_ref=str(data["product_manual_ref"]),
             required_output_paths=[str(item) for item in (data.get("required_output_paths") or []) if str(item).strip()],
             final_effects_text_ref=str(data.get("final_effects_text_ref") or ""),
