@@ -41,7 +41,7 @@ def _child_bootstrap_request_from_source_handoff(
     source_record: dict[str, Any],
     child_record: dict[str, Any],
 ) -> dict[str, Any]:
-    _handoff_ref, handoff = _load_source_handoff(source_record)
+    handoff_ref, handoff = _load_source_handoff(source_record)
     node_id = str(child_record.get("node_id") or "").strip()
     goal_slice = str(child_record.get("goal_slice") or "").strip()
     workspace_root = str(child_record.get("workspace_root") or "").strip()
@@ -55,6 +55,19 @@ def _child_bootstrap_request_from_source_handoff(
     root_goal = str(handoff.get("root_goal") or "").strip()
     if not endpoint_artifact_ref or not root_goal:
         raise ValueError("source frozen handoff missing endpoint_artifact_ref or root_goal for child bootstrap")
+    inherited_context_refs: list[str] = [str(item or "") for item in list(handoff.get("context_refs") or [])]
+    inherited_context_refs.append(str(handoff_ref.resolve()))
+    handoff_md_ref = handoff_ref.with_suffix(".md")
+    if handoff_md_ref.exists():
+        inherited_context_refs.append(str(handoff_md_ref.resolve()))
+    deduped_context_refs: list[str] = []
+    seen_context_refs: set[str] = set()
+    for raw_ref in inherited_context_refs:
+        normalized_ref = str(raw_ref or "").strip()
+        if not normalized_ref or normalized_ref in seen_context_refs:
+            continue
+        seen_context_refs.add(normalized_ref)
+        deduped_context_refs.append(normalized_ref)
     return {
         "mode": "continue_exact",
         "state_root": str(state_root.resolve()),
@@ -66,7 +79,7 @@ def _child_bootstrap_request_from_source_handoff(
         "endpoint_artifact_ref": endpoint_artifact_ref,
         "workspace_mirror_relpath": str(handoff.get("workspace_mirror_relpath") or "deliverables/primary_artifact"),
         "external_publish_target": str(handoff.get("external_publish_target") or ""),
-        "context_refs": list(handoff.get("context_refs") or []),
+        "context_refs": deduped_context_refs,
         "result_sink_ref": result_sink_ref,
     }
 

@@ -336,6 +336,7 @@ def _render_child_prompt(
             "Do not publish directly to the external publish target from this node unless the frozen handoff explicitly makes publication implementer-owned; the normal owner is root-kernel.",
             "If bounded progress reveals a meaningful parallelizable gap, surface a split request upward to the root kernel with the proposed child slices and why the current node should no longer own all remaining work alone.",
             "Do not directly materialize child nodes yourself or mutate topology fact from implementer context; split remains kernel-owned until an explicit acceptance decision exists.",
+            "If your context refs include a parent `FROZEN_HANDOFF.json` or `FROZEN_HANDOFF.md`, treat that inherited frozen handoff as authoritative whole-task context in addition to your narrowed branch goal slice.",
             "If you decide split is warranted, materialize a structured split proposal and call the exact split helper named in this prompt instead of only writing the recommendation into deliverable prose such as `PARTITION_PLAN.md` or `TRACEABILITY.md`.",
             "If kernel accepts a deferred split, do not assume the planned children will start automatically.",
             "When a deferred child is genuinely ready, materialize a structured activate proposal and call the exact activate helper named in this prompt instead of treating `PLANNED` child state as self-starting.",

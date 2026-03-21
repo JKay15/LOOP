@@ -27,7 +27,13 @@ def main() -> int:
     from loop_product.dispatch import launch_runtime as launch_runtime_module
     from loop_product.kernel.query import query_authority_view
     from loop_product.kernel.authority import kernel_internal_authority
-    from loop_product.kernel.state import KernelState, ensure_runtime_tree, load_kernel_state, persist_kernel_state
+    from loop_product.kernel.state import (
+        KernelState,
+        ensure_runtime_tree,
+        load_kernel_state,
+        persist_kernel_state,
+        persist_node_snapshot,
+    )
     from loop_product.protocols.node import NodeSpec, NodeStatus
 
     with tempfile.TemporaryDirectory(prefix="loop_product_process_hygiene_") as td:
@@ -261,6 +267,111 @@ def main() -> int:
                     "authority sync must scrub runtime-owned heavy trees from live child deliverables, "
                     f"but left {heavyweight_relpath} behind"
                 )
+
+        active_runtime_hygiene_workspace_root = workspace_root / "child-hygiene-live-status-001"
+        active_runtime_hygiene_artifact_root = active_runtime_hygiene_workspace_root / "deliverables" / "primary_artifact"
+        (active_runtime_hygiene_artifact_root / ".lake" / "packages" / "mathlib").mkdir(parents=True, exist_ok=True)
+        (active_runtime_hygiene_artifact_root / ".lake" / "packages" / "mathlib" / "dummy.txt").write_text("cached\n", encoding="utf-8")
+        (active_runtime_hygiene_artifact_root / "build" / "lib").mkdir(parents=True, exist_ok=True)
+        (active_runtime_hygiene_artifact_root / "build" / "lib" / "artifact.txt").write_text("build\n", encoding="utf-8")
+        runtime_hygiene_node = NodeSpec(
+            node_id="child-hygiene-live-status-001",
+            node_kind="implementer",
+            goal_slice="runtime status polling must scrub heavy trees from active child deliverables",
+            parent_node_id="root-kernel",
+            generation=1,
+            round_id="R1.status",
+            execution_policy={"sandbox_mode": "workspace-write"},
+            reasoning_profile={"thinking_budget": "high", "role": "implementer"},
+            budget_profile={"max_rounds": 2},
+            allowed_actions=["implement", "report"],
+            workspace_root=str(active_runtime_hygiene_workspace_root.resolve()),
+            delegation_ref="state/delegations/child-hygiene-live-status-001.json",
+            result_sink_ref="artifacts/child-hygiene-live-status-001/result.json",
+            lineage_ref="root-kernel->child-hygiene-live-status-001",
+            status=NodeStatus.ACTIVE,
+        )
+        active_runtime_kernel_state = load_kernel_state(state_root)
+        active_runtime_kernel_state.register_node(runtime_hygiene_node)
+        persist_kernel_state(state_root, active_runtime_kernel_state, authority=kernel_internal_authority())
+        persist_node_snapshot(
+            state_root,
+            active_runtime_kernel_state.nodes[runtime_hygiene_node.node_id],
+            authority=kernel_internal_authority(),
+        )
+
+        runtime_stdout_ref = state_root / "artifacts" / "launches" / runtime_hygiene_node.node_id / "attempt_001" / "logs" / "child.stdout.txt"
+        runtime_stderr_ref = state_root / "artifacts" / "launches" / runtime_hygiene_node.node_id / "attempt_001" / "logs" / "child.stderr.txt"
+        runtime_launch_result_ref = state_root / "artifacts" / "launches" / runtime_hygiene_node.node_id / "attempt_001" / "ChildLaunchResult.json"
+        runtime_stdout_ref.parent.mkdir(parents=True, exist_ok=True)
+        runtime_stdout_ref.write_text("writing first real artifact batch now\n", encoding="utf-8")
+        runtime_stderr_ref.write_text("", encoding="utf-8")
+        live_proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            cwd=str(ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            runtime_launch_result_ref.write_text(
+                json.dumps(
+                    {
+                        "launch_decision": "started",
+                        "source_result_ref": str((state_root / "artifacts" / "bootstrap" / "FirstImplementerBootstrapResult.json").resolve()),
+                        "node_id": runtime_hygiene_node.node_id,
+                        "workspace_root": str(active_runtime_hygiene_workspace_root.resolve()),
+                        "state_root": str(state_root.resolve()),
+                        "startup_health_timeout_ms": 250,
+                        "startup_retry_limit": 0,
+                        "attempt_count": 1,
+                        "retryable_failure_kind": "",
+                        "attempts": [],
+                        "launch_request_ref": str((runtime_launch_result_ref.parent / "ChildLaunchRequest.json").resolve()),
+                        "launch_result_ref": str(runtime_launch_result_ref.resolve()),
+                        "launch_log_dir": str(runtime_stdout_ref.parent.resolve()),
+                        "stdout_ref": str(runtime_stdout_ref.resolve()),
+                        "stderr_ref": str(runtime_stderr_ref.resolve()),
+                        "stdin_ref": str((active_runtime_hygiene_workspace_root / "CHILD_PROMPT.md").resolve()),
+                        "wrapped_argv": [sys.executable, "-c", "import time; time.sleep(60)"],
+                        "wrapper_cmd": "",
+                        "pid": int(live_proc.pid),
+                        "exit_code": None,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            previous_runtime_status_mode = os.environ.get("LOOP_CHILD_RUNTIME_STATUS_MODE")
+            os.environ["LOOP_CHILD_RUNTIME_STATUS_MODE"] = "direct"
+            try:
+                status_payload = launch_runtime_module.child_runtime_status_from_launch_result_ref(
+                    result_ref=runtime_launch_result_ref,
+                    stall_threshold_s=60.0,
+                )
+            finally:
+                if previous_runtime_status_mode is None:
+                    os.environ.pop("LOOP_CHILD_RUNTIME_STATUS_MODE", None)
+                else:
+                    os.environ["LOOP_CHILD_RUNTIME_STATUS_MODE"] = previous_runtime_status_mode
+            if str(status_payload.get("lifecycle_status") or "") != "ACTIVE":
+                return _fail("live runtime-status hygiene fixture must stay ACTIVE while the child pid is still attached")
+            if str(status_payload.get("recovery_reason") or "") != "live_pid_still_attached":
+                return _fail("live runtime-status hygiene fixture must remain a live-pid status check, not recovery")
+            for heavyweight_relpath in (".lake", "build"):
+                if (active_runtime_hygiene_artifact_root / heavyweight_relpath).exists():
+                    return _fail(
+                        "runtime status polling must scrub runtime-owned heavy trees from active child deliverables "
+                        f"before returning, but left {heavyweight_relpath} behind"
+                    )
+        finally:
+            live_proc.terminate()
+            try:
+                live_proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                live_proc.kill()
+                live_proc.wait(timeout=5.0)
 
     print("[loop-system-process-hygiene] OK")
     return 0

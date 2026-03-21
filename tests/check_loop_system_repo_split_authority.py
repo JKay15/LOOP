@@ -75,6 +75,7 @@ def _write_source_handoff(*, state_root: Path, workspace_root: Path, source_node
     endpoint_artifact_ref = workspace_root / "EndpointArtifact.json"
     _write_minimal_endpoint_artifact(endpoint_artifact_ref)
     handoff_ref = workspace_root / "FROZEN_HANDOFF.json"
+    handoff_md_ref = workspace_root / "FROZEN_HANDOFF.md"
     workspace_result_sink = workspace_root / "artifacts" / source_node.node_id / "result.json"
     kernel_result_sink = state_root / "artifacts" / source_node.node_id / "result.json"
     payload = {
@@ -95,6 +96,23 @@ def _write_source_handoff(*, state_root: Path, workspace_root: Path, source_node
         "evaluator_runner_ref": str((workspace_root / "RUN_EVALUATOR_NODE_UNTIL_TERMINAL.sh").resolve()),
     }
     handoff_ref.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    handoff_md_ref.write_text(
+        "\n".join(
+            [
+                "# Frozen Handoff",
+                "",
+                f"- node_id: `{source_node.node_id}`",
+                f"- state_root: `{state_root.resolve()}`",
+                f"- endpoint_artifact_ref: `{endpoint_artifact_ref.resolve()}`",
+                "",
+                "## Frozen Goal",
+                "",
+                source_node.goal_slice,
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return handoff_ref
 
 
@@ -275,6 +293,19 @@ def _accepted_split_case() -> int:
                 return _fail("accepted split child bootstrap must reuse continue_exact frozen bootstrap semantics")
             if any(str(item.get("endpoint_artifact_ref") or "").strip() == "" for item in bootstrap_calls):
                 return _fail("accepted split child bootstrap must reuse source frozen endpoint context")
+            source_workspace_root = state_root.parent / "workspace" / "child-implementer-001"
+            expected_inherited_refs = {
+                str((source_workspace_root / "FROZEN_HANDOFF.json").resolve()),
+                str((source_workspace_root / "FROZEN_HANDOFF.md").resolve()),
+            }
+            for call in bootstrap_calls:
+                context_refs = {str(item or "").strip() for item in list(call.get("context_refs") or []) if str(item or "").strip()}
+                missing_refs = expected_inherited_refs - context_refs
+                if missing_refs:
+                    return _fail(
+                        "accepted split child bootstrap must preserve the parent frozen handoff as inherited authoritative context, "
+                        f"but missed {sorted(missing_refs)}"
+                    )
 
             audit_view = query_audit_experience_view(state_root, node_id=source_node.node_id, limit=10)
             if not any("split" in str(item.get("event_type") or "").lower() for item in audit_view["recent_structural_decisions"]):

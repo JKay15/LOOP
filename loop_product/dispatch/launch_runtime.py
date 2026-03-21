@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping
 
+from loop_product.artifact_hygiene import canonicalize_workspace_artifact_heavy_trees
 from loop_product.ai_launch import (
     ai_launch_exit_code,
     detach_ai_launch_handle,
@@ -131,6 +132,18 @@ def _load_terminal_implementer_result(*, state_root: Path, node_id: str, node_pa
     if not _has_evaluator_backed_terminal_closure(payload):
         return result_ref, {}
     return result_ref, payload
+
+
+def _live_workspace_artifact_hygiene_sync(*, workspace_root: Path | None) -> list[str]:
+    if workspace_root is None:
+        return []
+    try:
+        candidate = workspace_root.expanduser().resolve()
+    except Exception:
+        return []
+    if not candidate.exists() or not candidate.is_dir():
+        return []
+    return canonicalize_workspace_artifact_heavy_trees(candidate)
 
 
 def _terminal_evaluation_report_ref(payload: Mapping[str, Any]) -> Path | None:
@@ -620,6 +633,8 @@ def _direct_child_runtime_status_from_launch_result_ref(
 
     state_root = require_runtime_root(Path(str(launch_result["state_root"])).expanduser().resolve())
     node_id = str(launch_result["node_id"])
+    workspace_root = Path(str(launch_result.get("workspace_root") or "")).expanduser()
+    _live_workspace_artifact_hygiene_sync(workspace_root=workspace_root)
     node_ref = state_root / "state" / f"{node_id}.json"
     node_payload = _load_json(node_ref) if node_ref.exists() else {}
     runtime_state = normalize_runtime_state(dict(node_payload.get("runtime_state") or {}))
@@ -736,6 +751,9 @@ def child_runtime_status_from_launch_result_ref(
         payload = request_host_child_runtime_status(
             launch_result_ref=str(Path(result_ref).expanduser().resolve()),
             stall_threshold_s=float(stall_threshold_s),
+        )
+        _live_workspace_artifact_hygiene_sync(
+            workspace_root=Path(str(payload.get("workspace_root") or "")).expanduser()
         )
         pid = int(payload.get("pid") or 0)
         if bool(payload.get("pid_alive")) and pid > 0 and not _pid_alive(pid):
