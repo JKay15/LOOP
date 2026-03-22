@@ -87,6 +87,34 @@ def _write_recovery_context(
     return context_path
 
 
+def _refresh_continue_exact_bundle(*, state_root: Path, node: NodeSpec, workspace_root: Path) -> dict[str, Any]:
+    from loop_product.dispatch.bootstrap import bootstrap_first_implementer_node
+
+    handoff_path = workspace_root / "FROZEN_HANDOFF.json"
+    if not handoff_path.exists():
+        raise ValueError(f"same-node recovery requires an existing frozen handoff at {handoff_path}")
+    handoff_payload = json.loads(handoff_path.read_text(encoding="utf-8"))
+    kernel_state = load_kernel_state(state_root)
+    bootstrap_payload = {
+        "mode": "continue_exact",
+        "task_slug": str(kernel_state.task_id or state_root.name or node.node_id),
+        "root_goal": _nonempty(handoff_payload.get("root_goal")) or str(kernel_state.root_goal or node.goal_slice),
+        "child_goal_slice": _nonempty(handoff_payload.get("child_goal_slice")) or str(node.goal_slice or ""),
+        "endpoint_artifact_ref": _nonempty(handoff_payload.get("endpoint_artifact_ref")),
+        "workspace_root": str(workspace_root.resolve()),
+        "state_root": str(state_root.resolve()),
+        "node_id": node.node_id,
+        "round_id": str(node.round_id or handoff_payload.get("round_id") or ""),
+        "workspace_mirror_relpath": _nonempty(handoff_payload.get("workspace_mirror_relpath")),
+        "workspace_live_artifact_relpath": _nonempty(handoff_payload.get("workspace_live_artifact_relpath")),
+        "external_publish_target": _nonempty(handoff_payload.get("external_publish_target")),
+        "context_refs": [str(item) for item in list(handoff_payload.get("context_refs") or [])],
+        "required_output_paths": [str(item).strip() for item in list(handoff_payload.get("required_output_paths") or []) if str(item).strip()],
+        "result_sink_ref": _nonempty(node.result_sink_ref) or _nonempty(handoff_payload.get("result_sink_ref")),
+    }
+    return bootstrap_first_implementer_node(authority=None, **bootstrap_payload)
+
+
 def _latest_launch_result_ref(*, state_root: Path, node_id: str, workspace_root: Path) -> Path:
     launch_root = state_root / "artifacts" / "launches" / node_id
     if not launch_root.exists():
@@ -234,13 +262,24 @@ def recover_orphaned_active_node(**payload: Any) -> dict[str, Any]:
     refreshed_state = load_kernel_state(state_root)
     refreshed_payload = dict(refreshed_state.nodes.get(node_id) or {})
     refreshed_node = NodeSpec.from_dict(refreshed_payload)
-    latest_result_ref = _latest_authoritative_result_ref(state_root=state_root, node=refreshed_node)
-    launch_spec = build_codex_cli_child_launch(
+    refreshed_bundle = _refresh_continue_exact_bundle(
+        state_root=state_root,
+        node=refreshed_node,
         workspace_root=workspace_root,
-        sandbox_mode=str(refreshed_node.execution_policy.get("sandbox_mode") or "danger-full-access"),
-        thinking_budget=str(refreshed_node.reasoning_profile.get("thinking_budget") or "medium"),
-        prompt_path=child_prompt_path,
     )
+    latest_result_ref = _latest_authoritative_result_ref(state_root=state_root, node=refreshed_node)
+    refreshed_child_prompt = Path(str(refreshed_bundle.get("child_prompt_ref") or child_prompt_path)).expanduser().resolve()
+    if not refreshed_child_prompt.exists():
+        raise ValueError(f"refreshed recovery bundle is missing CHILD_PROMPT.md at {refreshed_child_prompt}")
+    child_prompt_path = refreshed_child_prompt
+    launch_spec = dict(refreshed_bundle.get("launch_spec") or {})
+    if not launch_spec:
+        launch_spec = build_codex_cli_child_launch(
+            workspace_root=workspace_root,
+            sandbox_mode=str(refreshed_node.execution_policy.get("sandbox_mode") or "danger-full-access"),
+            thinking_budget=str(refreshed_node.reasoning_profile.get("thinking_budget") or "medium"),
+            prompt_path=child_prompt_path,
+        )
 
     result_payload = {
         "recovery_decision": "accepted",

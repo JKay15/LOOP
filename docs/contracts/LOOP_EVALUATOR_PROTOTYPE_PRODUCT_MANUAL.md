@@ -74,6 +74,7 @@ Prefer the repo-local adapter path in `loop_product.loop.evaluator_client`:
 That quick path has two layers. `initialize_evaluator_runtime(...)` prepares the trusted `.loop/...` runtime state for an ordinary implementer caller without exposing kernel authority directly. The adapter path then materializes the evaluator request JSON for you and calls the documented evaluator product surface. This is the normal route when a LOOP implementer already has the frozen final effect, implementation location, and role requirements in hand.
 
 For split children, that node-scoped evaluator bundle must stay slice-scoped by default: the bundle should judge only the narrowed branch goal and declared required outputs for that child, not silently inherit the parent/source whole-paper final-effects surface. Only an explicit final-integration / whole-paper closeout node may reuse a whole-paper evaluator surface.
+If a split child later goes through same-node orphaned-active recovery, the recovery path must rematerialize that node-scoped evaluator bundle under current code before relaunch; recovery must not keep running a stale whole-paper final-effects file just because the node id and workspace root stayed the same.
 
 Use the raw `loop-evaluator --input <fixture_request.json>` surface when you genuinely need the generic caller-facing entrypoint. Do not treat the raw surface as proof that evaluator usage is inherently heavy if `initialize_evaluator_runtime(...)` plus `run_evaluator_node(...)` already covers the implementer case.
 

@@ -249,6 +249,17 @@ def main() -> int:
             if not live_status_ref.exists():
                 return _fail("fresh runtime status query must persist a status_result_ref before recovery")
 
+            bundle_root = state_root / "artifacts" / "bootstrap" / "test-orphaned-active-recovery-helper"
+            poisoned_manual = bundle_root / "EvaluatorProductManual.md"
+            poisoned_effects = bundle_root / "EvaluatorFinalEffects.md"
+            if not poisoned_manual.exists() or not poisoned_effects.exists():
+                return _fail("recovery helper coverage requires the bootstrap evaluator bundle to exist before poisoning")
+            poisoned_manual.write_text("# Poisoned Manual\n\nstale bundle should be rewritten during recovery\n", encoding="utf-8")
+            poisoned_effects.write_text(
+                "# Poisoned Final Effects\n\nwhole-paper faithful complete formalization\npaper defect exposed\n",
+                encoding="utf-8",
+            )
+
             proc = subprocess.run(
                 [
                     str(script),
@@ -315,6 +326,13 @@ def main() -> int:
                 return _fail("accepted orphaned-active recovery must persist the fresh runtime status it relied on")
             if str(recovery.get("confirmed_runtime_recovery_reason") or "") != "active_without_live_pid":
                 return _fail("accepted orphaned-active recovery must explain the confirmed runtime-loss reason")
+
+            refreshed_manual_text = poisoned_manual.read_text(encoding="utf-8")
+            refreshed_effects_text = poisoned_effects.read_text(encoding="utf-8")
+            if "Poisoned Manual" in refreshed_manual_text:
+                return _fail("same-node recovery must refresh the bootstrap evaluator manual instead of reusing a stale poisoned copy")
+            if "Poisoned Final Effects" in refreshed_effects_text:
+                return _fail("same-node recovery must refresh the bootstrap evaluator final effects instead of reusing a stale poisoned copy")
 
             reused_launch_proc = subprocess.run(
                 [
