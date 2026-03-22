@@ -279,6 +279,7 @@ def _build_handoff_payload(
     if not workspace_live_artifact_relpath:
         raise ValueError("workspace_live_artifact_relpath must be non-empty")
     workspace_live_artifact_ref = str((workspace_root / workspace_live_artifact_relpath).resolve())
+    agent_context_refs = _sanitize_agent_context_refs(context_refs, endpoint_artifact_ref=endpoint_artifact_ref)
     return {
         "node_id": node.node_id,
         "parent_node_id": node.parent_node_id,
@@ -303,7 +304,7 @@ def _build_handoff_payload(
         "external_publish_target": external_publish_target,
         "required_output_paths": [str(item).strip() for item in list(required_output_paths or []) if str(item).strip()],
         "required_outputs": [str(item).strip() for item in list(required_output_paths or []) if str(item).strip()],
-        "context_refs": list(context_refs),
+        "context_refs": agent_context_refs,
         "result_sink_ref": result_sink_ref,
         "workspace_result_sink_relpath": workspace_result_sink_relpath,
         "workspace_result_sink_ref": workspace_result_sink_ref,
@@ -317,6 +318,20 @@ def _build_handoff_payload(
     }
 
 
+def _sanitize_agent_context_refs(context_refs: Iterable[str], *, endpoint_artifact_ref: str) -> list[str]:
+    endpoint_artifact_path = str(Path(endpoint_artifact_ref).expanduser().resolve())
+    sanitized: list[str] = []
+    for item in list(context_refs or []):
+        item_str = str(item).strip()
+        if not item_str:
+            continue
+        item_path = str(Path(item_str).expanduser().resolve())
+        if item_path == endpoint_artifact_path:
+            continue
+        sanitized.append(item_str)
+    return sanitized
+
+
 def _render_handoff_md(payload: dict[str, Any]) -> str:
     lines = [
         "# Frozen Handoff",
@@ -327,7 +342,6 @@ def _render_handoff_md(payload: dict[str, Any]) -> str:
         f"- lineage_ref: `{payload['lineage_ref']}`",
         f"- workspace_root: `{payload['workspace_root']}`",
         f"- state_root: `{payload['state_root']}`",
-        f"- endpoint_artifact_ref: `{payload['endpoint_artifact_ref']}`",
         "",
         "## Frozen Goal",
         "",
@@ -431,7 +445,7 @@ def _render_child_prompt(
             "Do not publish directly to the external publish target from this node unless the frozen handoff explicitly makes publication implementer-owned; the normal owner is root-kernel.",
             "If bounded progress reveals a meaningful parallelizable gap, surface a split request upward to the root kernel with the proposed child slices and why the current node should no longer own all remaining work alone.",
             "Do not directly materialize child nodes yourself or mutate topology fact from implementer context; split remains kernel-owned until an explicit acceptance decision exists.",
-            "If your context refs include a parent `FROZEN_HANDOFF.json` or `FROZEN_HANDOFF.md`, treat that inherited frozen handoff as authoritative whole-task context in addition to your narrowed branch goal slice.",
+            "If your context refs include a parent frozen handoff markdown, treat that inherited frozen handoff as authoritative whole-task context in addition to your narrowed branch goal slice.",
             "If you decide split is warranted, materialize a structured split proposal and call the exact split helper named in this prompt instead of only writing the recommendation into deliverable prose such as `PARTITION_PLAN.md` or `TRACEABILITY.md`.",
             "If a child needs explanatory gating prose, record it under `activation_rationale`.",
             "If a child needs a machine gate, use `activation_condition` only with machine-evaluable syntax `after:<node_id>:<requirement>`.",
@@ -487,6 +501,7 @@ def _materialize_evaluator_bundle(
     external_publish_target: str,
     required_output_paths: list[str],
     handoff_json_path: Path,
+    handoff_md_path: Path,
     context_refs: list[str],
 ) -> tuple[Path, Path]:
     from loop_product.loop import build_evaluator_submission_for_frozen_task
@@ -498,15 +513,15 @@ def _materialize_evaluator_bundle(
     final_effects_path = bootstrap_dir / "EvaluatorFinalEffects.md"
     output_root = (state_root / "artifacts" / "evaluator_runs" / node.node_id).resolve()
     workspace_mirror_ref = str((workspace_root / workspace_mirror_relpath).resolve())
+    agent_context_refs = _sanitize_agent_context_refs(context_refs, endpoint_artifact_ref=endpoint_artifact_ref)
     if _use_whole_paper_evaluator_surface(node):
         _write_text(
             manual_path,
             _render_task_scoped_evaluator_manual(
-                endpoint_artifact_ref=endpoint_artifact_ref,
                 workspace_root=workspace_root,
                 workspace_mirror_ref=workspace_mirror_ref,
                 external_publish_target=external_publish_target,
-                handoff_json_path=handoff_json_path,
+                handoff_md_path=handoff_md_path,
             ),
         )
         _write_text(
@@ -543,7 +558,7 @@ def _materialize_evaluator_bundle(
         product_manual_ref=manual_path,
         required_output_paths=required_output_paths,
         final_effects_text_ref=final_effects_path,
-        context_refs=[*list(context_refs), endpoint_artifact_ref, str(handoff_json_path.resolve())],
+        context_refs=[*list(agent_context_refs), str(handoff_md_path.resolve())],
     )
     _write_json(submission_path, submission.to_dict())
     repo_runner = (product_repo_root().resolve() / "scripts" / "run_evaluator_node_until_terminal.sh").resolve()
@@ -797,11 +812,10 @@ def _render_slice_scoped_evaluator_final_effects_text(
 
 def _render_task_scoped_evaluator_manual(
     *,
-    endpoint_artifact_ref: str,
     workspace_root: Path,
     workspace_mirror_ref: str,
     external_publish_target: str,
-    handoff_json_path: Path,
+    handoff_md_path: Path,
 ) -> str:
     lines = [
         "# Task-Scoped Evaluator Product Manual",
@@ -812,8 +826,7 @@ def _render_task_scoped_evaluator_manual(
         "",
         f"- workspace_root: `{workspace_root.resolve()}`",
         f"- workspace_mirror_ref: `{workspace_mirror_ref}`",
-        f"- endpoint_artifact_ref: `{endpoint_artifact_ref}`",
-        f"- frozen_handoff_ref: `{handoff_json_path.resolve()}`",
+        f"- frozen_handoff_ref: `{handoff_md_path.resolve()}`",
     ]
     if external_publish_target:
         lines.append(f"- external_publish_target: `{external_publish_target}`")
@@ -953,6 +966,7 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
         external_publish_target=request["external_publish_target"],
         required_output_paths=request["required_output_paths"],
         handoff_json_path=handoff_json_path,
+        handoff_md_path=handoff_md_path,
         context_refs=request["context_refs"],
     )
     artifact_publication_runner_path = _materialize_publication_runner(

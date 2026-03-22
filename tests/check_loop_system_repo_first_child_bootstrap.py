@@ -250,6 +250,8 @@ def main() -> int:
                 return _fail("frozen handoff markdown must include the exact state_root for helper replay")
             if f"- workspace_live_artifact_ref: `{expected_live_artifact_ref}`" not in handoff_md_text:
                 return _fail("frozen handoff markdown must include the exact live artifact ref")
+            if str(endpoint_artifact.resolve()) in handoff_md_text:
+                return _fail("frozen handoff markdown must not expose the raw endpoint artifact ref to implementer-facing context")
 
             prompt_text = child_prompt.read_text(encoding="utf-8")
             for needle in (
@@ -317,6 +319,8 @@ def main() -> int:
             for needle in ("authoritative kernel-visible sink", "workspace-local mirror result sink"):
                 if needle not in prompt_text:
                     return _fail(f"child prompt must explain {needle!r}")
+            if "FROZEN_HANDOFF.json" in prompt_text:
+                return _fail("child prompt must not direct implementers toward the machine-only handoff json")
             if not Path(expected_evaluator_runner_ref).exists():
                 return _fail("bootstrap must materialize the exact evaluator runner script")
             if not Path(expected_publication_runner_ref).exists():
@@ -352,10 +356,12 @@ def main() -> int:
                 if not str(role_requirements.get(role_id) or "").strip():
                     return _fail(f"ordinary implementer bootstrap must provide a non-empty role requirement for {role_id}")
             context_refs = [str(item) for item in list(submission_payload.get("context_refs") or [])]
-            if str(endpoint_artifact.resolve()) not in context_refs:
-                return _fail("ordinary implementer bootstrap must preserve the endpoint artifact as evaluator context")
-            if str(handoff_json.resolve()) not in context_refs:
-                return _fail("ordinary implementer bootstrap must preserve the frozen handoff as evaluator context")
+            if str(endpoint_artifact.resolve()) in context_refs:
+                return _fail("ordinary implementer bootstrap must not expose the raw endpoint artifact as evaluator context")
+            if str(handoff_md.resolve()) not in context_refs:
+                return _fail("ordinary implementer bootstrap must preserve the safe frozen handoff markdown as evaluator context")
+            if str(handoff_json.resolve()) in context_refs:
+                return _fail("ordinary implementer bootstrap must not expose the machine-only frozen handoff json as evaluator context")
 
             node = NodeSpec.from_dict(json.loads(node_ref.read_text(encoding="utf-8")))
             if node.node_id != str(result.get("node_id") or ""):
@@ -561,8 +567,15 @@ def main() -> int:
             if derived_context_refs[0] != str(endpoint_artifact.resolve()):
                 return _fail("endpoint-driven bootstrap must keep the endpoint artifact as the first context ref")
             derived_handoff_context_refs = {str(item) for item in list(derived_handoff_payload.get("context_refs") or [])}
-            if not expected_context_refs.issubset(derived_handoff_context_refs):
+            expected_handoff_context_refs = {
+                str(required_doc.resolve()),
+                str(required_wrapper.resolve()),
+                str(ancestor_relative_ref.resolve()),
+            }
+            if not expected_handoff_context_refs.issubset(derived_handoff_context_refs):
                 return _fail("endpoint-driven bootstrap must project explicit local context refs into the frozen handoff")
+            if str(endpoint_artifact.resolve()) in derived_handoff_context_refs:
+                return _fail("endpoint-driven bootstrap must not expose the raw endpoint artifact through frozen handoff context refs")
 
             whole_paper_project_name = "test-first-child-bootstrap-whole-paper"
             whole_paper_workspace_root = ROOT / "workspace" / whole_paper_project_name
@@ -671,6 +684,8 @@ def main() -> int:
                 return _fail("whole-paper endpoint bootstrap must filter OPERATOR-mode and stale runtime artifact refs from context_refs")
             if whole_paper_handoff_context_refs.intersection(polluted_whole_paper_refs):
                 return _fail("whole-paper frozen handoff must not project OPERATOR-mode or stale runtime artifact refs")
+            if str(whole_paper_endpoint_artifact.resolve()) in whole_paper_handoff_context_refs:
+                return _fail("whole-paper frozen handoff must not expose the raw endpoint artifact through agent-facing context refs")
         finally:
             ancestor_relative_ref.unlink(missing_ok=True)
             stale_loop_artifact.unlink(missing_ok=True)
