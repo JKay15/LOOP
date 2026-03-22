@@ -437,6 +437,18 @@ def _render_child_prompt(
             "This node is slice-scoped and does not own whole-paper terminal classification authority.",
             "If you emit `WHOLE_PAPER_STATUS.json`, keep it slice-local and do not claim whole-paper `TERMINAL` classifications such as `paper defect exposed`, `external dependency blocked`, or `whole-paper faithful complete formalization`.",
         ]
+    whole_paper_source_guard_lines: list[str] = []
+    if (
+        normalize_machine_choice(node.workflow_scope, WORKFLOW_SCOPE_SPEC) == "whole_paper_formalization"
+        and normalize_machine_choice(node.artifact_scope, ARTIFACT_SCOPE_SPEC) == "task"
+        and normalize_machine_choice(node.terminal_authority_scope, TERMINAL_AUTHORITY_SCOPE_SPEC) == "whole_paper"
+    ):
+        whole_paper_source_guard_lines = [
+            "This node is the whole-paper source phase.",
+            "Its opening responsibility is to advance source control artifacts for extraction, dependency closure surfacing, partition drafting, and split submission.",
+            "Do not read evaluator manuals or final-effects docs during the opening extraction/partition phase while the deterministic source control bundle is still the only materialized artifact set.",
+            "Advance the source control bundle or submit split before spending cycles on whole-paper terminal-classification analysis.",
+        ]
     return "\n".join(
         [
             "Read and follow:",
@@ -452,6 +464,7 @@ def _render_child_prompt(
             "Publish through the exact publication runner before evaluator or terminal report.",
             "A child-authored WHOLE_PAPER_STATUS.json or branch README is not a publication receipt.",
             "If the frozen handoff declares startup required outputs, materialize that exact first batch under the live artifact root before treating the node as substantively underway.",
+            *whole_paper_source_guard_lines,
             *slice_scope_guard_lines,
             "Do not inspect sibling workspace task folders or historical deliverables as templates, evidence, or reuse context unless the frozen handoff explicitly names that exact reuse target.",
             "When this prompt names a committed repo-shipped wrapper or helper, call it directly before reading its source or tests unless the direct path fails.",
@@ -824,10 +837,13 @@ def _default_startup_required_output_paths(*, workflow_scope: str, artifact_scop
     ):
         return [
             "README.md",
+            "TRACEABILITY.md",
             "WHOLE_PAPER_STATUS.json",
             "extraction/source_structure.json",
             "extraction/theorem_inventory.json",
             "analysis/internal_dependency_graph.json",
+            "analysis/block_partition_draft.json",
+            "external_dependencies/EXTERNAL_DEPENDENCY_LEDGER.json",
         ]
     return []
 
@@ -917,6 +933,24 @@ def _parse_whole_paper_source_tex(source_tex_ref: Path) -> dict[str, Any]:
                 )
                 current_item = None
 
+    top_level_sections = [section for section in sections if str(section.get("level") or "") == "section"]
+
+    def _section_title_for_line(line_no: int) -> str:
+        current_title = "front_matter"
+        for section in top_level_sections:
+            try:
+                section_line_start = int(section.get("line_start") or 0)
+            except (TypeError, ValueError):
+                continue
+            if section_line_start <= int(line_no):
+                current_title = str(section.get("title") or "").strip() or current_title
+            else:
+                break
+        return current_title
+
+    for item in theorem_items:
+        item["section_title"] = _section_title_for_line(int(item["line_start"]))
+
     nodes = [
         {
             "node_id": item["node_id"],
@@ -924,6 +958,7 @@ def _parse_whole_paper_source_tex(source_tex_ref: Path) -> dict[str, Any]:
             "label": item["label"],
             "line_start": item["line_start"],
             "line_end": item["line_end"],
+            "section_title": item["section_title"],
         }
         for item in theorem_items
     ]
@@ -941,13 +976,16 @@ def _parse_whole_paper_source_tex(source_tex_ref: Path) -> dict[str, Any]:
                     "to_ref": str(ref),
                 }
             )
+    citation_keys = sorted({str(cite) for item in theorem_items for cite in list(item["citations"]) if str(cite).strip()})
     citation_count = sum(len(list(item["citations"])) for item in theorem_items)
     return {
         "title": title,
         "sections": sections,
+        "top_level_sections": top_level_sections,
         "theorem_items": theorem_items,
         "nodes": nodes,
         "edges": edges,
+        "citation_keys": citation_keys,
         "citation_count": citation_count,
     }
 
@@ -974,14 +1012,54 @@ def _materialize_whole_paper_startup_batch(*, live_root: Path, source_tex_ref: P
         "nodes": list(parsed["nodes"]),
         "edges": list(parsed["edges"]),
     }
+    block_order: list[str] = []
+    block_map: dict[str, dict[str, Any]] = {}
+    for item in list(parsed["theorem_items"]):
+        section_title = str(item.get("section_title") or "front_matter").strip() or "front_matter"
+        if section_title not in block_map:
+            block_order.append(section_title)
+            block_map[section_title] = {
+                "block_id": safe_runtime_name(section_title) or f"block_{len(block_order)}",
+                "block_title": section_title,
+                "node_ids": [],
+                "labels": [],
+                "line_start": int(item["line_start"]),
+                "line_end": int(item["line_end"]),
+            }
+        block = block_map[section_title]
+        block["node_ids"].append(str(item["node_id"]))
+        label = str(item.get("label") or "").strip()
+        if label:
+            block["labels"].append(label)
+        block["line_start"] = min(int(block["line_start"]), int(item["line_start"]))
+        block["line_end"] = max(int(block["line_end"]), int(item["line_end"]))
+    block_partition_payload = {
+        "source_tex_ref": str(source_tex_ref.resolve()),
+        "block_count": len(block_order),
+        "blocks": [block_map[title] for title in block_order],
+    }
+    external_dependency_payload = {
+        "source_tex_ref": str(source_tex_ref.resolve()),
+        "citation_key_count": len(list(parsed["citation_keys"])),
+        "citation_keys": list(parsed["citation_keys"]),
+        "candidates": [
+            {
+                "citation_key": str(key),
+                "status": "unresolved_candidate",
+            }
+            for key in list(parsed["citation_keys"])
+        ],
+    }
     status_payload = {
         "workflow_scope": "whole_paper_formalization",
         "status": "IN_PROGRESS",
         "startup_batch_materialized": True,
+        "startup_control_bundle_materialized": True,
         "source_tex_ref": str(source_tex_ref.resolve()),
         "section_count": int(source_structure_payload["section_count"]),
         "theorem_like_count": int(theorem_inventory_payload["theorem_like_count"]),
         "internal_dependency_edge_count": int(dependency_graph_payload["edge_count"]),
+        "block_count": int(block_partition_payload["block_count"]),
         "citation_count": int(parsed["citation_count"]),
     }
     readme_text = "\n".join(
@@ -992,17 +1070,39 @@ def _materialize_whole_paper_startup_batch(*, live_root: Path, source_tex_ref: P
             f"- section_count: `{source_structure_payload['section_count']}`",
             f"- theorem_like_count: `{theorem_inventory_payload['theorem_like_count']}`",
             f"- internal_dependency_edge_count: `{dependency_graph_payload['edge_count']}`",
+            f"- block_count: `{block_partition_payload['block_count']}`",
             f"- citation_count: `{parsed['citation_count']}`",
             "",
             "This batch was materialized deterministically from the frozen source TeX before implementer-owned split/formalization work begins.",
         ]
     )
+    traceability_text = "\n".join(
+        [
+            "# Whole-Paper Source Control Bundle",
+            "",
+            "This source bootstrap owns the extraction/partition control surface before split.",
+            "",
+            f"- source_tex_ref: `{source_tex_ref.resolve()}`",
+            f"- theorem_like_count: `{theorem_inventory_payload['theorem_like_count']}`",
+            f"- internal_dependency_edge_count: `{dependency_graph_payload['edge_count']}`",
+            f"- partition_block_count: `{block_partition_payload['block_count']}`",
+            f"- external_dependency_candidate_count: `{external_dependency_payload['citation_key_count']}`",
+            "",
+            "Next source-phase responsibility:",
+            "- refine the initial partition draft if needed,",
+            "- advance traceability/external dependency evidence, and",
+            "- submit split once the staged fronts are ready.",
+        ]
+    )
 
     _write_text(live_root / "README.md", readme_text)
+    _write_text(live_root / "TRACEABILITY.md", traceability_text)
     _write_json(live_root / "WHOLE_PAPER_STATUS.json", status_payload)
     _write_json(live_root / "extraction" / "source_structure.json", source_structure_payload)
     _write_json(live_root / "extraction" / "theorem_inventory.json", theorem_inventory_payload)
     _write_json(live_root / "analysis" / "internal_dependency_graph.json", dependency_graph_payload)
+    _write_json(live_root / "analysis" / "block_partition_draft.json", block_partition_payload)
+    _write_json(live_root / "external_dependencies" / "EXTERNAL_DEPENDENCY_LEDGER.json", external_dependency_payload)
 
 
 def _render_task_scoped_evaluator_final_effects_text(*, artifact_payload: dict[str, Any], workspace_mirror_ref: str) -> str:

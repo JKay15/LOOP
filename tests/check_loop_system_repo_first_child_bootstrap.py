@@ -607,7 +607,7 @@ def main() -> int:
                         "\\end{definition}",
                         "\\section{Main Result}",
                         "\\begin{theorem}\\label{thm:main}",
-                        "Assume Definition~\\ref{def:calib}.",
+                        "Assume Definition~\\ref{def:calib} and \\cite{foo2020}.",
                         "\\end{theorem}",
                     ]
                 )
@@ -698,10 +698,13 @@ def main() -> int:
                 return _fail("whole-paper source handoff must preserve explicit terminal_authority_scope=whole_paper")
             expected_whole_paper_startup_outputs = [
                 "README.md",
+                "TRACEABILITY.md",
                 "WHOLE_PAPER_STATUS.json",
                 "extraction/source_structure.json",
                 "extraction/theorem_inventory.json",
                 "analysis/internal_dependency_graph.json",
+                "analysis/block_partition_draft.json",
+                "external_dependencies/EXTERNAL_DEPENDENCY_LEDGER.json",
             ]
             if list(whole_paper_request.get("startup_required_output_paths") or []) != expected_whole_paper_startup_outputs:
                 return _fail("whole-paper endpoint bootstrap must emit a machine-readable startup_required_output_paths contract")
@@ -710,16 +713,21 @@ def main() -> int:
             whole_paper_live_root = Path(str(whole_paper_bootstrap.get("workspace_live_artifact_ref") or "")).resolve()
             expected_live_files = [
                 whole_paper_live_root / "README.md",
+                whole_paper_live_root / "TRACEABILITY.md",
                 whole_paper_live_root / "WHOLE_PAPER_STATUS.json",
                 whole_paper_live_root / "extraction" / "source_structure.json",
                 whole_paper_live_root / "extraction" / "theorem_inventory.json",
                 whole_paper_live_root / "analysis" / "internal_dependency_graph.json",
+                whole_paper_live_root / "analysis" / "block_partition_draft.json",
+                whole_paper_live_root / "external_dependencies" / "EXTERNAL_DEPENDENCY_LEDGER.json",
             ]
             if not all(path.exists() for path in expected_live_files):
                 return _fail("whole-paper endpoint bootstrap must materialize the deterministic startup extraction batch in the live artifact root")
             source_structure_payload = json.loads((whole_paper_live_root / "extraction" / "source_structure.json").read_text(encoding="utf-8"))
             theorem_inventory_payload = json.loads((whole_paper_live_root / "extraction" / "theorem_inventory.json").read_text(encoding="utf-8"))
             dependency_graph_payload = json.loads((whole_paper_live_root / "analysis" / "internal_dependency_graph.json").read_text(encoding="utf-8"))
+            block_partition_payload = json.loads((whole_paper_live_root / "analysis" / "block_partition_draft.json").read_text(encoding="utf-8"))
+            external_dependency_payload = json.loads((whole_paper_live_root / "external_dependencies" / "EXTERNAL_DEPENDENCY_LEDGER.json").read_text(encoding="utf-8"))
             status_payload = json.loads((whole_paper_live_root / "WHOLE_PAPER_STATUS.json").read_text(encoding="utf-8"))
             if str(source_structure_payload.get("source_tex_ref") or "") != str(whole_paper_source_ref.resolve()):
                 return _fail("whole-paper startup extraction batch must record the exact source TeX ref it parsed")
@@ -729,8 +737,21 @@ def main() -> int:
                 return _fail("whole-paper startup extraction batch must parse theorem-like environments from the source TeX")
             if not list(dependency_graph_payload.get("edges") or []):
                 return _fail("whole-paper startup extraction batch must emit at least one internal dependency edge when the source TeX contains refs")
+            if int(block_partition_payload.get("block_count") or 0) < 1:
+                return _fail("whole-paper startup extraction batch must emit an initial partition draft")
+            if int(external_dependency_payload.get("citation_key_count") or 0) < 1:
+                return _fail("whole-paper startup extraction batch must emit a non-empty external dependency ledger when the source TeX contains citations")
             if not bool(status_payload.get("startup_batch_materialized")):
                 return _fail("whole-paper startup status file must record that the deterministic startup batch was materialized")
+            if not bool(status_payload.get("startup_control_bundle_materialized")):
+                return _fail("whole-paper startup status file must record that the deterministic source control bundle was materialized")
+
+            whole_paper_child_prompt = Path(str(whole_paper_bootstrap.get("child_prompt_ref") or ""))
+            whole_paper_prompt_text = whole_paper_child_prompt.read_text(encoding="utf-8").lower()
+            if "this node is the whole-paper source phase" not in whole_paper_prompt_text:
+                return _fail("whole-paper source prompt must identify the source phase explicitly")
+            if "do not read evaluator manuals or final-effects docs during the opening extraction/partition phase" not in whole_paper_prompt_text:
+                return _fail("whole-paper source prompt must explicitly delay evaluator-manual reading until after source control work advances")
 
             expected_whole_paper_refs = {
                 str(whole_paper_endpoint_artifact.resolve()),
