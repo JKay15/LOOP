@@ -15,7 +15,6 @@ from typing import Any, Mapping, Sequence
 from loop_product import build_endpoint_clarification_part1_input, run_evaluator
 from loop_product.artifact_hygiene import (
     artifact_fingerprint,
-    canonicalize_directory_artifact_heavy_trees,
     iter_runtime_heavy_tree_paths,
 )
 from loop_product.evaluator.agent_execution_policy import validate_evaluator_agent_execution, validate_repo_shipped_role_agent_cmd
@@ -38,12 +37,12 @@ _ENDPOINT_FINAL_EFFECTS_PATH = product_contract_path("LOOP_ENDPOINT_CLARIFICATIO
 _DEFAULT_AGENT_EXECUTION: dict[str, dict[str, str]] = {
     "default": {
         "agent_provider": "codex_cli",
-        "sandbox_mode": "danger-full-access",
+        "sandbox_mode": "workspace-write",
         "reasoning_effort": "high",
     },
     "reviewer": {
         "agent_provider": "codex_cli",
-        "sandbox_mode": "danger-full-access",
+        "sandbox_mode": "workspace-write",
         "reasoning_effort": "high",
     },
 }
@@ -253,7 +252,12 @@ def _enforce_directory_artifact_hygiene_preflight(submission: EvaluatorNodeSubmi
     artifact_root = Path(submission.implementation_package_ref).expanduser().resolve()
     if not artifact_root.exists() or not artifact_root.is_dir():
         return
-    canonicalize_directory_artifact_heavy_trees(artifact_root)
+    heavy = [str(item) for item in iter_runtime_heavy_tree_paths(artifact_root)]
+    if heavy:
+        raise ValueError(
+            "evaluator preflight requires the published artifact root to remain immutable and free of runtime-owned heavy trees; "
+            f"republish before evaluator launch: {', '.join(heavy)}"
+        )
 
 
 def _derive_state_root_from_submission(submission: EvaluatorNodeSubmission) -> Path:
@@ -744,12 +748,12 @@ def build_evaluator_submission_for_smoke_round(
     agent_execution: dict[str, Any] = {
         "default": {
             "agent_provider": "codex_cli",
-            "sandbox_mode": "danger-full-access",
+            "sandbox_mode": "workspace-write",
             "reasoning_effort": "high",
         },
         "reviewer": {
             "agent_provider": "codex_cli",
-            "sandbox_mode": "danger-full-access",
+            "sandbox_mode": "workspace-write",
             "reasoning_effort": "high",
         },
     }

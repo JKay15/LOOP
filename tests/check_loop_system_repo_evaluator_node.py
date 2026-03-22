@@ -120,7 +120,7 @@ def _write_stub_agent(path: Path) -> None:
                     _write_json(result_path, result)
                     _write_text(response_path, "# Checker\\n\\nStub checker completed.\\n")
                     return 0
-                if role == "test_designer":
+                if role in {"test_designer", "test_ai"}:
                     ordinary_root_raw = str(context.get("ordinary_test_artifact_root") or "").strip()
                     if ordinary_root_raw:
                         ordinary_root = Path(ordinary_root_raw)
@@ -539,6 +539,186 @@ def _write_unknown_reviewer_agent(path: Path) -> None:
                         },
                     )
                     _write_text(response_path, "VERDICT: UNKNOWN\\nsummary: synthetic reviewer returned unknown.\\n")
+                    return 0
+                raise SystemExit(f"unexpected role: {role}")
+
+
+            if __name__ == "__main__":
+                raise SystemExit(main())
+            """
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def _write_mutating_fake_codex_cli(path: Path) -> None:
+    path.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            from __future__ import annotations
+
+            import json
+            import os
+            import sys
+            from pathlib import Path
+
+            def _write_json(path: Path, obj: object) -> None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\\n", encoding="utf-8")
+
+
+            def _write_text(path: Path, text: str) -> None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+
+
+            def _candidate_paths() -> list[Path]:
+                texts: list[str] = []
+                prompt_ref = Path(os.environ["LOOP_PRODUCT_EVAL_PROMPT"])
+                texts.append(prompt_ref.read_text(encoding="utf-8"))
+                context_ref = Path(os.environ["LOOP_PRODUCT_EVAL_CONTEXT_PATH"])
+                texts.append(context_ref.read_text(encoding="utf-8"))
+                found: list[Path] = []
+                seen: set[Path] = set()
+                for text in texts:
+                    normalized = (
+                        text.replace("`", " ")
+                        .replace('"', " ")
+                        .replace("'", " ")
+                        .replace("(", " ")
+                        .replace(")", " ")
+                        .replace(",", " ")
+                        .replace(":", " ")
+                    )
+                    for raw in normalized.split():
+                        if not raw.startswith("/"):
+                            continue
+                        candidate = Path(raw.rstrip(".,;"))
+                        try:
+                            resolved = candidate.resolve()
+                        except Exception:
+                            continue
+                        if "deliverables/primary_artifact" not in str(resolved):
+                            continue
+                        if resolved in seen:
+                            continue
+                        seen.add(resolved)
+                        found.append(resolved)
+                return found
+
+
+            def main() -> int:
+                argv = sys.argv[1:]
+                if not argv or argv[0] != "exec":
+                    raise SystemExit(f"unexpected argv: {argv!r}")
+                role = str(os.environ["LOOP_PRODUCT_EVAL_ROLE"])
+                result_path = Path(os.environ["LOOP_PRODUCT_EVAL_RESULT_PATH"])
+                response_path = Path(os.environ["LOOP_PRODUCT_EVAL_RESPONSE_PATH"])
+                context = json.loads(Path(os.environ["LOOP_PRODUCT_EVAL_CONTEXT_PATH"]).read_text(encoding="utf-8"))
+                if role == "checker":
+                    requirement = {
+                        "requirement_id": "REQ-001",
+                        "description": "Evaluator-visible artifact refs must stay inside staged copies.",
+                        "blocking": True,
+                    }
+                    _write_json(
+                        result_path,
+                        {
+                            "status": "OK",
+                            "normalized_requirements": [requirement],
+                            "requirement_graph": {
+                                "requirements": [requirement],
+                                "evaluation_units": [{"unit_id": "EU-001", "requirement_ids": ["REQ-001"]}],
+                                "dependency_edges": [],
+                            },
+                            "repair_actions": [],
+                            "human_gate_reasons": [],
+                            "notes": [],
+                        },
+                    )
+                    _write_text(response_path, "# Checker\\n\\nPath-mutation checker completed.\\n")
+                    return 0
+                if role == "test_designer":
+                    candidates = _candidate_paths()
+                    if not candidates:
+                        raise SystemExit("no artifact path found in prompt/context")
+                    target = candidates[0]
+                    (target / ".lake").mkdir(parents=True, exist_ok=True)
+                    _write_text(target / ".lake" / "mutated_by_prompt_agent.txt", "staged-only\\n")
+                    ordinary_root = result_path.parent
+                    stdout_ref = ordinary_root / "stdout.txt"
+                    stderr_ref = ordinary_root / "stderr.txt"
+                    exec_span_ref = ordinary_root / "exec_span.json"
+                    _write_text(stdout_ref, f"mutated {target}\\n")
+                    _write_text(stderr_ref, "")
+                    _write_json(
+                        exec_span_ref,
+                        {
+                            "cwd": str(Path(context["workspace_root"]).resolve()),
+                            "exit_code": 0,
+                        },
+                    )
+                    _write_json(
+                        result_path,
+                        {
+                            "status": "OK",
+                            "ordinary_test_results": {
+                                "all_passed": True,
+                                "executed_tests": [
+                                    {
+                                        "test_id": "OT-IMMUTABLE-001",
+                                        "test_kind": "documented_cli_probe",
+                                        "argv": ["bash", "-lc", "mutated staged artifact path only"],
+                                        "passed": True,
+                                        "exit_code": 0,
+                                        "stdout_ref": str(stdout_ref),
+                                        "stderr_ref": str(stderr_ref),
+                                        "exec_span_ref": str(exec_span_ref),
+                                    }
+                                ],
+                            },
+                            "notes": [str(target)],
+                        },
+                    )
+                    _write_text(response_path, "# Test Designer\\n\\nMutated the staged artifact path only.\\n")
+                    return 0
+                if role == "ai_user":
+                    _write_json(
+                        result_path,
+                        {
+                            "status": "OK",
+                            "operation_log_ref": "",
+                            "effect_results": [
+                                {
+                                    "requirement_id": "REQ-001",
+                                    "outcome": "PASS",
+                                    "summary": "staged-only mutation completed",
+                                    "evidence_refs": [str(response_path)],
+                                }
+                            ],
+                            "notes": [],
+                        },
+                    )
+                    _write_text(response_path, "# AI-as-User\\n\\nPath-mutation user lane completed.\\n")
+                    return 0
+                if role == "reviewer":
+                    _write_json(
+                        result_path,
+                        {
+                            "status": "OK",
+                            "effect_reviews": [
+                                {
+                                    "requirement_id": "REQ-001",
+                                    "verdict": "PASS",
+                                    "evidence_refs": [str(response_path)],
+                                    "reproduction_steps": ["Inspect the staged role workspace instead of the real publish root."],
+                                }
+                            ],
+                        },
+                    )
+                    _write_text(response_path, "VERDICT: PASS\\nsummary: staged path mutation stayed local.\\n")
                     return 0
                 raise SystemExit(f"unexpected role: {role}")
 
@@ -2150,6 +2330,137 @@ def main() -> int:
                         "evaluator role workspace staging must exclude nested heavyweight deliverable tree "
                         f"{heavyweight_relpath}"
                     )
+
+        immutable_workspace_root = temp_root / "immutable_publish_workspace"
+        immutable_artifact_root = immutable_workspace_root / "deliverables" / "primary_artifact"
+        immutable_live_root = immutable_workspace_root / ".tmp_primary_artifact"
+        immutable_live_root.mkdir(parents=True, exist_ok=True)
+        (immutable_live_root / "README.md").write_text("# README\n", encoding="utf-8")
+        (immutable_live_root / "TRACEABILITY.md").write_text("# TRACEABILITY\n", encoding="utf-8")
+        (immutable_live_root / "slice.lean").write_text("def immutableProbe : Nat := 0\n", encoding="utf-8")
+        immutable_manual_ref = immutable_workspace_root / "PRODUCT_MANUAL.md"
+        immutable_manual_ref.write_text(
+            textwrap.dedent(
+                f"""\
+                # Manual
+
+                Evaluate the published artifact rooted at:
+                `{immutable_artifact_root.resolve()}`
+
+                The artifact lives under the source workspace:
+                `{immutable_workspace_root.resolve()}`
+                """
+            ),
+            encoding="utf-8",
+        )
+        immutable_final_effects_ref = immutable_workspace_root / "FINAL_EFFECTS.md"
+        immutable_final_effects_ref.write_text(
+            textwrap.dedent(
+                f"""\
+                # Final Effects
+
+                - Stay inside the staged workspace copy even if manuals mention `{immutable_artifact_root.resolve()}`.
+                - Preserve the real published artifact at `{immutable_artifact_root.resolve()}`.
+                """
+            ),
+            encoding="utf-8",
+        )
+        immutable_kernel_state = load_kernel_state(state_root)
+        immutable_child_node = NodeSpec(
+            node_id="child-immutable-publish-001",
+            node_kind="implementer",
+            goal_slice="prove evaluator prompts no longer leak the real publish root",
+            parent_node_id=root_node.node_id,
+            generation=1,
+            round_id="R1",
+            execution_policy={"sandbox_mode": "danger-full-access"},
+            reasoning_profile={"role": "implementer", "thinking_budget": "high"},
+            budget_profile={"max_rounds": 2},
+            allowed_actions=["evaluate", "report"],
+            delegation_ref="state/delegations/child-immutable-publish-001.json",
+            result_sink_ref="artifacts/child-immutable-publish-001/implementer_result.json",
+            lineage_ref="root-kernel->child-immutable-publish-001",
+            status=NodeStatus.ACTIVE,
+        )
+        immutable_kernel_state.register_node(immutable_child_node)
+        persist_kernel_state(state_root, immutable_kernel_state, authority=kernel_internal_authority())
+        immutable_receipt_ref = (
+            state_root
+            / "artifacts"
+            / "publication"
+            / immutable_child_node.node_id
+            / "WorkspaceArtifactPublicationReceipt.json"
+        )
+        publish_workspace_artifact_snapshot(
+            node_id=immutable_child_node.node_id,
+            live_artifact_ref=immutable_live_root,
+            publish_artifact_ref=immutable_artifact_root,
+            publication_receipt_ref=immutable_receipt_ref,
+        )
+        immutable_submission = build_evaluator_submission_for_frozen_task(
+            target_node=immutable_child_node,
+            workspace_root=immutable_workspace_root,
+            output_root=state_root / "artifacts" / "evaluator_node_immutable_publish_runs",
+            implementation_package_ref=immutable_artifact_root,
+            artifact_publication_receipt_ref=immutable_receipt_ref,
+            product_manual_ref=immutable_manual_ref,
+            final_effects_text_ref=immutable_final_effects_ref,
+        )
+        mutating_fake_codex_root = temp_root / "mutating_fake_codex_bin"
+        mutating_fake_codex_root.mkdir(parents=True, exist_ok=True)
+        _write_mutating_fake_codex_cli(mutating_fake_codex_root / "codex")
+        previous_path = str(os.environ.get("PATH") or "")
+        os.environ["PATH"] = (
+            str(mutating_fake_codex_root) + os.pathsep + previous_path if previous_path else str(mutating_fake_codex_root)
+        )
+        try:
+            immutable_result, immutable_refs = run_evaluator_node(
+                state_root=state_root,
+                submission=immutable_submission,
+            )
+        finally:
+            os.environ["PATH"] = previous_path
+        if immutable_result.verdict is not EvaluatorVerdict.PASS:
+            return _fail(
+                "prompt-path mutator fixture must still complete through evaluator-node runtime; "
+                f"got verdict={immutable_result.verdict.value} summary={immutable_result.summary!r}"
+            )
+        if (immutable_artifact_root / ".lake").exists():
+            return _fail(
+                "evaluator-visible manuals/final effects must no longer leak the real publish root; the publish root stayed mutable"
+            )
+        immutable_run_root = Path(str(immutable_refs["evaluation_report_ref"])).resolve().parent
+        immutable_test_ai_run_ref = (
+            immutable_run_root
+            / ".loop"
+            / "test_ai"
+            / "runs"
+            / "test_ai__EU-001"
+            / "invocation.json"
+        )
+        immutable_test_ai_prompt_ref = Path(
+            str(json.loads(immutable_test_ai_run_ref.read_text(encoding="utf-8")).get("prompt_ref") or "")
+        )
+        immutable_test_ai_prompt_text = immutable_test_ai_prompt_ref.read_text(encoding="utf-8")
+        immutable_staged_workspace_root = (
+            immutable_run_root / ".loop" / "test_ai" / "workspaces" / "test_ai__EU-001" / "workspace"
+        )
+        immutable_staged_artifact_root = immutable_staged_workspace_root / "deliverables" / "primary_artifact"
+        if str(immutable_artifact_root.resolve()) in immutable_test_ai_prompt_text:
+            return _fail(
+                "evaluator-visible manuals/final effects must rewrite the real publish-root path out of delegated prompts"
+            )
+        if str(immutable_staged_artifact_root.resolve()) not in immutable_test_ai_prompt_text:
+            return _fail(
+                "delegated evaluator prompts must point at the staged artifact copy after workspace-path rewriting"
+            )
+        staged_mutation_ref = (
+            immutable_staged_artifact_root / ".lake" / "mutated_by_prompt_agent.txt"
+        )
+        if not staged_mutation_ref.exists():
+            return _fail(
+                "prompt-path mutator fixture must still mutate the staged evaluator-visible artifact copy so the regression proves path rewriting"
+            )
 
         failing_agent_cmd = _fixture_role_agent_cmd(scenario="lane_failure", failing_role="checker", failure_message="synthetic checker failure")
         bug_submission = build_evaluator_submission_for_endpoint_clarification(

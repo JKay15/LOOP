@@ -834,6 +834,11 @@ def _run_lane(
             workspace_name=f"test_ai__{unit_id}",
             copy_source_workspace=True,
         )
+        test_ai_manual_text = _legacy._rewrite_workspace_absolute_paths(
+            text=manual_text,
+            source_workspace_root=workspace_root,
+            target_workspace_root=test_ai_workspace,
+        )
         try:
             test_ai = _invoke_text_role(
                 request=request,
@@ -845,10 +850,22 @@ def _run_lane(
                 prompt_text=_build_lane_prompt(
                     role_id="test_designer",
                     request=request,
-                    manual_text=manual_text,
+                    manual_text=test_ai_manual_text,
                     target_unit=target_unit_obj,
                 ),
-                context_obj={**base_context, "role": "test_designer", "workspace_root": str(test_ai_workspace)},
+                context_obj={
+                    **base_context,
+                    "role": "test_designer",
+                    "workspace_root": str(test_ai_workspace),
+                    "product_manual_ref": str(
+                        _legacy._materialize_staged_role_context_ref(
+                            staged_workspace_root=test_ai_workspace,
+                            source_workspace_root=workspace_root,
+                            source_path=manual_path,
+                            label="product_manual",
+                        )
+                    ),
+                },
             )
         except Exception as exc:  # noqa: BLE001
             issue_info = _issue_info_from_exception(exc)
@@ -879,6 +896,11 @@ def _run_lane(
             workspace_name=f"ai_user__{unit_id}",
             copy_source_workspace=True,
         )
+        ai_user_manual_text = _legacy._rewrite_workspace_absolute_paths(
+            text=manual_text,
+            source_workspace_root=workspace_root,
+            target_workspace_root=ai_user_workspace,
+        )
         try:
             ai_user = _invoke_text_role(
                 request=request,
@@ -890,10 +912,22 @@ def _run_lane(
                 prompt_text=_build_lane_prompt(
                     role_id="ai_user",
                     request=request,
-                    manual_text=manual_text,
+                    manual_text=ai_user_manual_text,
                     target_unit=target_unit_obj,
                 ),
-                context_obj={**base_context, "role": "ai_user", "workspace_root": str(ai_user_workspace)},
+                context_obj={
+                    **base_context,
+                    "role": "ai_user",
+                    "workspace_root": str(ai_user_workspace),
+                    "product_manual_ref": str(
+                        _legacy._materialize_staged_role_context_ref(
+                            staged_workspace_root=ai_user_workspace,
+                            source_workspace_root=workspace_root,
+                            source_path=manual_path,
+                            label="product_manual",
+                        )
+                    ),
+                },
             )
         except Exception as exc:  # noqa: BLE001
             issue_info = _issue_info_from_exception(exc)
@@ -1095,7 +1129,11 @@ def run_evaluator_simple_prototype(*, request: Mapping[str, Any] | str | Path) -
                         workspace_root=checker_workspace_root,
                         prompt_text=_legacy.build_checker_prompt(
                             request=normalized_request,
-                            final_effects_text=goals_text,
+                            final_effects_text=_legacy._rewrite_workspace_absolute_paths(
+                                text=goals_text,
+                                source_workspace_root=workspace_root,
+                                target_workspace_root=checker_workspace_root,
+                            ),
                             result_path=(
                                 _legacy._role_runtime_artifact_root(
                                     checker_role_dir,
@@ -1326,6 +1364,11 @@ def run_evaluator_simple_prototype(*, request: Mapping[str, Any] | str | Path) -
             }
             _run_state.write_run_state(run_root=run_root, state=state)
             try:
+                reviewer_manual_text = _legacy._rewrite_workspace_absolute_paths(
+                    text=manual_text,
+                    source_workspace_root=workspace_root,
+                    target_workspace_root=reviewer_workspace_root,
+                )
                 reviewer_run = _invoke_text_role(
                     request=normalized_request,
                     role_id="reviewer",
@@ -1335,7 +1378,7 @@ def run_evaluator_simple_prototype(*, request: Mapping[str, Any] | str | Path) -
                     workspace_root=reviewer_workspace_root,
                     prompt_text=_build_reviewer_prompt(
                         request=normalized_request,
-                        manual_text=manual_text,
+                        manual_text=reviewer_manual_text,
                         checker_result=_project_checker_result_from_state(state),
                         lanes=_project_lanes_from_state(state),
                     ),

@@ -9,6 +9,7 @@ from typing import Any, Callable, Mapping
 
 from loop_product.dispatch.child_progress_snapshot import child_progress_snapshot_from_launch_result_ref
 from loop_product.dispatch.launch_runtime import terminate_runtime_owned_launch_result_ref
+from loop_product.evaluator_authority import authoritative_result_conflicts_with_inflight_evaluator
 from loop_product.kernel.state import load_kernel_state
 from loop_product.protocols.node import NodeSpec
 from loop_product.protocols.schema import validate_repo_object
@@ -345,6 +346,12 @@ def supervise_child_until_settled(
         node_id = str(status.get("node_id") or "").strip()
         result_ref = _authoritative_result_ref(state_root=state_root, node_id=node_id)
         result_payload = _load_json(result_ref) if result_ref.exists() else None
+        if result_payload and authoritative_result_conflicts_with_inflight_evaluator(
+            state_root=state_root,
+            node_id=node_id,
+            payload=result_payload,
+        ):
+            result_payload = None
         classification = _classify_terminal_result(result_payload or {})
         history.append(
             {

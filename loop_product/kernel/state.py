@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from loop_product.artifact_hygiene import canonicalize_workspace_artifact_heavy_trees
+from loop_product.evaluator_authority import authoritative_result_conflicts_with_inflight_evaluator
 from loop_product.gateway.classify import classify_envelope
 from loop_product.kernel.authority import KernelMutationAuthority, require_kernel_authority
 from loop_product.protocols.control_envelope import ControlEnvelope
@@ -571,6 +572,12 @@ def synchronize_authoritative_node_results(
         try:
             result_payload = json.loads(result_ref.read_text(encoding="utf-8"))
         except Exception:
+            continue
+        if authoritative_result_conflicts_with_inflight_evaluator(
+            state_root=state_root,
+            node_id=node_id,
+            payload=result_payload,
+        ):
             continue
         desired_status = _normalized_status_from_authoritative_result(
             current_status=str(node_payload.get("status") or ""),

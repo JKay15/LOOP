@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from loop_product.dispatch.launch_runtime import child_runtime_status_from_launch_result_ref
+from loop_product.evaluator_authority import (
+    authoritative_result_conflicts_with_inflight_evaluator,
+    latest_evaluator_run_state_ref,
+)
 from loop_product.protocols.schema import validate_repo_object
 
 _DOC_SUFFIXES = {".md", ".markdown", ".rst", ".txt", ".tex", ".pdf"}
@@ -125,16 +129,6 @@ def _split_doc_refs(*, state_root: Path, observed_paths: Iterable[Path]) -> tupl
     return all_doc_refs, repo_doc_refs, external_doc_refs
 
 
-def _latest_evaluator_run_state(*, state_root: Path, node_id: str) -> Path | None:
-    base = state_root / "artifacts" / "evaluator_runs" / node_id
-    if not base.exists():
-        return None
-    candidates = list(base.glob("**/EvaluatorRunState.json"))
-    if not candidates:
-        return None
-    return max(candidates, key=lambda path: path.stat().st_mtime_ns)
-
-
 def _evaluator_log_refs(*, run_state_ref: Path) -> list[Path]:
     run_root = run_state_ref.parent
     evaluator_loop_root = run_root / ".loop"
@@ -164,7 +158,7 @@ def _lane_status_ids(lanes_by_unit_id: dict[str, Any], status: str) -> list[str]
 
 
 def _evaluator_summary(*, state_root: Path, node_id: str) -> dict[str, Any]:
-    run_state_ref = _latest_evaluator_run_state(state_root=state_root, node_id=node_id)
+    run_state_ref = latest_evaluator_run_state_ref(state_root=state_root, node_id=node_id)
     if run_state_ref is None:
         return {
             "evaluator_run_state_ref": "",
@@ -251,6 +245,13 @@ def child_progress_snapshot_from_launch_result_ref(
     implementer_result_ref = _authoritative_result_ref(state_root=state_root, node_id=node_id)
     terminal_result_present = implementer_result_ref.exists()
     result_payload = _load_json(implementer_result_ref) if terminal_result_present else {}
+    if terminal_result_present and authoritative_result_conflicts_with_inflight_evaluator(
+        state_root=state_root,
+        node_id=node_id,
+        payload=result_payload,
+    ):
+        terminal_result_present = False
+        result_payload = {}
     evaluator_summary = _evaluator_summary(state_root=state_root, node_id=node_id)
     implementer_evaluator = dict(result_payload.get("evaluator_result") or {})
     snapshot_ref = launch_result_ref.with_name("ChildProgressSnapshot.json")

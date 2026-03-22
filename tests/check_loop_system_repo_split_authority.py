@@ -980,6 +980,122 @@ def _source_split_continuation_sync_case() -> int:
     return 0
 
 
+def _inflight_evaluator_authority_gate_case() -> int:
+    from loop_product.dispatch.child_dispatch import materialize_child
+    from loop_product.dispatch.publication import publish_workspace_artifact_snapshot
+    from loop_product.kernel.authority import kernel_internal_authority
+    from loop_product.kernel.query import query_authority_view
+    from loop_product.kernel.state import load_kernel_state
+    from loop_product.protocols.node import NodeStatus
+    from loop_product.runtime_paths import node_live_artifact_root
+
+    with tempfile.TemporaryDirectory(prefix="loop_system_split_authority_inflight_eval_") as td:
+        state_root = Path(td) / ".loop"
+        _persist_base_state(state_root)
+        authority = kernel_internal_authority()
+        kernel_state = load_kernel_state(state_root)
+        child_workspace_root = ROOT / "workspace" / "test-child-inflight-evaluator-authority"
+        shutil.rmtree(child_workspace_root, ignore_errors=True)
+        materialize_child(
+            state_root=state_root,
+            kernel_state=kernel_state,
+            parent_node_id="child-implementer-001",
+            node_id="child-inflight-evaluator-001",
+            goal_slice="prove that in-flight evaluator state must gate authoritative blocked results",
+            round_id="R1.child-inflight-evaluator-001",
+            execution_policy={"sandbox_mode": "workspace-write", "agent_provider": "codex_cli"},
+            reasoning_profile={"thinking_budget": "medium", "role": "implementer"},
+            budget_profile={"max_rounds": 1},
+            node_kind="implementer",
+            generation=2,
+            allowed_actions=["implement", "evaluate", "report"],
+            workspace_root=str(child_workspace_root.resolve()),
+            codex_home="",
+            depends_on_node_ids=[],
+            activation_condition="",
+            result_sink_ref="artifacts/child-inflight-evaluator-001/result.json",
+            lineage_ref="root-kernel->child-implementer-001->child-inflight-evaluator-001",
+            status=NodeStatus.ACTIVE,
+            authority=authority,
+        )
+        live_root = node_live_artifact_root(
+            state_root=state_root,
+            node_id="child-inflight-evaluator-001",
+            workspace_mirror_relpath="deliverables/primary_artifact",
+        )
+        live_root.mkdir(parents=True, exist_ok=True)
+        (live_root / "README.md").write_text("# inflight evaluator gate\n", encoding="utf-8")
+        publish_workspace_artifact_snapshot(
+            node_id="child-inflight-evaluator-001",
+            live_artifact_ref=live_root,
+            publish_artifact_ref=child_workspace_root / "deliverables" / "primary_artifact",
+            publication_receipt_ref=state_root
+            / "artifacts"
+            / "publication"
+            / "child-inflight-evaluator-001"
+            / "WorkspaceArtifactPublicationReceipt.json",
+        )
+        result_ref = state_root / "artifacts" / "child-inflight-evaluator-001" / "result.json"
+        result_ref.parent.mkdir(parents=True, exist_ok=True)
+        result_ref.write_text(
+            json.dumps(
+                {
+                    "schema": "loop_product.child_result",
+                    "node_id": "child-inflight-evaluator-001",
+                    "status": "BLOCKED",
+                    "outcome": "STUCK",
+                    "summary": "child wrote a blocked result before the evaluator reached reviewer closure",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        evaluator_run_root = (
+            state_root
+            / "artifacts"
+            / "evaluator_runs"
+            / "child-inflight-evaluator-001"
+            / "implementer_task_child-inflight-evaluator-001"
+            / "R1__child-inflight-evaluator-001__evaluator"
+        )
+        evaluator_run_root.mkdir(parents=True, exist_ok=True)
+        (evaluator_run_root / "EvaluatorRunState.json").write_text(
+            json.dumps(
+                {
+                    "evaluation_id": "implementer_task_child-inflight-evaluator-001",
+                    "run_id": "R1__child-inflight-evaluator-001__evaluator",
+                    "status": "IN_PROGRESS",
+                    "checker": {"status": "COMPLETED", "attempt_count": 1},
+                    "lanes_by_unit_id": {
+                        "EU-001": {"status": "COMPLETED"},
+                        "EU-002": {"status": "RUNNING"},
+                    },
+                    "reviewer": {"status": "PENDING", "attempt_count": 0},
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        authority_view = query_authority_view(state_root)
+        node_graph = {item["node_id"]: item for item in authority_view["node_graph"]}
+        if node_graph.get("child-inflight-evaluator-001", {}).get("status") != NodeStatus.ACTIVE.value:
+            return _fail(
+                "authoritative result sync must ignore blocked child results while the latest evaluator run is still in progress"
+            )
+        node_state = json.loads((state_root / "state" / "child-inflight-evaluator-001.json").read_text(encoding="utf-8"))
+        if node_state.get("status") != NodeStatus.ACTIVE.value:
+            return _fail(
+                "per-node snapshot must stay ACTIVE while an in-flight evaluator conflicts with a child-authored blocked result"
+            )
+        shutil.rmtree(child_workspace_root, ignore_errors=True)
+
+    return 0
+
+
 def main() -> int:
     try:
         rc = _accepted_split_case()
@@ -995,6 +1111,9 @@ def main() -> int:
         if rc:
             return rc
         rc = _source_split_continuation_sync_case()
+        if rc:
+            return rc
+        rc = _inflight_evaluator_authority_gate_case()
         if rc:
             return rc
         rc = _rejected_split_case()

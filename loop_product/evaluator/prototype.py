@@ -204,6 +204,34 @@ def _sanitize_self_eval_manual_text(*, text: str, workspace_root: Path) -> str:
     return sanitized
 
 
+def _rewrite_workspace_absolute_paths(
+    *,
+    text: str,
+    source_workspace_root: Path,
+    target_workspace_root: Path,
+) -> str:
+    sanitized = str(text)
+    target_root = str(Path(target_workspace_root).resolve())
+    source_roots = tuple(
+        candidate
+        for candidate in dict.fromkeys(
+            (
+                str(Path(source_workspace_root)),
+                str(Path(source_workspace_root).resolve()),
+            )
+        )
+        if candidate
+    )
+    if not source_roots:
+        return sanitized
+    for source_root in sorted(source_roots, key=len, reverse=True):
+        if source_root == target_root:
+            continue
+        sanitized = sanitized.replace(source_root + "/", target_root + "/")
+        sanitized = sanitized.replace(source_root, target_root)
+    return sanitized
+
+
 def _preferred_workspace_python(workspace_root: Path) -> Path | None:
     workspace_root = Path(workspace_root)
     resolved_workspace_root = workspace_root.resolve()
@@ -1115,15 +1143,31 @@ def _materialize_staged_role_context_ref(
     source_path: Path,
     label: str,
 ) -> Path:
+    def _rewrite_if_workspace_text(staged_path: Path) -> None:
+        if staged_path.suffix.lower() not in {".md", ".markdown", ".txt", ".rst", ".json", ".yaml", ".yml", ".toml", ".tex"}:
+            return
+        try:
+            text = staged_path.read_text(encoding="utf-8")
+        except Exception:
+            return
+        source_prefix = str(source_root)
+        staged_prefix = str(staged_root)
+        if source_prefix not in text:
+            return
+        staged_path.write_text(text.replace(source_prefix, staged_prefix), encoding="utf-8")
+
     resolved_source = source_path.resolve()
     staged_root = staged_workspace_root.resolve()
     source_root = source_workspace_root.resolve()
     if _is_within(resolved_source, source_root):
         candidate = staged_root / resolved_source.relative_to(source_root)
         if candidate.exists():
+            _rewrite_if_workspace_text(candidate)
             return candidate
     staged_input_path = staged_root / ".loop_evaluator_internal" / "inputs" / f"{label}__{resolved_source.name}"
     _copy_file_if_needed(source=resolved_source, dest=staged_input_path)
+    if _is_within(resolved_source, source_root):
+        _rewrite_if_workspace_text(staged_input_path)
     return staged_input_path
 
 
@@ -2060,8 +2104,6 @@ def _normalize_agent_config(request: Mapping[str, Any], role_id: str) -> dict[st
     sandbox_mode = str(merged.get("sandbox_mode") or "").strip() or "danger-full-access"
     if sandbox_mode not in {"read-only", "workspace-write", "danger-full-access"}:
         raise ValueError(f"unsupported sandbox_mode for {role_id}: {sandbox_mode}")
-    if sandbox_mode in {"read-only", "workspace-write"}:
-        sandbox_mode = "danger-full-access"
     merged["sandbox_mode"] = sandbox_mode
     reasoning_effort = str(merged.get("reasoning_effort") or "").strip().lower()
     if reasoning_effort and reasoning_effort not in _REASONING_EFFORTS:
@@ -4889,9 +4931,14 @@ def _run_ai_user_effect(
     effect_scratch_dir = Path(staging["scratch_dir"])
     current_run_snapshot_root = Path(staging["current_run_snapshot_root"])
     effect_scratch_dir.mkdir(parents=True, exist_ok=True)
+    staged_manual_text = _rewrite_workspace_absolute_paths(
+        text=manual_text,
+        source_workspace_root=Path(str(request["workspace_root"])),
+        target_workspace_root=staged_workspace_root,
+    )
     prompt_text = build_ai_user_prompt(
         request=request,
-        manual_text=manual_text,
+        manual_text=staged_manual_text,
         final_effect_requirements=final_effect_requirements,
         requirement_graph=requirement_graph,
         target_unit=target_unit,
@@ -5299,6 +5346,11 @@ def run_evaluator_prototype(*, request: Mapping[str, Any] | str | Path) -> dict[
                     role_id="checker",
                     copy_source_workspace=False,
                 )
+                staged_goals_text = _rewrite_workspace_absolute_paths(
+                    text=goals_text,
+                    source_workspace_root=workspace_root,
+                    target_workspace_root=Path(checker_workspace["workspace_root"]),
+                )
                 checker_result_raw, checker_run = _invoke_role(
                     role_id="checker",
                     request=normalized_request,
@@ -5307,7 +5359,7 @@ def run_evaluator_prototype(*, request: Mapping[str, Any] | str | Path) -> dict[
                     role_dir=checker_role_dir,
                     prompt_text=build_checker_prompt(
                         request=normalized_request,
-                        final_effects_text=goals_text,
+                        final_effects_text=staged_goals_text,
                         result_path=checker_artifact_root / "result.json",
                         response_path=checker_artifact_root / "response.md",
                     ),
@@ -5357,6 +5409,11 @@ def run_evaluator_prototype(*, request: Mapping[str, Any] | str | Path) -> dict[
                 role_id="test_ai",
                 copy_source_workspace=True,
             )
+            staged_manual_text = _rewrite_workspace_absolute_paths(
+                text=manual_text,
+                source_workspace_root=workspace_root,
+                target_workspace_root=Path(test_designer_workspace["workspace_root"]),
+            )
             designer_result, designer_run = _invoke_role(
                 role_id="test_designer",
                 request=normalized_request,
@@ -5367,7 +5424,7 @@ def run_evaluator_prototype(*, request: Mapping[str, Any] | str | Path) -> dict[
                 role_dir=test_ai_role_dir,
                 prompt_text=build_test_designer_prompt(
                     request=normalized_request,
-                    manual_text=manual_text,
+                    manual_text=staged_manual_text,
                     final_effect_requirements=final_effect_requirements,
                     result_path=test_ai_artifact_root / "result.json",
                     response_path=test_ai_artifact_root / "response.md",
@@ -5436,6 +5493,11 @@ def run_evaluator_prototype(*, request: Mapping[str, Any] | str | Path) -> dict[
                 role_id="reviewer",
                 copy_source_workspace=False,
             )
+            staged_reviewer_manual_text = _rewrite_workspace_absolute_paths(
+                text=manual_text,
+                source_workspace_root=workspace_root,
+                target_workspace_root=Path(reviewer_workspace["workspace_root"]),
+            )
             reviewer_result_raw, reviewer_run = _invoke_role(
                 role_id="reviewer",
                 request=normalized_request,
@@ -5444,7 +5506,7 @@ def run_evaluator_prototype(*, request: Mapping[str, Any] | str | Path) -> dict[
                 role_dir=reviewer_role_dir,
                 prompt_text=build_reviewer_prompt(
                     request=normalized_request,
-                    manual_text=manual_text,
+                    manual_text=staged_reviewer_manual_text,
                     final_effect_requirements=final_effect_requirements,
                     requirement_graph=requirement_graph,
                     ordinary_test_results=ordinary_test_results,
