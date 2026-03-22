@@ -32,6 +32,7 @@ def main() -> int:
     from loop_product.kernel.authority import kernel_internal_authority
     from loop_product.protocols.node import NodeSpec, NodeStatus
     from loop_product.kernel.state import ensure_runtime_tree
+    from loop_product.runtime_paths import node_machine_handoff_ref
 
     product_agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
     workspace_agents = (ROOT / "workspace" / "AGENTS.md").read_text(encoding="utf-8")
@@ -274,6 +275,8 @@ def main() -> int:
             workspace_live_artifact_abs=workspace_root / ".tmp_primary_artifact",
             artifact_publication_receipt_abs=workspace_root / "artifacts" / "publication" / "receipt.json",
             artifact_publication_runner_abs=workspace_root / "PUBLISH_WORKSPACE_ARTIFACT.sh",
+            split_runner_abs=workspace_root / "SUBMIT_SPLIT_REQUEST.sh",
+            activate_runner_abs=workspace_root / "SUBMIT_ACTIVATE_REQUEST.sh",
             workspace_result_sink_abs=workspace_root / "workspace_result.json",
             kernel_result_sink_abs=workspace_root / "kernel_result.json",
             evaluator_submission_abs=workspace_root / "EvaluatorNodeSubmission.json",
@@ -285,9 +288,9 @@ def main() -> int:
             return _fail("bootstrap child prompt must forbid self-materializing child nodes from implementer context")
         if "report whether split was proposed or accepted" not in prompt_text:
             return _fail("bootstrap child prompt must require split/outcome reporting in the implementer closeout")
-        if "submit_split_request_from_handoff.sh" not in prompt_text:
+        if "SUBMIT_SPLIT_REQUEST.sh" not in prompt_text:
             return _fail("bootstrap child prompt must surface an exact split helper path instead of only prose guidance")
-        if "submit_activate_request_from_handoff.sh" not in prompt_text:
+        if "SUBMIT_ACTIVATE_REQUEST.sh" not in prompt_text:
             return _fail("bootstrap child prompt must surface an exact activate helper path for deferred children")
         if "after:<node_id>:<requirement>" not in prompt_text:
             return _fail("bootstrap child prompt must pin activation_condition to machine-evaluable after:<node_id>:<requirement> syntax")
@@ -360,7 +363,8 @@ def main() -> int:
         kernel_state.register_node(child_node)
         persist_kernel_state(state_root, kernel_state, authority=kernel_internal_authority())
 
-        handoff = workspace_root / "FROZEN_HANDOFF.json"
+        handoff = node_machine_handoff_ref(state_root=state_root, node_id=child_node.node_id)
+        handoff.parent.mkdir(parents=True, exist_ok=True)
         handoff.write_text(
             json.dumps(
                 {
@@ -579,7 +583,8 @@ def main() -> int:
             + "\n",
             encoding="utf-8",
         )
-        handoff = workspace_root / "FROZEN_HANDOFF.json"
+        handoff = node_machine_handoff_ref(state_root=state_root, node_id=child_node.node_id)
+        handoff.parent.mkdir(parents=True, exist_ok=True)
         handoff.write_text(
             json.dumps(
                 {

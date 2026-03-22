@@ -13,6 +13,7 @@ from loop_product.evaluator_authority import authoritative_result_conflicts_with
 from loop_product.kernel.state import load_kernel_state
 from loop_product.protocols.node import NodeSpec
 from loop_product.protocols.schema import validate_repo_object
+from loop_product.runtime_paths import node_machine_handoff_ref
 
 _PLACEHOLDER_DOC_BASENAMES = {
     "readme.md",
@@ -178,7 +179,10 @@ def _progress_snapshot_fingerprint(snapshot: Mapping[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True)
 
 
-def _load_frozen_handoff(workspace_root: Path) -> dict[str, Any]:
+def _load_frozen_handoff(*, state_root: Path, node_id: str, workspace_root: Path) -> dict[str, Any]:
+    handoff_ref = node_machine_handoff_ref(state_root=state_root, node_id=node_id)
+    if handoff_ref.exists():
+        return _load_optional_json(handoff_ref)
     return _load_optional_json((workspace_root / "FROZEN_HANDOFF.json").resolve())
 
 
@@ -204,7 +208,15 @@ def _required_workspace_artifact_materialized(snapshot: Mapping[str, Any]) -> bo
     if not workspace_root_raw:
         return False
     workspace_root = _absolute(workspace_root_raw)
-    handoff = _load_frozen_handoff(workspace_root)
+    state_root_raw = str(snapshot.get("state_root") or "").strip()
+    node_id = str(snapshot.get("node_id") or "").strip()
+    if not state_root_raw or not node_id:
+        return False
+    handoff = _load_frozen_handoff(
+        state_root=_absolute(state_root_raw),
+        node_id=node_id,
+        workspace_root=workspace_root,
+    )
     candidates: list[Path] = []
     workspace_live_artifact_ref = str(handoff.get("workspace_live_artifact_ref") or "").strip()
     if workspace_live_artifact_ref:

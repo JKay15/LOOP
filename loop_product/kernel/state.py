@@ -15,6 +15,7 @@ from loop_product.protocols.control_envelope import ControlEnvelope
 from loop_product.protocols.node import NodeSpec, NodeStatus, RuntimeAttachmentState, normalize_runtime_state
 from loop_product.protocols.schema import validate_repo_object
 from loop_product.runtime_paths import require_runtime_root
+from loop_product.runtime_paths import node_machine_handoff_ref
 
 
 NON_TERMINAL_NODE_STATUSES = {
@@ -444,6 +445,10 @@ def authoritative_node_dependency_ready(*, state_root: Path, node_payload: dict[
     if workspace_root:
         publication_gate = workspace_publication_ready_for_terminal_state(
             workspace_root=workspace_root,
+            machine_handoff_ref=node_machine_handoff_ref(
+                state_root=state_root,
+                node_id=str(node_payload.get("node_id") or ""),
+            ),
             required_output_paths=_required_output_paths_for_node_payload(node_payload),
         )
         if not bool(publication_gate.get("ready")):
@@ -472,6 +477,10 @@ def authoritative_node_split_release_ready(*, state_root: Path, node_payload: di
     if workspace_root:
         publication_gate = workspace_publication_ready_for_terminal_state(
             workspace_root=workspace_root,
+            machine_handoff_ref=node_machine_handoff_ref(
+                state_root=state_root,
+                node_id=str(node_payload.get("node_id") or ""),
+            ),
             required_output_paths=_required_output_paths_for_node_payload(node_payload),
         )
         if not bool(publication_gate.get("ready")):
@@ -479,7 +488,7 @@ def authoritative_node_split_release_ready(*, state_root: Path, node_payload: di
     return authoritative_result_payload_split_release_ready(dict(result_payload or {}))
 
 
-def _workspace_artifact_hygiene_sync(*, kernel_state: KernelState) -> None:
+def _workspace_artifact_hygiene_sync(*, state_root: Path, kernel_state: KernelState) -> None:
     from loop_product.dispatch.publication import inspect_workspace_publication_state
 
     for node_payload in kernel_state.nodes.values():
@@ -489,7 +498,13 @@ def _workspace_artifact_hygiene_sync(*, kernel_state: KernelState) -> None:
         artifact_workspace = Path(workspace_root).expanduser().resolve()
         if not artifact_workspace.exists() or not artifact_workspace.is_dir():
             continue
-        publication_state = inspect_workspace_publication_state(workspace_root=artifact_workspace)
+        publication_state = inspect_workspace_publication_state(
+            workspace_root=artifact_workspace,
+            machine_handoff_ref=node_machine_handoff_ref(
+                state_root=state_root,
+                node_id=str(node_payload.get("node_id") or ""),
+            ),
+        )
         excluded_roots: list[Path] = []
         publish_ref = str(publication_state.get("publish_artifact_ref") or "").strip()
         if publish_ref:
@@ -558,7 +573,7 @@ def synchronize_authoritative_node_results(
     require_kernel_authority(authority, surface="synchronize_authoritative_node_results")
     state_root = require_runtime_root(state_root)
     kernel_state = load_kernel_state(state_root)
-    _workspace_artifact_hygiene_sync(kernel_state=kernel_state)
+    _workspace_artifact_hygiene_sync(state_root=state_root, kernel_state=kernel_state)
     dirty = False
 
     for node_id, node_payload in list(kernel_state.nodes.items()):

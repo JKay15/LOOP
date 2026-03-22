@@ -90,6 +90,8 @@ def _persist_base_state(state_root: Path) -> None:
 
 
 def _write_source_handoff(*, state_root: Path, workspace_root: Path, source_node) -> Path:
+    from loop_product.runtime_paths import node_machine_handoff_ref
+
     endpoint_artifact_ref = workspace_root / "EndpointArtifact.json"
     endpoint_artifact_ref.write_text(
         json.dumps(
@@ -104,9 +106,10 @@ def _write_source_handoff(*, state_root: Path, workspace_root: Path, source_node
         + "\n",
         encoding="utf-8",
     )
-    handoff_ref = workspace_root / "FROZEN_HANDOFF.json"
+    handoff_ref = node_machine_handoff_ref(state_root=state_root, node_id=source_node.node_id)
     workspace_result_sink = workspace_root / "artifacts" / source_node.node_id / "result.json"
     kernel_result_sink = state_root / "artifacts" / source_node.node_id / "result.json"
+    handoff_ref.parent.mkdir(parents=True, exist_ok=True)
     handoff_ref.write_text(
         json.dumps(
             {

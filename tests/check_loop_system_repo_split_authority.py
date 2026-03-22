@@ -73,9 +73,11 @@ def _write_minimal_endpoint_artifact(path: Path) -> None:
 
 
 def _write_source_handoff(*, state_root: Path, workspace_root: Path, source_node) -> Path:
+    from loop_product.runtime_paths import node_machine_handoff_ref
+
     endpoint_artifact_ref = workspace_root / "EndpointArtifact.json"
     _write_minimal_endpoint_artifact(endpoint_artifact_ref)
-    handoff_ref = workspace_root / "FROZEN_HANDOFF.json"
+    handoff_ref = node_machine_handoff_ref(state_root=state_root, node_id=source_node.node_id)
     handoff_md_ref = workspace_root / "FROZEN_HANDOFF.md"
     workspace_result_sink = workspace_root / "artifacts" / source_node.node_id / "result.json"
     kernel_result_sink = state_root / "artifacts" / source_node.node_id / "result.json"
@@ -106,6 +108,7 @@ def _write_source_handoff(*, state_root: Path, workspace_root: Path, source_node
         "evaluator_submission_ref": str((state_root / "artifacts" / "bootstrap" / "EvaluatorNodeSubmission.json").resolve()),
         "evaluator_runner_ref": str((workspace_root / "RUN_EVALUATOR_NODE_UNTIL_TERMINAL.sh").resolve()),
     }
+    handoff_ref.parent.mkdir(parents=True, exist_ok=True)
     handoff_ref.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     handoff_md_ref.write_text(
         "\n".join(
@@ -306,7 +309,6 @@ def _accepted_split_case() -> int:
                 return _fail("accepted split child bootstrap must reuse source frozen endpoint context")
             source_workspace_root = state_root.parent / "workspace" / "child-implementer-001"
             expected_inherited_refs = {
-                str((source_workspace_root / "FROZEN_HANDOFF.json").resolve()),
                 str((source_workspace_root / "FROZEN_HANDOFF.md").resolve()),
             }
             for call in bootstrap_calls:

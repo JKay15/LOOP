@@ -32,6 +32,7 @@ from loop_product.protocols.evaluator import EvaluatorNodeSubmission, EvaluatorR
 from loop_product.protocols.node import NodeSpec
 from loop_product.protocols.schema import validate_repo_object
 from loop_product.runtime_paths import (
+    node_machine_handoff_ref,
     product_contract_path,
     product_package_root,
     require_runtime_root,
@@ -399,7 +400,7 @@ def materialize_terminal_implementer_result(
         return {}
 
     workspace_root = Path(submission.workspace_root).expanduser().resolve()
-    handoff = _load_optional_json(workspace_root / "FROZEN_HANDOFF.json")
+    handoff = _load_optional_json(node_machine_handoff_ref(state_root=runtime_root, node_id=node.node_id))
     kernel_result_ref = Path(
         str(handoff.get("kernel_result_sink_ref") or (runtime_root / node.result_sink_ref))
     ).expanduser().resolve()

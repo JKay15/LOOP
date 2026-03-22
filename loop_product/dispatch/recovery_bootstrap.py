@@ -14,7 +14,7 @@ from loop_product.protocols.node import NodeSpec
 from loop_product.protocols.schema import validate_repo_object
 from loop_product.runtime.liveness import build_runtime_loss_signal
 from loop_product.runtime.recover import build_retry_request
-from loop_product.runtime_paths import require_runtime_root
+from loop_product.runtime_paths import node_machine_handoff_ref, require_runtime_root
 
 
 def _nonempty(value: Any) -> str:
@@ -90,7 +90,7 @@ def _write_recovery_context(
 def _refresh_continue_exact_bundle(*, state_root: Path, node: NodeSpec, workspace_root: Path) -> dict[str, Any]:
     from loop_product.dispatch.bootstrap import bootstrap_first_implementer_node
 
-    handoff_path = workspace_root / "FROZEN_HANDOFF.json"
+    handoff_path = node_machine_handoff_ref(state_root=state_root, node_id=node.node_id)
     if not handoff_path.exists():
         raise ValueError(f"same-node recovery requires an existing frozen handoff at {handoff_path}")
     handoff_payload = json.loads(handoff_path.read_text(encoding="utf-8"))

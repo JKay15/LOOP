@@ -102,3 +102,16 @@ def node_live_artifact_root(*, state_root: Path, node_id: str, workspace_mirror_
     publish_path = Path(str(workspace_mirror_relpath or "").strip() or "deliverables/primary_artifact")
     leaf_name = publish_path.name or "primary_artifact"
     return (runtime_root / "artifacts" / "live_artifacts" / safe_node_id / leaf_name).resolve()
+
+
+def node_machine_handoff_ref(*, state_root: Path, node_id: str) -> Path:
+    """Return the runtime-owned machine handoff ref for one node.
+
+    Machine-only replay/control payloads must stay outside the agent-visible
+    workspace. The workspace may contain human-safe markdown and wrapper
+    entrypoints, but not the raw JSON handoff.
+    """
+
+    runtime_root = require_runtime_root(state_root).resolve()
+    safe_node_id = _safe_workspace_name(node_id)
+    return (runtime_root / "artifacts" / "bootstrap" / safe_node_id / "FROZEN_HANDOFF.json").resolve()

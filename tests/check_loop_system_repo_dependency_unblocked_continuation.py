@@ -60,11 +60,14 @@ def _write_node_handoff(
     goal_slice: str,
     result_sink_ref: str,
 ) -> None:
+    from loop_product.runtime_paths import node_machine_handoff_ref
+
     endpoint_artifact_ref = workspace_root / "EndpointArtifact.json"
     _write_minimal_endpoint_artifact(endpoint_artifact_ref)
-    handoff_ref = workspace_root / "FROZEN_HANDOFF.json"
+    handoff_ref = node_machine_handoff_ref(state_root=state_root, node_id=node_id)
     workspace_result_sink = workspace_root / result_sink_ref
     kernel_result_sink = state_root / result_sink_ref
+    handoff_ref.parent.mkdir(parents=True, exist_ok=True)
     handoff_ref.write_text(
         json.dumps(
             {

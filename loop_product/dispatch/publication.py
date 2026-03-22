@@ -88,8 +88,13 @@ def _derive_state_root_from_result_ref(result_ref: Path) -> Path:
     return result_ref.parents[2]
 
 
-def _load_workspace_publication_context(workspace_root: Path) -> dict[str, Any]:
-    handoff = _load_optional_json((workspace_root / "FROZEN_HANDOFF.json").resolve())
+def _load_workspace_publication_context(workspace_root: Path, *, machine_handoff_ref: str | Path | None = None) -> dict[str, Any]:
+    handoff_path = (
+        _absolute(machine_handoff_ref)
+        if machine_handoff_ref not in (None, "")
+        else (workspace_root / "FROZEN_HANDOFF.json").resolve()
+    )
+    handoff = _load_optional_json(handoff_path)
     publish_ref = str(handoff.get("workspace_mirror_ref") or "").strip()
     live_ref = str(handoff.get("workspace_live_artifact_ref") or "").strip()
     receipt_ref = str(handoff.get("artifact_publication_receipt_ref") or "").strip()
@@ -97,7 +102,7 @@ def _load_workspace_publication_context(workspace_root: Path) -> dict[str, Any]:
         return {
             "applicable": False,
             "workspace_root": str(workspace_root.resolve()),
-            "handoff_ref": str((workspace_root / "FROZEN_HANDOFF.json").resolve()),
+            "handoff_ref": str(handoff_path),
             "publish_artifact_ref": "",
             "live_artifact_ref": "",
             "publication_receipt_ref": "",
@@ -108,7 +113,7 @@ def _load_workspace_publication_context(workspace_root: Path) -> dict[str, Any]:
     return {
         "applicable": True,
         "workspace_root": str(workspace_root.resolve()),
-        "handoff_ref": str((workspace_root / "FROZEN_HANDOFF.json").resolve()),
+        "handoff_ref": str(handoff_path),
         "publish_artifact_ref": str(publish_path),
         "live_artifact_ref": str(live_path),
         "publication_receipt_ref": str(receipt_path),
@@ -153,7 +158,11 @@ def _workspace_local_runtime_heavy_roots(*, workspace_root: Path, publish_path: 
     return sorted({path for path in candidates if path.exists()}, key=lambda item: (len(item.parts), str(item)))
 
 
-def inspect_workspace_local_runtime_state(*, workspace_root: str | Path) -> dict[str, Any]:
+def inspect_workspace_local_runtime_state(
+    *,
+    workspace_root: str | Path,
+    machine_handoff_ref: str | Path | None = None,
+) -> dict[str, Any]:
     """Describe whether a workspace-local node leaked runtime-owned heavy trees into the workspace.
 
     When the exact live artifact root is external to the workspace, any local
@@ -163,7 +172,7 @@ def inspect_workspace_local_runtime_state(*, workspace_root: str | Path) -> dict
     """
 
     workspace_path = _absolute(workspace_root)
-    context = _load_workspace_publication_context(workspace_path)
+    context = _load_workspace_publication_context(workspace_path, machine_handoff_ref=machine_handoff_ref)
     if not bool(context.get("applicable")):
         return {
             **context,
@@ -200,11 +209,15 @@ def inspect_workspace_local_runtime_state(*, workspace_root: str | Path) -> dict
     }
 
 
-def inspect_workspace_publication_state(*, workspace_root: str | Path) -> dict[str, Any]:
+def inspect_workspace_publication_state(
+    *,
+    workspace_root: str | Path,
+    machine_handoff_ref: str | Path | None = None,
+) -> dict[str, Any]:
     """Describe whether a workspace-local publish root has been mutated outside publication."""
 
     workspace_path = _absolute(workspace_root)
-    context = _load_workspace_publication_context(workspace_path)
+    context = _load_workspace_publication_context(workspace_path, machine_handoff_ref=machine_handoff_ref)
     if not bool(context.get("applicable")):
         return {
             **context,
@@ -276,12 +289,16 @@ def inspect_workspace_publication_state(*, workspace_root: str | Path) -> dict[s
 def workspace_publication_ready_for_terminal_state(
     *,
     workspace_root: str | Path,
+    machine_handoff_ref: str | Path | None = None,
     required_output_paths: list[str] | tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Return whether a workspace-local node may sync a terminal authoritative result."""
 
-    report = inspect_workspace_publication_state(workspace_root=workspace_root)
-    local_runtime_report = inspect_workspace_local_runtime_state(workspace_root=workspace_root)
+    report = inspect_workspace_publication_state(workspace_root=workspace_root, machine_handoff_ref=machine_handoff_ref)
+    local_runtime_report = inspect_workspace_local_runtime_state(
+        workspace_root=workspace_root,
+        machine_handoff_ref=machine_handoff_ref,
+    )
     if not bool(report.get("applicable")):
         return {
             **report,
@@ -382,10 +399,14 @@ def workspace_publication_ready_for_terminal_state(
     }
 
 
-def reset_workspace_publish_root(*, workspace_root: str | Path) -> dict[str, Any]:
+def reset_workspace_publish_root(
+    *,
+    workspace_root: str | Path,
+    machine_handoff_ref: str | Path | None = None,
+) -> dict[str, Any]:
     """Remove an invalid published mirror so same-node recovery can restart from a clean publish root."""
 
-    report = inspect_workspace_publication_state(workspace_root=workspace_root)
+    report = inspect_workspace_publication_state(workspace_root=workspace_root, machine_handoff_ref=machine_handoff_ref)
     publish_ref = str(report.get("publish_artifact_ref") or "").strip()
     removed_publish_root = False
     if publish_ref:
@@ -402,10 +423,14 @@ def reset_workspace_publish_root(*, workspace_root: str | Path) -> dict[str, Any
     }
 
 
-def reset_workspace_local_runtime_heavy_roots(*, workspace_root: str | Path) -> dict[str, Any]:
+def reset_workspace_local_runtime_heavy_roots(
+    *,
+    workspace_root: str | Path,
+    machine_handoff_ref: str | Path | None = None,
+) -> dict[str, Any]:
     """Remove invalid workspace-local heavy trees when the frozen live root is external."""
 
-    report = inspect_workspace_local_runtime_state(workspace_root=workspace_root)
+    report = inspect_workspace_local_runtime_state(workspace_root=workspace_root, machine_handoff_ref=machine_handoff_ref)
     removed_roots: list[str] = []
     if bool(report.get("live_artifact_root_is_external")):
         for root_ref in list(report.get("workspace_runtime_heavy_root_refs") or []):

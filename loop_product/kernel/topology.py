@@ -18,17 +18,18 @@ from loop_product.protocols.node import NodeStatus, RuntimeAttachmentState, norm
 from loop_product.protocols.topology import TopologyMutation
 from loop_product.runtime.recover import apply_accepted_recovery_mutation, review_recovery_request
 from loop_product.runtime_paths import node_live_artifact_root, product_repo_root, require_runtime_root
+from loop_product.runtime_paths import node_machine_handoff_ref
 from loop_product.topology.activate import review_activate_request
 from loop_product.topology.merge import review_merge_request
 from loop_product.topology.prune import review_reap_request
 from loop_product.topology.split_review import review_split_request
 
 
-def _load_source_handoff(source_record: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
-    workspace_root = Path(str(source_record.get("workspace_root") or "")).expanduser().resolve()
-    if not str(workspace_root).strip():
-        raise ValueError("source node missing workspace_root for split child bootstrap")
-    handoff_ref = workspace_root / "FROZEN_HANDOFF.json"
+def _load_source_handoff(*, state_root: Path, source_record: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
+    node_id = str(source_record.get("node_id") or "").strip()
+    if not node_id:
+        raise ValueError("source node missing node_id for split child bootstrap")
+    handoff_ref = node_machine_handoff_ref(state_root=state_root, node_id=node_id)
     if not handoff_ref.exists():
         raise ValueError(f"source frozen handoff missing for split child bootstrap: {handoff_ref}")
     payload = json.loads(handoff_ref.read_text(encoding="utf-8"))
@@ -43,7 +44,7 @@ def _child_bootstrap_request_from_source_handoff(
     source_record: dict[str, Any],
     child_record: dict[str, Any],
 ) -> dict[str, Any]:
-    handoff_ref, handoff = _load_source_handoff(source_record)
+    handoff_ref, handoff = _load_source_handoff(state_root=state_root, source_record=source_record)
     node_id = str(child_record.get("node_id") or "").strip()
     goal_slice = str(child_record.get("goal_slice") or "").strip()
     workspace_root = str(child_record.get("workspace_root") or "").strip()
@@ -58,8 +59,8 @@ def _child_bootstrap_request_from_source_handoff(
     if not endpoint_artifact_ref or not root_goal:
         raise ValueError("source frozen handoff missing endpoint_artifact_ref or root_goal for child bootstrap")
     inherited_context_refs: list[str] = [str(item or "") for item in list(handoff.get("context_refs") or [])]
-    inherited_context_refs.append(str(handoff_ref.resolve()))
-    handoff_md_ref = handoff_ref.with_suffix(".md")
+    source_workspace_root = Path(str(source_record.get("workspace_root") or "")).expanduser().resolve()
+    handoff_md_ref = source_workspace_root / "FROZEN_HANDOFF.md"
     if handoff_md_ref.exists():
         inherited_context_refs.append(str(handoff_md_ref.resolve()))
     shared_cache_helper = (product_repo_root().resolve() / "scripts" / "ensure_workspace_lake_packages.sh").resolve()

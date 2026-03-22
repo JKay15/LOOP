@@ -28,6 +28,7 @@ from loop_product.protocols.node import NodeSpec, NodeStatus
 from loop_product.protocols.schema import validate_repo_object
 from loop_product.runtime_paths import (
     implementer_workspace_root,
+    node_machine_handoff_ref,
     product_repo_root,
     require_runtime_root,
     safe_runtime_name,
@@ -384,6 +385,8 @@ def _render_child_prompt(
     workspace_live_artifact_abs: Path,
     artifact_publication_receipt_abs: Path,
     artifact_publication_runner_abs: Path,
+    split_runner_abs: Path,
+    activate_runner_abs: Path,
     workspace_result_sink_abs: Path,
     kernel_result_sink_abs: Path,
     evaluator_submission_abs: Path,
@@ -395,8 +398,6 @@ def _render_child_prompt(
     evaluator_exec_skill = (repo_root / ".agents" / "skills" / "evaluator-exec" / "SKILL.md").resolve()
     evaluator_manual = (repo_root / "docs" / "contracts" / "LOOP_EVALUATOR_PROTOTYPE_PRODUCT_MANUAL.md").resolve()
     local_input_helper = (repo_root / "scripts" / "find_local_input_candidates.sh").resolve()
-    split_submit_helper = (repo_root / "scripts" / "submit_split_request_from_handoff.sh").resolve()
-    activate_submit_helper = (repo_root / "scripts" / "submit_activate_request_from_handoff.sh").resolve()
     slice_scope_guard_lines: list[str] = []
     if not _use_whole_paper_evaluator_surface(node):
         slice_scope_guard_lines = [
@@ -461,8 +462,8 @@ def _render_child_prompt(
             f"- `{loop_runner_skill}`",
             f"- `{evaluator_exec_skill}`",
             f"- `{evaluator_manual}`",
-            f"- `{split_submit_helper}`",
-            f"- `{activate_submit_helper}`",
+            f"- split runner: `{split_runner_abs.resolve()}`",
+            f"- activate runner: `{activate_runner_abs.resolve()}`",
             "",
             "Exact live/publish refs for this node:",
             "",
@@ -500,7 +501,6 @@ def _materialize_evaluator_bundle(
     artifact_publication_receipt_ref: Path,
     external_publish_target: str,
     required_output_paths: list[str],
-    handoff_json_path: Path,
     handoff_md_path: Path,
     context_refs: list[str],
 ) -> tuple[Path, Path]:
@@ -538,7 +538,7 @@ def _materialize_evaluator_bundle(
                 node=node,
                 workspace_root=workspace_root,
                 workspace_mirror_ref=workspace_mirror_ref,
-                handoff_json_path=handoff_json_path,
+                handoff_md_path=handoff_md_path,
             ),
         )
         _write_text(
@@ -575,7 +575,7 @@ def _materialize_evaluator_bundle(
     return submission_path, runner_path
 
 
-def _materialize_publication_runner(*, workspace_root: Path, handoff_json_path: Path) -> Path:
+def _materialize_publication_runner(*, workspace_root: Path, machine_handoff_ref: Path) -> Path:
     repo_runner = (product_repo_root().resolve() / "scripts" / "publish_workspace_artifact_from_handoff.sh").resolve()
     runner_path = workspace_root / "PUBLISH_WORKSPACE_ARTIFACT.sh"
     _write_executable_text(
@@ -584,7 +584,39 @@ def _materialize_publication_runner(*, workspace_root: Path, handoff_json_path: 
             [
                 "#!/usr/bin/env bash",
                 "set -euo pipefail",
-                f'exec "{repo_runner}" --handoff-ref "{handoff_json_path.resolve()}" "$@"',
+                f'exec "{repo_runner}" --handoff-ref "{machine_handoff_ref.resolve()}" "$@"',
+            ]
+        ),
+    )
+    return runner_path
+
+
+def _materialize_split_runner(*, workspace_root: Path, machine_handoff_ref: Path) -> Path:
+    repo_runner = (product_repo_root().resolve() / "scripts" / "submit_split_request_from_handoff.sh").resolve()
+    runner_path = workspace_root / "SUBMIT_SPLIT_REQUEST.sh"
+    _write_executable_text(
+        runner_path,
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "set -euo pipefail",
+                f'exec "{repo_runner}" --handoff-ref "{machine_handoff_ref.resolve()}" "$@"',
+            ]
+        ),
+    )
+    return runner_path
+
+
+def _materialize_activate_runner(*, workspace_root: Path, machine_handoff_ref: Path) -> Path:
+    repo_runner = (product_repo_root().resolve() / "scripts" / "submit_activate_request_from_handoff.sh").resolve()
+    runner_path = workspace_root / "SUBMIT_ACTIVATE_REQUEST.sh"
+    _write_executable_text(
+        runner_path,
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "set -euo pipefail",
+                f'exec "{repo_runner}" --handoff-ref "{machine_handoff_ref.resolve()}" "$@"',
             ]
         ),
     )
@@ -849,7 +881,7 @@ def _render_slice_scoped_evaluator_manual(
     node: NodeSpec,
     workspace_root: Path,
     workspace_mirror_ref: str,
-    handoff_json_path: Path,
+    handoff_md_path: Path,
 ) -> str:
     lines = [
         "# Slice-Scoped Evaluator Product Manual",
@@ -860,7 +892,7 @@ def _render_slice_scoped_evaluator_manual(
         "",
         f"- workspace_root: `{workspace_root.resolve()}`",
         f"- workspace_mirror_ref: `{workspace_mirror_ref}`",
-        f"- frozen_handoff_ref: `{handoff_json_path.resolve()}`",
+        f"- frozen_handoff_ref: `{handoff_md_path.resolve()}`",
         f"- target_node_id: `{node.node_id}`",
         f"- slice_goal: `{node.goal_slice}`",
         "",
@@ -940,7 +972,7 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
     else:
         raise ValueError(f"unsupported bootstrap mode: {mode!r}")
 
-    handoff_json_path = workspace_root / "FROZEN_HANDOFF.json"
+    handoff_json_path = node_machine_handoff_ref(state_root=state_root, node_id=child_node.node_id)
     handoff_md_path = workspace_root / "FROZEN_HANDOFF.md"
     child_prompt_path = workspace_root / "CHILD_PROMPT.md"
     workspace_live_artifact_relpath = request["workspace_live_artifact_relpath"] or _default_workspace_live_artifact_relpath(
@@ -965,13 +997,17 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
         artifact_publication_receipt_ref=artifact_publication_receipt_abs,
         external_publish_target=request["external_publish_target"],
         required_output_paths=request["required_output_paths"],
-        handoff_json_path=handoff_json_path,
         handoff_md_path=handoff_md_path,
         context_refs=request["context_refs"],
     )
     artifact_publication_runner_path = _materialize_publication_runner(
         workspace_root=workspace_root,
-        handoff_json_path=handoff_json_path,
+        machine_handoff_ref=handoff_json_path,
+    )
+    split_runner_path = _materialize_split_runner(workspace_root=workspace_root, machine_handoff_ref=handoff_json_path)
+    activate_runner_path = _materialize_activate_runner(
+        workspace_root=workspace_root,
+        machine_handoff_ref=handoff_json_path,
     )
     handoff_payload = _build_handoff_payload(
         node=child_node,
@@ -1008,6 +1044,8 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
             workspace_live_artifact_abs=workspace_live_artifact_abs,
             artifact_publication_receipt_abs=artifact_publication_receipt_abs,
             artifact_publication_runner_abs=artifact_publication_runner_path,
+            split_runner_abs=split_runner_path,
+            activate_runner_abs=activate_runner_path,
             workspace_result_sink_abs=workspace_result_sink_abs,
             kernel_result_sink_abs=kernel_result_sink_abs,
             evaluator_submission_abs=evaluator_submission_path,

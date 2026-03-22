@@ -34,7 +34,7 @@ from loop_product.host_child_runtime_status import (
 )
 from loop_product.protocols.node import normalize_runtime_state
 from loop_product.protocols.schema import validate_repo_object
-from loop_product.runtime_paths import require_runtime_root
+from loop_product.runtime_paths import node_machine_handoff_ref, require_runtime_root
 
 DEFAULT_STARTUP_RETRY_LIMIT = 1
 DEFAULT_STARTUP_HEALTH_TIMEOUT_MS = 12000
@@ -151,7 +151,11 @@ def _load_terminal_implementer_result(*, state_root: Path, node_id: str, node_pa
     return result_ref, payload
 
 
-def _live_workspace_artifact_hygiene_sync(*, workspace_root: Path | None) -> dict[str, Any]:
+def _live_workspace_artifact_hygiene_sync(
+    *,
+    workspace_root: Path | None,
+    machine_handoff_ref: str | Path | None = None,
+) -> dict[str, Any]:
     if workspace_root is None:
         return {
             "removed_refs": [],
@@ -172,8 +176,14 @@ def _live_workspace_artifact_hygiene_sync(*, workspace_root: Path | None) -> dic
             "publication_state": {"applicable": False, "violation": False},
             "local_runtime_state": {"applicable": False, "violation": False},
         }
-    publication_state = inspect_workspace_publication_state(workspace_root=candidate)
-    local_runtime_state = inspect_workspace_local_runtime_state(workspace_root=candidate)
+    publication_state = inspect_workspace_publication_state(
+        workspace_root=candidate,
+        machine_handoff_ref=machine_handoff_ref,
+    )
+    local_runtime_state = inspect_workspace_local_runtime_state(
+        workspace_root=candidate,
+        machine_handoff_ref=machine_handoff_ref,
+    )
     excluded_roots: list[Path] = []
     publish_ref = str(publication_state.get("publish_artifact_ref") or "").strip()
     if publish_ref:
@@ -682,9 +692,12 @@ def _direct_child_runtime_status_from_launch_result_ref(
     state_root = require_runtime_root(Path(str(launch_result["state_root"])).expanduser().resolve())
     node_id = str(launch_result["node_id"])
     workspace_root = Path(str(launch_result.get("workspace_root") or "")).expanduser()
-    hygiene_state = _live_workspace_artifact_hygiene_sync(workspace_root=workspace_root)
     node_ref = state_root / "state" / f"{node_id}.json"
     node_payload = _load_json(node_ref) if node_ref.exists() else {}
+    hygiene_state = _live_workspace_artifact_hygiene_sync(
+        workspace_root=workspace_root,
+        machine_handoff_ref=node_machine_handoff_ref(state_root=state_root, node_id=node_id),
+    )
     runtime_state = normalize_runtime_state(dict(node_payload.get("runtime_state") or {}))
     terminal_result_ref, terminal_result_payload = _load_terminal_implementer_result(
         state_root=state_root,
@@ -715,9 +728,15 @@ def _direct_child_runtime_status_from_launch_result_ref(
     publish_root_violation = bool(publication_state.get("violation"))
     local_workspace_violation = bool(local_runtime_state.get("violation"))
     if publish_root_violation:
-        reset_workspace_publish_root(workspace_root=workspace_root)
+        reset_workspace_publish_root(
+            workspace_root=workspace_root,
+            machine_handoff_ref=node_machine_handoff_ref(state_root=state_root, node_id=node_id),
+        )
     if local_workspace_violation:
-        reset_workspace_local_runtime_heavy_roots(workspace_root=workspace_root)
+        reset_workspace_local_runtime_heavy_roots(
+            workspace_root=workspace_root,
+            machine_handoff_ref=node_machine_handoff_ref(state_root=state_root, node_id=node_id),
+        )
     if (publish_root_violation or local_workspace_violation) and pid_alive:
         _reap_runtime_owned_launch(launch_result)
         pid_alive = pid > 0 and _pid_alive(pid)
@@ -849,7 +868,11 @@ def child_runtime_status_from_launch_result_ref(
             stall_threshold_s=float(stall_threshold_s),
         )
         hygiene_state = _live_workspace_artifact_hygiene_sync(
-            workspace_root=Path(str(payload.get("workspace_root") or "")).expanduser()
+            workspace_root=Path(str(payload.get("workspace_root") or "")).expanduser(),
+            machine_handoff_ref=node_machine_handoff_ref(
+                state_root=require_runtime_root(Path(str(payload.get("state_root") or "")).expanduser().resolve()),
+                node_id=str(payload.get("node_id") or ""),
+            ) if str(payload.get("state_root") or "").strip() and str(payload.get("node_id") or "").strip() else None,
         )
         publication_state = dict(hygiene_state.get("publication_state") or {})
         if bool(publication_state.get("violation")):

@@ -211,6 +211,8 @@ def main() -> int:
                 (state_root / "artifacts" / "publication" / str(result.get("node_id") or "") / "WorkspaceArtifactPublicationReceipt.json").resolve()
             )
             expected_publication_runner_ref = str((workspace_root / "PUBLISH_WORKSPACE_ARTIFACT.sh").resolve())
+            expected_split_runner_ref = str((workspace_root / "SUBMIT_SPLIT_REQUEST.sh").resolve())
+            expected_activate_runner_ref = str((workspace_root / "SUBMIT_ACTIVATE_REQUEST.sh").resolve())
             expected_evaluator_manual_ref = str((evaluator_bundle_root / "EvaluatorProductManual.md").resolve())
             expected_evaluator_final_effects_ref = str((evaluator_bundle_root / "EvaluatorFinalEffects.md").resolve())
             if str(handoff_payload.get("workspace_result_sink_relpath") or "") != expected_workspace_sink_relpath:
@@ -245,6 +247,10 @@ def main() -> int:
                 return _fail("bootstrap result must surface the exact artifact publication receipt ref")
             if str(result.get("artifact_publication_runner_ref") or "") != expected_publication_runner_ref:
                 return _fail("bootstrap result must surface the exact workspace-local publication runner ref")
+            if handoff_json.parent == workspace_root.resolve():
+                return _fail("machine-only frozen handoff must not be materialized inside the agent-visible workspace")
+            if (workspace_root / "FROZEN_HANDOFF.json").exists():
+                return _fail("agent-visible workspace must not contain FROZEN_HANDOFF.json")
             handoff_md_text = handoff_md.read_text(encoding="utf-8")
             if f"- state_root: `{state_root.resolve()}`" not in handoff_md_text:
                 return _fail("frozen handoff markdown must include the exact state_root for helper replay")
@@ -274,8 +280,8 @@ def main() -> int:
                 str((ROOT / ".agents" / "skills" / "evaluator-exec" / "SKILL.md").resolve()),
                 str((ROOT / "docs" / "contracts" / "LOOP_EVALUATOR_PROTOTYPE_PRODUCT_MANUAL.md").resolve()),
                 str((ROOT / "scripts" / "find_local_input_candidates.sh").resolve()),
-                str((ROOT / "scripts" / "submit_split_request_from_handoff.sh").resolve()),
-                str((ROOT / "scripts" / "submit_activate_request_from_handoff.sh").resolve()),
+                expected_split_runner_ref,
+                expected_activate_runner_ref,
                 expected_live_artifact_ref,
                 expected_publication_receipt_ref,
                 expected_publication_runner_ref,
@@ -325,6 +331,10 @@ def main() -> int:
                 return _fail("bootstrap must materialize the exact evaluator runner script")
             if not Path(expected_publication_runner_ref).exists():
                 return _fail("bootstrap must materialize the exact publication runner script")
+            if not Path(expected_split_runner_ref).exists():
+                return _fail("bootstrap must materialize the exact split submission runner script")
+            if not Path(expected_activate_runner_ref).exists():
+                return _fail("bootstrap must materialize the exact activate submission runner script")
             if not Path(expected_evaluator_submission_ref).exists():
                 return _fail("bootstrap must materialize the exact evaluator submission artifact")
             if not Path(expected_evaluator_manual_ref).exists():
@@ -426,7 +436,7 @@ def main() -> int:
                 "workspace_mirror_relpath": "deliverables/primary_artifact",
                 "workspace_live_artifact_relpath": split_live_relpath,
                 "external_publish_target": "",
-                "context_refs": [str(endpoint_artifact.resolve()), str(handoff_json.resolve())],
+                "context_refs": [str(endpoint_artifact.resolve()), str(handoff_md.resolve())],
                 "required_output_paths": ["README.md", "TRACEABILITY.md", "WHOLE_PAPER_STATUS.json"],
                 "result_sink_ref": split_node.result_sink_ref,
             }

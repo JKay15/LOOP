@@ -13,6 +13,7 @@ from loop_product.kernel.state import ACTIVE_NODE_STATUSES, KernelState, persist
 from loop_product.protocols.control_envelope import ControlEnvelope
 from loop_product.protocols.node import NodeSpec, RuntimeAttachmentState, normalize_runtime_state
 from loop_product.protocols.topology import TopologyMutation
+from loop_product.runtime_paths import node_machine_handoff_ref
 from loop_product.topology.budget import normalized_complexity_budget
 
 
@@ -398,7 +399,10 @@ def _same_node_continue_exact_request(*, state_root: Path, source_record: Mappin
     workspace_root = Path(str(source_record.get("workspace_root") or "")).expanduser().resolve()
     if not str(workspace_root).strip():
         raise ValueError("resume relaunch requires a non-empty workspace_root on the source node")
-    handoff_ref = workspace_root / "FROZEN_HANDOFF.json"
+    node_id = str(source_record.get("node_id") or "").strip()
+    if not node_id:
+        raise ValueError("resume relaunch requires a non-empty node_id on the source node")
+    handoff_ref = node_machine_handoff_ref(state_root=state_root, node_id=node_id)
     if not handoff_ref.exists():
         raise ValueError(f"resume relaunch requires a frozen handoff: {handoff_ref}")
     handoff = json.loads(handoff_ref.read_text(encoding="utf-8"))
@@ -406,7 +410,6 @@ def _same_node_continue_exact_request(*, state_root: Path, source_record: Mappin
         raise ValueError(f"resume relaunch frozen handoff must be a JSON object: {handoff_ref}")
     endpoint_artifact_ref = str(handoff.get("endpoint_artifact_ref") or "").strip()
     root_goal = str(handoff.get("root_goal") or "").strip()
-    node_id = str(source_record.get("node_id") or "").strip()
     round_id = str(source_record.get("round_id") or handoff.get("round_id") or "").strip()
     goal_slice = str(source_record.get("goal_slice") or handoff.get("child_goal_slice") or "").strip()
     result_sink_ref = str(source_record.get("result_sink_ref") or handoff.get("result_sink_ref") or "").strip()
