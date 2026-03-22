@@ -593,7 +593,8 @@ def main() -> int:
             whole_paper_project_name = "test-first-child-bootstrap-whole-paper"
             whole_paper_workspace_root = ROOT / "workspace" / whole_paper_project_name
             whole_paper_state_root = ROOT / ".loop" / whole_paper_project_name
-            whole_paper_source_ref = temp_root / "whole_paper_source" / "main.tex"
+            whole_paper_cache_root = temp_root / "arxiv_2602_11505v2"
+            whole_paper_source_ref = whole_paper_cache_root / "source" / "main.tex"
             shutil.rmtree(whole_paper_workspace_root, ignore_errors=True)
             shutil.rmtree(whole_paper_state_root, ignore_errors=True)
             whole_paper_source_ref.parent.mkdir(parents=True, exist_ok=True)
@@ -614,21 +615,23 @@ def main() -> int:
                 + "\n",
                 encoding="utf-8",
             )
-
-            whole_paper_endpoint_artifact = temp_root / "WholePaperEndpointArtifact.json"
+            whole_paper_endpoint_artifact = (
+                whole_paper_cache_root
+                / "benchmark_inputs"
+                / "test-first-child-bootstrap-whole-paper"
+                / "EndpointArtifact.json"
+            )
+            whole_paper_endpoint_artifact.parent.mkdir(parents=True, exist_ok=True)
             whole_paper_endpoint_artifact.write_text(
                 json.dumps(
                     {
                         "version": "1",
-                        "session_root": str((temp_root / "whole_paper_endpoint_session").resolve()),
+                        "session_root": str((whole_paper_cache_root / "session_root").resolve()),
                         "artifact_ref": str(whole_paper_endpoint_artifact.resolve()),
-                        "latest_turn_ref": str((temp_root / "turns" / "0002" / "TurnResult.json").resolve()),
+                        "latest_turn_ref": str((whole_paper_cache_root / "turns" / "0002" / "TurnResult.json").resolve()),
                         "mode": "VISION_COMPILER",
                         "status": "CLARIFIED",
-                        "original_user_prompt": (
-                            "Run a whole-paper faithful complete formalization benchmark for "
-                            f"{whole_paper_source_ref.resolve()}."
-                        ),
+                        "original_user_prompt": "Run a whole-paper faithful complete formalization benchmark for arXiv:2602.11505v2.",
                         "confirmed_requirements": [],
                         "denied_requirements": [],
                         "question_history": [],

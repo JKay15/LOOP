@@ -858,6 +858,27 @@ def _first_existing_source_tex_ref(context_refs: list[str]) -> Path | None:
     return None
 
 
+def _resolve_whole_paper_source_tex_ref(*, artifact_path: Path, context_refs: list[str]) -> Path | None:
+    direct = _first_existing_source_tex_ref(context_refs)
+    if direct is not None:
+        return direct
+
+    candidates: list[Path] = []
+    for parent in artifact_path.resolve().parents:
+        candidates.append(parent / "source" / "main.tex")
+        if parent.name == "benchmark_inputs":
+            candidates.append(parent.parent / "source" / "main.tex")
+    seen: set[str] = set()
+    for candidate in candidates:
+        resolved_key = str(candidate.resolve()) if candidate.exists() else str(candidate)
+        if resolved_key in seen:
+            continue
+        seen.add(resolved_key)
+        if candidate.exists() and candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
 def _split_latex_csv(raw: str) -> list[str]:
     return [item.strip() for item in str(raw or "").split(",") if item.strip()]
 
@@ -1443,6 +1464,16 @@ def bootstrap_first_implementer_from_endpoint(*, authority: KernelMutationAuthor
         refs=context_refs,
         workflow_scope=workflow_scope,
     )
+    whole_paper_source_tex_ref: Path | None = None
+    if workflow_scope == "whole_paper_formalization":
+        whole_paper_source_tex_ref = _resolve_whole_paper_source_tex_ref(
+            artifact_path=artifact_path,
+            context_refs=context_refs,
+        )
+        if whole_paper_source_tex_ref is not None:
+            source_tex_ref_str = str(whole_paper_source_tex_ref)
+            if source_tex_ref_str not in context_refs:
+                context_refs = [source_tex_ref_str, *context_refs]
     task_slug = _nonempty(payload.get("task_slug")) or _default_task_slug(
         artifact_payload=artifact_payload,
         artifact_path=artifact_path,
@@ -1481,11 +1512,10 @@ def bootstrap_first_implementer_from_endpoint(*, authority: KernelMutationAuthor
         and normalize_machine_choice(request["artifact_scope"], ARTIFACT_SCOPE_SPEC) == "task"
         and normalize_machine_choice(request["terminal_authority_scope"], TERMINAL_AUTHORITY_SCOPE_SPEC) == "whole_paper"
     ):
-        source_tex_ref = _first_existing_source_tex_ref(context_refs)
-        if source_tex_ref is not None:
+        if whole_paper_source_tex_ref is not None:
             live_root = Path(str(result_payload.get("workspace_live_artifact_ref") or "")).expanduser().resolve()
             _materialize_whole_paper_startup_batch(
                 live_root=live_root,
-                source_tex_ref=source_tex_ref,
+                source_tex_ref=whole_paper_source_tex_ref,
             )
     return result_payload
