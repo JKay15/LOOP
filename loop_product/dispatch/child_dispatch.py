@@ -50,6 +50,7 @@ def materialize_child(
     codex_home: str | Path | None = None,
     depends_on_node_ids: list[str] | None = None,
     activation_condition: str = "",
+    activation_rationale: str = "",
     result_sink_ref: str = "",
     lineage_ref: str = "",
     status: NodeStatus = NodeStatus.ACTIVE,
@@ -87,6 +88,7 @@ def materialize_child(
         codex_home="",
         depends_on_node_ids=resolved_depends_on,
         activation_condition=str(activation_condition or ""),
+        activation_rationale=str(activation_rationale or ""),
         runtime_state={},
         delegation_ref=delegation_rel.as_posix(),
         result_sink_ref=resolved_result_sink_ref,
@@ -109,6 +111,7 @@ def materialize_child(
         "codex_home": str(node.codex_home),
         "depends_on_node_ids": list(node.depends_on_node_ids),
         "activation_condition": str(node.activation_condition),
+        "activation_rationale": str(node.activation_rationale),
         "result_sink_ref": node.result_sink_ref,
         "lineage_ref": node.lineage_ref,
     }

@@ -50,6 +50,7 @@ class NodeSpec:
     codex_home: str = ""
     depends_on_node_ids: list[str] = field(default_factory=list)
     activation_condition: str = ""
+    activation_rationale: str = ""
     runtime_state: dict[str, Any] = field(default_factory=dict)
     delegation_ref: str = ""
     result_sink_ref: str = ""
@@ -83,6 +84,7 @@ class NodeSpec:
             codex_home=str(data.get("codex_home") or ""),
             depends_on_node_ids=[str(item) for item in (data.get("depends_on_node_ids") or [])],
             activation_condition=str(data.get("activation_condition") or ""),
+            activation_rationale=str(data.get("activation_rationale") or ""),
             runtime_state=normalize_runtime_state(dict(data.get("runtime_state") or {})),
             delegation_ref=str(data.get("delegation_ref") or ""),
             result_sink_ref=str(data.get("result_sink_ref") or ""),

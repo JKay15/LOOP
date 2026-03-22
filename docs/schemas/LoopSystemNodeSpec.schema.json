@@ -18,6 +18,7 @@
     "codex_home",
     "depends_on_node_ids",
     "activation_condition",
+    "activation_rationale",
     "runtime_state",
     "delegation_ref",
     "result_sink_ref",
@@ -124,6 +125,9 @@
       }
     },
     "activation_condition": {
+      "type": "string"
+    },
+    "activation_rationale": {
       "type": "string"
     },
     "runtime_state": {

@@ -11,7 +11,7 @@ from typing import Any
 from loop_product.kernel.state import load_kernel_state
 from loop_product.kernel.submit import submit_topology_mutation
 from loop_product.protocols.node import NodeSpec
-from loop_product.topology.split_review import build_split_request
+from loop_product.topology.split_review import build_split_request, _supported_activation_condition
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -40,8 +40,21 @@ def _normalize_target_nodes(raw: Any) -> list[dict[str, Any]]:
         if depends_on:
             normalized_item["depends_on_node_ids"] = depends_on
         activation_condition = str(item.get("activation_condition") or "").strip()
+        activation_rationale = str(item.get("activation_rationale") or "").strip()
         if activation_condition:
-            normalized_item["activation_condition"] = activation_condition
+            if _supported_activation_condition(activation_condition):
+                normalized_item["activation_condition"] = activation_condition
+            else:
+                if not activation_rationale:
+                    activation_rationale = activation_condition
+                if not depends_on:
+                    raise ValueError(
+                        "proposal.target_nodes[{idx}].activation_condition must use supported "
+                        "after:<node_id>:<requirement> syntax unless depends_on_node_ids already provide the machine gate; "
+                        "put explanatory prose in activation_rationale".format(idx=idx)
+                    )
+        if activation_rationale:
+            normalized_item["activation_rationale"] = activation_rationale
         normalized.append(normalized_item)
     return normalized
 
@@ -75,6 +88,19 @@ def _build_result_payload(*, handoff_ref: Path, proposal_ref: Path, envelope: di
     }
 
 
+def _build_rejected_result_payload(*, handoff_ref: Path, proposal_ref: Path, error: Exception | str) -> dict[str, Any]:
+    return {
+        "handoff_ref": str(handoff_ref.resolve()),
+        "proposal_ref": str(proposal_ref.resolve()),
+        "status": "REJECTED",
+        "accepted": False,
+        "envelope": {},
+        "review": {},
+        "envelope_id": "",
+        "error": str(error),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Submit a split request from frozen handoff context.")
     parser.add_argument("--handoff-ref", required=True)
@@ -86,41 +112,49 @@ def main() -> int:
     proposal_ref = Path(args.proposal_ref).expanduser().resolve()
     result_ref = Path(args.result_ref).expanduser().resolve()
 
-    handoff = _load_json(handoff_ref)
-    proposal = _load_json(proposal_ref)
+    try:
+        handoff = _load_json(handoff_ref)
+        proposal = _load_json(proposal_ref)
 
-    state_root = _resolve_state_root(handoff)
-    node_id = str(handoff.get("node_id") or "").strip()
-    round_id = str(handoff.get("round_id") or "").strip()
-    if not node_id or not round_id:
-        raise ValueError("handoff must include non-empty node_id and round_id")
+        state_root = _resolve_state_root(handoff)
+        node_id = str(handoff.get("node_id") or "").strip()
+        round_id = str(handoff.get("round_id") or "").strip()
+        if not node_id or not round_id:
+            raise ValueError("handoff must include non-empty node_id and round_id")
 
-    kernel_state = load_kernel_state(state_root)
-    source_raw = dict(kernel_state.nodes.get(node_id) or {})
-    if not source_raw:
-        raise ValueError(f"source node not found in kernel state: {node_id}")
-    source_node = NodeSpec.from_dict(source_raw)
+        kernel_state = load_kernel_state(state_root)
+        source_raw = dict(kernel_state.nodes.get(node_id) or {})
+        if not source_raw:
+            raise ValueError(f"source node not found in kernel state: {node_id}")
+        source_node = NodeSpec.from_dict(source_raw)
 
-    mutation = build_split_request(
-        source_node=source_node,
-        target_nodes=_normalize_target_nodes(proposal.get("target_nodes")),
-        split_mode=str(proposal.get("split_mode") or "parallel"),
-        completed_work=str(proposal.get("completed_work") or ""),
-        remaining_work=str(proposal.get("remaining_work") or ""),
-        reason=str(proposal.get("reason") or ""),
-    )
-    envelope = submit_topology_mutation(
-        state_root,
-        mutation,
-        round_id=round_id,
-        generation=source_node.generation,
-        source=source_node.node_id,
-    )
-    result_payload = _build_result_payload(
-        handoff_ref=handoff_ref,
-        proposal_ref=proposal_ref,
-        envelope=envelope.to_dict(),
-    )
+        mutation = build_split_request(
+            source_node=source_node,
+            target_nodes=_normalize_target_nodes(proposal.get("target_nodes")),
+            split_mode=str(proposal.get("split_mode") or "parallel"),
+            completed_work=str(proposal.get("completed_work") or ""),
+            remaining_work=str(proposal.get("remaining_work") or ""),
+            reason=str(proposal.get("reason") or ""),
+        )
+        envelope = submit_topology_mutation(
+            state_root,
+            mutation,
+            round_id=round_id,
+            generation=source_node.generation,
+            source=source_node.node_id,
+        )
+        result_payload = _build_result_payload(
+            handoff_ref=handoff_ref,
+            proposal_ref=proposal_ref,
+            envelope=envelope.to_dict(),
+        )
+    except Exception as exc:
+        result_payload = _build_rejected_result_payload(
+            handoff_ref=handoff_ref,
+            proposal_ref=proposal_ref,
+            error=exc,
+        )
+
     result_ref.parent.mkdir(parents=True, exist_ok=True)
     result_ref.write_text(json.dumps(result_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(result_payload, indent=2, sort_keys=True))

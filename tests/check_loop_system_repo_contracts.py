@@ -97,6 +97,7 @@ def main() -> int:
                 "runtime_state",
                 "depends_on_node_ids",
                 "activation_condition",
+                "activation_rationale",
                 "accepted deferred activation",
                 "completed deferred source node proposes a merge",
                 "accepted deferred merge",

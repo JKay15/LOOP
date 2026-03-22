@@ -40,6 +40,7 @@ Every LOOP execution unit is a `node`, and child materialization must pass throu
 - `workspace_root`
 - `depends_on_node_ids`
 - `activation_condition`
+- `activation_rationale`
 - `runtime_state`
 - `delegation_ref`
 - `result_sink_ref`
@@ -64,8 +65,9 @@ Every LOOP execution unit is a `node`, and child materialization must pass throu
 - child-visible split submission must have a repo-shipped split helper path; text-only split recommendations in `PARTITION_PLAN.md`, `TRACEABILITY.md`, or similar prose are not submitted topology proposals
 - fresh implementer child nodes must materialize `split_request` in `allowed_actions` by default so the documented autosplit-capable path is actually invokable from the persisted node/delegation surface
 - accepted split children must match the reviewed `target_node_ids` exactly and must inherit the kernel-owned `parent generation + 1` step rather than proposer-supplied generation drift
-- accepted `parallel` split children may start immediately only when they are dependency-free; any accepted split target that already declares `depends_on_node_ids` or an `activation_condition` must persist as `PLANNED` until a later activate step, even if the parent split itself was accepted in `parallel` mode
-- accepted deferred split children must persist `depends_on_node_ids` and `activation_condition` in both node state and frozen delegation, and must land as `PLANNED` rather than `ACTIVE`
+- accepted `parallel` split children may start immediately only when they are dependency-free; any accepted split target that already declares `depends_on_node_ids` or a machine-evaluable `activation_condition` must persist as `PLANNED` until a later activate step, even if the parent split itself was accepted in `parallel` mode
+- accepted deferred split children must persist `depends_on_node_ids`, `activation_condition`, and any free-text `activation_rationale` in both node state and frozen delegation, and must land as `PLANNED` rather than `ACTIVE`
+- free-text activation intent/explanation belongs in `activation_rationale`; runtime activation may only execute machine-evaluable `activation_condition` values
 - accepted deferred split children may use split-release activation conditions of the form `after:<source>:split_accepted_and_<slice>_released`; those conditions are only satisfiable once the source has durably published the released slice under an authoritative split-continuation result
 - accepted split-child bootstrap must preserve the parent `FROZEN_HANDOFF.json` and, when present, `FROZEN_HANDOFF.md` as inherited authoritative context refs rather than narrowing visible constraints down to the branch slice alone
 - accepted split-child bootstrap must also preserve the narrowed `child_goal_slice`, live-root refs, and slice-scoped evaluator bundle refs in durable handoff state instead of silently reusing the source node's whole-task evaluator bundle

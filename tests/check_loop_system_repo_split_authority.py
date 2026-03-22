@@ -406,27 +406,102 @@ def _parallel_split_with_dependency_bound_child_case() -> int:
 
         topology_module.bootstrap_first_implementer_node = _fake_bootstrap
         topology_module.launch_child_from_result_ref = _fake_launch_child_from_result_ref
+        try:
+            try:
+                build_split_request(
+                    source_node=source_node,
+                    target_nodes=[
+                        {
+                            "node_id": "child-extraction-001",
+                            "goal_slice": "close the whole-paper extraction/dependency ledger",
+                            "activation_condition": "May start immediately from the shared extraction ledger and dependency graph.",
+                        },
+                        {
+                            "node_id": "child-linear-001",
+                            "goal_slice": "formalize the linear chain independently",
+                            "activation_condition": "May start immediately from the shared extraction ledger and dependency graph.",
+                        },
+                    ],
+                    split_mode="parallel",
+                    reason="prose-only activation conditions without machine gating must fail closed",
+                )
+            except ValueError:
+                pass
+            else:
+                return _fail("build_split_request must reject prose-only activation conditions with no safe machine fallback")
+
+            authority = query_authority_view(state_root)
+            node_graph = {item["node_id"]: item for item in authority["node_graph"]}
+            if node_graph.get("child-extraction-001") or node_graph.get("child-linear-001"):
+                return _fail("rejected split must not materialize any child nodes")
+            if bootstrap_calls or launch_calls:
+                return _fail("rejected split must not bootstrap or launch child nodes")
+        finally:
+            if original_bootstrap is not None:
+                topology_module.bootstrap_first_implementer_node = original_bootstrap
+            else:
+                delattr(topology_module, "bootstrap_first_implementer_node")
+            if original_launch is not None:
+                topology_module.launch_child_from_result_ref = original_launch
+            else:
+                delattr(topology_module, "launch_child_from_result_ref")
+
+    return 0
+
+
+def _parallel_split_dependency_gated_prose_rationale_case() -> int:
+    import loop_product.kernel.topology as topology_module
+
+    from loop_product.kernel.query import query_authority_view
+    from loop_product.kernel.submit import submit_topology_mutation
+    from loop_product.protocols.control_envelope import EnvelopeStatus
+    from loop_product.protocols.node import NodeStatus
+    from loop_product.topology.split_review import build_split_request
+
+    with tempfile.TemporaryDirectory(prefix="loop_system_parallel_split_prose_rationale_") as td:
+        state_root = Path(td) / ".loop"
+        _persist_base_state(state_root)
+        source_node = _base_source_node()
+        bootstrap_calls: list[dict[str, object]] = []
+        launch_calls: list[dict[str, object]] = []
+        original_bootstrap = getattr(topology_module, "bootstrap_first_implementer_node", None)
+        original_launch = getattr(topology_module, "launch_child_from_result_ref", None)
+
+        def _fake_bootstrap(**kwargs):
+            bootstrap_calls.append(dict(kwargs))
+            bootstrap_ref = state_root / "artifacts" / "bootstrap" / f"{kwargs['node_id']}__bootstrap.json"
+            bootstrap_ref.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "bootstrap_result_ref": str(bootstrap_ref.resolve()),
+                "node_id": kwargs["node_id"],
+                "state_root": str(state_root.resolve()),
+                "workspace_root": str(kwargs["workspace_root"]),
+            }
+            bootstrap_ref.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            return payload
+
+        def _fake_launch_child_from_result_ref(**kwargs):
+            launch_calls.append(dict(kwargs))
+            return {"launch_decision": "test-only", "source_result_ref": str(kwargs.get("result_ref") or "")}
+
+        topology_module.bootstrap_first_implementer_node = _fake_bootstrap
+        topology_module.launch_child_from_result_ref = _fake_launch_child_from_result_ref
         mutation = build_split_request(
             source_node=source_node,
             target_nodes=[
                 {
                     "node_id": "child-extraction-001",
                     "goal_slice": "close the whole-paper extraction/dependency ledger",
-                    "activation_condition": "May start immediately from the shared extraction ledger and dependency graph.",
-                },
-                {
-                    "node_id": "child-linear-001",
-                    "goal_slice": "formalize the linear chain independently",
-                    "activation_condition": "May start immediately from the shared extraction ledger and dependency graph.",
                 },
                 {
                     "node_id": "child-final-001",
-                    "goal_slice": "integrate only after extraction and linear children finish",
-                    "depends_on_node_ids": ["child-extraction-001", "child-linear-001"],
+                    "goal_slice": "integrate only after extraction finishes",
+                    "depends_on_node_ids": ["child-extraction-001"],
+                    "activation_condition": "Activate once the extraction ledger is durably published and reviewed.",
                 },
             ],
             split_mode="parallel",
-            reason="parallelize independent fronts but keep dependency-bound final integration gated",
+            reason="dependency-gated prose should be preserved as rationale while the machine gate comes from depends_on",
         )
         envelope = submit_topology_mutation(
             state_root,
@@ -436,29 +511,27 @@ def _parallel_split_with_dependency_bound_child_case() -> int:
         )
         try:
             if envelope.status is not EnvelopeStatus.ACCEPTED:
-                return _fail(f"dependency-gated parallel split must still be accepted, got {envelope.status.value!r}")
+                return _fail(
+                    "dependency-gated parallel split with prose activation rationale should be accepted via safe machine fallback, "
+                    f"got {envelope.status.value!r}"
+                )
 
             authority = query_authority_view(state_root)
             node_graph = {item["node_id"]: item for item in authority["node_graph"]}
             if node_graph.get("child-extraction-001", {}).get("status") != NodeStatus.ACTIVE.value:
-                return _fail("dependency-free parallel split child must become ACTIVE immediately")
-            if node_graph.get("child-linear-001", {}).get("status") != NodeStatus.ACTIVE.value:
-                return _fail("second dependency-free parallel split child must become ACTIVE immediately")
+                return _fail("dependency-free child should still launch immediately")
             if node_graph.get("child-final-001", {}).get("status") != NodeStatus.PLANNED.value:
-                return _fail("dependency-bound child in a parallel split must remain PLANNED until dependencies are ready")
-            if "child-final-001" not in authority["planned_child_nodes"]:
-                return _fail("dependency-bound parallel child must appear in planned_child_nodes")
-            if "child-final-001" in authority["active_child_nodes"]:
-                return _fail("dependency-bound parallel child must not appear in active_child_nodes before activation")
+                return _fail("dependency-gated child should remain PLANNED until activation")
+            if len(bootstrap_calls) != 1 or len(launch_calls) != 1:
+                return _fail("only the dependency-free child should bootstrap and launch immediately in this case")
 
             final_state = json.loads((state_root / "state" / "child-final-001.json").read_text(encoding="utf-8"))
-            if final_state.get("depends_on_node_ids") != ["child-extraction-001", "child-linear-001"]:
-                return _fail("dependency-bound parallel child must preserve depends_on_node_ids in node state")
-            if len(bootstrap_calls) != 2 or len(launch_calls) != 2:
-                return _fail("only dependency-free parallel split children should bootstrap and launch immediately")
-            bootstrapped_ids = {str(item.get("node_id") or "") for item in bootstrap_calls}
-            if bootstrapped_ids != {"child-extraction-001", "child-linear-001"}:
-                return _fail("dependency-bound parallel child must not be bootstrapped before activation")
+            if final_state.get("depends_on_node_ids") != ["child-extraction-001"]:
+                return _fail("dependency-gated child must preserve depends_on_node_ids in node state")
+            if final_state.get("activation_condition") != "":
+                return _fail("unsupported prose activation_condition must not persist as a machine gate")
+            if "durably published and reviewed" not in str(final_state.get("activation_rationale") or ""):
+                return _fail("dependency-gated child must preserve prose gating explanation as activation_rationale")
         finally:
             if original_bootstrap is not None:
                 topology_module.bootstrap_first_implementer_node = original_bootstrap
@@ -1102,6 +1175,9 @@ def main() -> int:
         if rc:
             return rc
         rc = _parallel_split_with_dependency_bound_child_case()
+        if rc:
+            return rc
+        rc = _parallel_split_dependency_gated_prose_rationale_case()
         if rc:
             return rc
         rc = _split_required_outputs_persist_case()

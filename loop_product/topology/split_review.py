@@ -57,6 +57,25 @@ def _target_requires_planned_activation(*, split_mode: str, target_payload: Mapp
     return bool(depends_on or activation_condition)
 
 
+def _supported_activation_condition(value: Any) -> bool:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return True
+    if not normalized.startswith("after:"):
+        return False
+    parts = normalized.split(":")
+    if len(parts) != 3:
+        return False
+    _, dependency_node_id, requirement = parts
+    dependency_node_id = str(dependency_node_id or "").strip()
+    requirement = str(requirement or "").strip().lower()
+    if not dependency_node_id:
+        return False
+    if requirement in {"terminal", "completed", "failed"}:
+        return True
+    return requirement.startswith("split_accepted_and_") and requirement.endswith("_released")
+
+
 def _normalize_target_payloads(
     *,
     source_node_id: str,
@@ -69,6 +88,7 @@ def _normalize_target_payloads(
     source_allowed_actions: Sequence[str],
     target_nodes: Sequence[Any],
     split_mode: str,
+    validate_activation_condition: bool = True,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     normalized: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -87,7 +107,8 @@ def _normalize_target_payloads(
         depends_on_raw = target.get("depends_on_node_ids")
         required_output_paths_raw = target.get("required_output_paths")
         explicit_generation = target.get("generation")
-        activation_condition = str(target.get("activation_condition") or "").strip()
+        activation_condition_raw = str(target.get("activation_condition") or "").strip()
+        activation_rationale = str(target.get("activation_rationale") or "").strip()
 
         if not isinstance(execution_policy_raw, Mapping):
             errors.append(f"target {node_id or index} execution_policy must be a mapping")
@@ -112,6 +133,17 @@ def _normalize_target_payloads(
         else:
             errors.append(f"target {node_id or index} depends_on_node_ids must be a list of strings")
             continue
+        activation_condition = activation_condition_raw
+        if activation_condition and not _supported_activation_condition(activation_condition):
+            if not activation_rationale:
+                activation_rationale = activation_condition
+            activation_condition = ""
+            if validate_activation_condition and split_mode != "deferred" and not resolved_depends_on:
+                errors.append(
+                    f"target {node_id or index} activation_condition must use supported after:<node_id>:<requirement> syntax "
+                    "unless depends_on_node_ids already provide a machine-evaluable gate; explanatory prose belongs in activation_rationale"
+                )
+                continue
         if split_mode == "deferred" and not activation_condition:
             activation_condition = f"after:{source_node_id}:terminal"
         if required_output_paths_raw in (None, ""):
@@ -162,6 +194,7 @@ def _normalize_target_payloads(
                 "codex_home": str(target.get("codex_home") or ""),
                 "depends_on_node_ids": resolved_depends_on,
                 "activation_condition": activation_condition,
+                "activation_rationale": activation_rationale,
                 "result_sink_ref": str(target.get("result_sink_ref") or f"artifacts/{node_id}/result.json"),
                 "generation": expected_generation,
             }
@@ -200,14 +233,14 @@ def _request_skeleton_checks(
                     split_mode != "deferred"
                     or (
                         list(item.get("depends_on_node_ids") or [])
-                        and str(item.get("activation_condition") or "").strip()
+                        and _supported_activation_condition(item.get("activation_condition"))
                     )
                 )
                 for item in normalized_targets
             ),
             "detail": (
                 "every split target must preserve a non-empty goal_slice; "
-                "deferred targets must also persist dependency and activation metadata"
+                "deferred targets must also persist dependency and machine-evaluable activation metadata"
             ),
         },
         "S4_generation_budget": {
@@ -346,14 +379,14 @@ def review_split_request(kernel_state: KernelState, mutation: TopologyMutation) 
                     normalized_split_mode != "deferred"
                     or (
                         list(item.get("depends_on_node_ids") or [])
-                        and str(item.get("activation_condition") or "").strip()
+                        and _supported_activation_condition(item.get("activation_condition"))
                     )
                 )
                 for item in normalized_target_nodes
             ),
             "detail": (
                 "every proposed split child must carry a valid mapping-shaped payload with a non-empty goal_slice; "
-                "deferred children must also keep dependency and activation metadata"
+                "deferred children must also keep dependency and machine-evaluable activation metadata"
             ),
         },
         {

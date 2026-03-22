@@ -271,6 +271,9 @@ def main() -> int:
             workspace_root=workspace_root,
             handoff_md_path=handoff_md,
             node=node,
+            workspace_live_artifact_abs=workspace_root / ".tmp_primary_artifact",
+            artifact_publication_receipt_abs=workspace_root / "artifacts" / "publication" / "receipt.json",
+            artifact_publication_runner_abs=workspace_root / "PUBLISH_WORKSPACE_ARTIFACT.sh",
             workspace_result_sink_abs=workspace_root / "workspace_result.json",
             kernel_result_sink_abs=workspace_root / "kernel_result.json",
             evaluator_submission_abs=workspace_root / "EvaluatorNodeSubmission.json",
@@ -286,6 +289,10 @@ def main() -> int:
             return _fail("bootstrap child prompt must surface an exact split helper path instead of only prose guidance")
         if "submit_activate_request_from_handoff.sh" not in prompt_text:
             return _fail("bootstrap child prompt must surface an exact activate helper path for deferred children")
+        if "after:<node_id>:<requirement>" not in prompt_text:
+            return _fail("bootstrap child prompt must pin activation_condition to machine-evaluable after:<node_id>:<requirement> syntax")
+        if "activation_rationale" not in prompt_text:
+            return _fail("bootstrap child prompt must tell the implementer where explanatory activation prose belongs")
         if "WHOLE_PAPER_STATUS.json" not in prompt_text:
             return _fail("bootstrap child prompt must require structured whole-paper terminal evidence before evaluator")
         if "exact frozen refs in the handoff/prompt as authoritative" not in prompt_text:
@@ -403,6 +410,103 @@ def main() -> int:
         result_payload = json.loads(result_ref.read_text(encoding="utf-8"))
         if str(result_payload.get("status") or "") != "ACCEPTED":
             return _fail("split helper must surface ACCEPTED when kernel review accepts the proposal")
+
+        kernel_state_payload = json.loads((state_root / "state" / "kernel_state.json").read_text(encoding="utf-8"))
+        kernel_state_payload["nodes"]["child-001"]["status"] = "ACTIVE"
+        (state_root / "state" / "kernel_state.json").write_text(
+            json.dumps(kernel_state_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        child_state_path = state_root / "state" / "child-001.json"
+        child_state_payload = json.loads(child_state_path.read_text(encoding="utf-8"))
+        child_state_payload["status"] = "ACTIVE"
+        child_state_path.write_text(json.dumps(child_state_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        rationale_proposal = workspace_root / "RationaleSplitRequest.json"
+        rationale_proposal.write_text(
+            json.dumps(
+                {
+                    "split_mode": "parallel",
+                    "reason": "dependency-gated split with prose explanation should normalize cleanly",
+                    "completed_work": "source established the boundary-producing child",
+                    "remaining_work": "an immediate helper child and one dependency-gated follow-up child remain",
+                    "target_nodes": [
+                        {
+                            "node_id": "child-001-rationale-anchor",
+                            "goal_slice": "materialize an immediate helper branch so the split remains a real parallel split",
+                        },
+                        {
+                            "node_id": "child-001-followup-rationale",
+                            "goal_slice": "follow up after the boundary is published",
+                            "depends_on_node_ids": ["child-001-block-bc"],
+                            "activation_condition": "Activate once the upstream boundary is ready.",
+                        }
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        rationale_result_ref = workspace_root / "RationaleSplitRequestResult.json"
+        rationale_proc = subprocess.run(
+            [str(helper), "--handoff-ref", str(handoff), "--proposal-ref", str(rationale_proposal), "--result-ref", str(rationale_result_ref)],
+            capture_output=True,
+            text=True,
+        )
+        if rationale_proc.returncode != 0:
+            return _fail(
+                "split helper must accept prose activation rationale when depends_on_node_ids already provide the machine gate; "
+                f"stderr={rationale_proc.stderr.strip()!r}"
+            )
+        rationale_payload = json.loads(rationale_result_ref.read_text(encoding="utf-8"))
+        if str(rationale_payload.get("status") or "") != "ACCEPTED":
+            return _fail("split helper must surface ACCEPTED when prose activation rationale can be normalized safely")
+        normalized_state_path = state_root / "state" / "child-001-followup-rationale.json"
+        if not normalized_state_path.exists():
+            return _fail("accepted dependency-gated prose split must materialize the normalized child state")
+        normalized_state = json.loads(normalized_state_path.read_text(encoding="utf-8"))
+        if str(normalized_state.get("activation_condition") or "") != "":
+            return _fail("safe prose activation rationale must not persist as a machine activation_condition")
+        if "upstream boundary is ready" not in str(normalized_state.get("activation_rationale") or ""):
+            return _fail("safe prose activation rationale must persist in activation_rationale")
+
+        bad_proposal = workspace_root / "BadSplitRequest.json"
+        bad_proposal.write_text(
+            json.dumps(
+                {
+                    "split_mode": "parallel",
+                    "reason": "prose-only activation condition with no machine fallback should fail closed",
+                    "completed_work": "source prepared a boundary sketch",
+                    "remaining_work": "downstream block wants a gate but does not supply dependencies or machine syntax",
+                    "target_nodes": [
+                        {
+                            "node_id": "child-001-bad-followup",
+                            "goal_slice": "follow up after some unspecified condition",
+                            "activation_condition": "Activate once the upstream boundary is ready.",
+                        }
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        bad_result_ref = workspace_root / "BadSplitRequestResult.json"
+        bad_proc = subprocess.run(
+            [str(helper), "--handoff-ref", str(handoff), "--proposal-ref", str(bad_proposal), "--result-ref", str(bad_result_ref)],
+            capture_output=True,
+            text=True,
+        )
+        if bad_proc.returncode == 0:
+            return _fail("split helper must reject prose-only activation_condition values when there is no safe machine fallback")
+        if not bad_result_ref.exists():
+            return _fail("split helper rejection must still materialize a deterministic result file")
+        bad_result_payload = json.loads(bad_result_ref.read_text(encoding="utf-8"))
+        if str(bad_result_payload.get("status") or "") != "REJECTED":
+            return _fail("split helper must surface REJECTED when prose activation_condition lacks a machine fallback")
 
     with tempfile.TemporaryDirectory(prefix="loop_product_activate_helper_") as td:
         temp_root = Path(td)

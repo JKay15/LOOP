@@ -105,6 +105,8 @@ def main() -> int:
         return _fail("ordinary node protocol must serialize default depends_on_node_ids=[]")
     if root_node_record.get("activation_condition") != "":
         return _fail("ordinary node protocol must serialize default activation_condition=''")
+    if root_node_record.get("activation_rationale") != "":
+        return _fail("ordinary node protocol must serialize default activation_rationale=''")
 
     evaluator_result = EvaluatorResult(
         verdict=EvaluatorVerdict.BUG,
@@ -173,6 +175,8 @@ def main() -> int:
             return _fail("ordinary materialized child nodes must default depends_on_node_ids to []")
         if child_node_record.get("activation_condition") != "":
             return _fail("ordinary materialized child nodes must default activation_condition to empty")
+        if child_node_record.get("activation_rationale") != "":
+            return _fail("ordinary materialized child nodes must default activation_rationale to empty")
 
         accepted_heartbeat = submit_control_envelope(
             state_root,

@@ -360,6 +360,7 @@ def apply_accepted_topology_mutation(
             codex_home=str(target.get("codex_home") or ""),
             depends_on_node_ids=list(target.get("depends_on_node_ids") or []),
             activation_condition=str(target.get("activation_condition") or ""),
+            activation_rationale=str(target.get("activation_rationale") or ""),
             result_sink_ref=str(target.get("result_sink_ref") or ""),
             lineage_ref=str(
                 target.get("lineage_ref") or f"{source_record.get('lineage_ref') or source_node_id}->{node_id}"
