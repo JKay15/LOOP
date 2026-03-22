@@ -77,9 +77,21 @@ def main() -> int:
         required_wrapper = temp_root / "ensure_workspace_lake_packages.sh"
         required_wrapper.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
         required_wrapper.chmod(0o755)
+        whole_paper_template_ref = (ROOT.parent / "docs" / "design" / "leanatlas_real_autosplit_formalization_experiment_template_v0_1.md").resolve()
+        whole_paper_acceptance_ref = (ROOT.parent / "docs" / "design" / "leanatlas_complete_formalization_acceptance_v0_1.md").resolve()
+        whole_paper_doc_pack_ref = (ROOT.parent / "docs" / "design" / "leanatlas_single_node_formalization_doc_pack_v0_1.md").resolve()
+        operator_workflow_ref = (ROOT.parent / "docs" / "agents" / "OPERATOR_WORKFLOW.md").resolve()
+        operator_skill_ref = (ROOT.parent / ".agents" / "skills" / "leanatlas-operator-proof-loop" / "SKILL.md").resolve()
+        shared_cache_helper_ref = (ROOT.parent / "scripts" / "ensure_workspace_lake_packages.sh").resolve()
         ancestor_relative_ref = ROOT.parent / ".cache" / "loop_bootstrap_relative_context_ref_test.md"
         ancestor_relative_ref.parent.mkdir(parents=True, exist_ok=True)
         ancestor_relative_ref.write_text("relative context ref\n", encoding="utf-8")
+        stale_loop_artifact = ROOT / ".loop" / "context_ref_pollution_fixture" / "artifacts" / "stale.json"
+        stale_workspace_artifact = ROOT / "workspace" / "context_ref_pollution_fixture" / "deliverables" / "primary_artifact" / "README.md"
+        stale_loop_artifact.parent.mkdir(parents=True, exist_ok=True)
+        stale_workspace_artifact.parent.mkdir(parents=True, exist_ok=True)
+        stale_loop_artifact.write_text("{}\n", encoding="utf-8")
+        stale_workspace_artifact.write_text("# stale runtime artifact\n", encoding="utf-8")
         project_name = "test-first-child-bootstrap"
         workspace_root = ROOT / "workspace" / project_name
         state_root = ROOT / ".loop" / project_name
@@ -530,13 +542,118 @@ def main() -> int:
             derived_handoff_context_refs = {str(item) for item in list(derived_handoff_payload.get("context_refs") or [])}
             if not expected_context_refs.issubset(derived_handoff_context_refs):
                 return _fail("endpoint-driven bootstrap must project explicit local context refs into the frozen handoff")
+
+            whole_paper_project_name = "test-first-child-bootstrap-whole-paper"
+            whole_paper_workspace_root = ROOT / "workspace" / whole_paper_project_name
+            whole_paper_state_root = ROOT / ".loop" / whole_paper_project_name
+            shutil.rmtree(whole_paper_workspace_root, ignore_errors=True)
+            shutil.rmtree(whole_paper_state_root, ignore_errors=True)
+
+            whole_paper_endpoint_artifact = temp_root / "WholePaperEndpointArtifact.json"
+            whole_paper_endpoint_artifact.write_text(
+                json.dumps(
+                    {
+                        "version": "1",
+                        "session_root": str((temp_root / "whole_paper_endpoint_session").resolve()),
+                        "artifact_ref": str(whole_paper_endpoint_artifact.resolve()),
+                        "latest_turn_ref": str((temp_root / "turns" / "0002" / "TurnResult.json").resolve()),
+                        "mode": "VISION_COMPILER",
+                        "status": "CLARIFIED",
+                        "original_user_prompt": (
+                            "Run a whole-paper faithful complete formalization benchmark for "
+                            "/Users/xiongjiangkai/xjk_papers/leanatlas/.cache/leanatlas/tmp/arxiv_2602_11505v2/source/main.tex."
+                        ),
+                        "confirmed_requirements": [],
+                        "denied_requirements": [],
+                        "question_history": [],
+                        "turn_count": 1,
+                        "requirement_artifact": {
+                            "task_type": "research",
+                            "sufficient": True,
+                            "user_request_summary": "Whole-paper faithful complete formalization benchmark for arxiv_2602_11505v2.",
+                            "final_effect": (
+                                "Produce a whole-paper faithful complete formalization benchmark using the staged "
+                                "Extraction Agent, Partition Agent, Block Formalization Agents, External Dependency Agents, "
+                                "and Final Integration / Final Evaluation structure."
+                            ),
+                            "observable_success_criteria": [
+                                "Whole-paper evaluator gives an authoritative terminal result.",
+                                "All proof-relevant mathematical content is explicitly extracted and closed or honestly classified.",
+                            ],
+                            "hard_constraints": [
+                                "Faithfulness outranks compilation.",
+                                "Do not leave internal gaps.",
+                            ],
+                            "non_goals": [
+                                "Do not reuse a stale single-node bounded-gap artifact as the target outcome.",
+                            ],
+                            "relevant_context": [
+                                str(whole_paper_template_ref),
+                                str(whole_paper_acceptance_ref),
+                                str(whole_paper_doc_pack_ref),
+                                str(shared_cache_helper_ref),
+                                str(operator_workflow_ref),
+                                str(operator_skill_ref),
+                                str(stale_loop_artifact.resolve()),
+                                str(stale_workspace_artifact.resolve()),
+                            ],
+                            "open_questions": [],
+                            "artifact_ready_for_persistence": True,
+                        },
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            whole_paper_bootstrap = bootstrap_first_implementer_from_endpoint(
+                endpoint_artifact_ref=str(whole_paper_endpoint_artifact.resolve()),
+                workspace_root=str(whole_paper_workspace_root.resolve()),
+                state_root=str(whole_paper_state_root.resolve()),
+            )
+            Draft202012Validator(result_schema).validate(whole_paper_bootstrap)
+            whole_paper_bootstrap_result = Path(str(whole_paper_bootstrap.get("bootstrap_result_ref") or ""))
+            whole_paper_request_path = whole_paper_bootstrap_result.parent / "FirstImplementerBootstrapRequest.json"
+            whole_paper_request = json.loads(whole_paper_request_path.read_text(encoding="utf-8"))
+            whole_paper_request_context_refs = {str(item) for item in list(whole_paper_request.get("context_refs") or [])}
+            whole_paper_handoff_json = Path(str(whole_paper_bootstrap.get("handoff_json_ref") or ""))
+            whole_paper_handoff_payload = json.loads(whole_paper_handoff_json.read_text(encoding="utf-8"))
+            whole_paper_handoff_context_refs = {str(item) for item in list(whole_paper_handoff_payload.get("context_refs") or [])}
+
+            expected_whole_paper_refs = {
+                str(whole_paper_endpoint_artifact.resolve()),
+                str(whole_paper_template_ref),
+                str(whole_paper_acceptance_ref),
+                str(whole_paper_doc_pack_ref),
+                str(shared_cache_helper_ref),
+            }
+            polluted_whole_paper_refs = {
+                str(operator_workflow_ref),
+                str(operator_skill_ref),
+                str(stale_loop_artifact.resolve()),
+                str(stale_workspace_artifact.resolve()),
+            }
+            if not expected_whole_paper_refs.issubset(whole_paper_request_context_refs):
+                return _fail("whole-paper endpoint bootstrap must retain the whole-paper benchmark refs required by the frozen goal")
+            if whole_paper_request_context_refs.intersection(polluted_whole_paper_refs):
+                return _fail("whole-paper endpoint bootstrap must filter OPERATOR-mode and stale runtime artifact refs from context_refs")
+            if whole_paper_handoff_context_refs.intersection(polluted_whole_paper_refs):
+                return _fail("whole-paper frozen handoff must not project OPERATOR-mode or stale runtime artifact refs")
         finally:
             ancestor_relative_ref.unlink(missing_ok=True)
+            stale_loop_artifact.unlink(missing_ok=True)
+            stale_workspace_artifact.unlink(missing_ok=True)
+            shutil.rmtree(ROOT / ".loop" / "context_ref_pollution_fixture", ignore_errors=True)
+            shutil.rmtree(ROOT / "workspace" / "context_ref_pollution_fixture", ignore_errors=True)
             shutil.rmtree(workspace_root, ignore_errors=True)
             shutil.rmtree(state_root, ignore_errors=True)
             shutil.rmtree(ROOT / "workspace" / "test-first-child-bootstrap-slice", ignore_errors=True)
             shutil.rmtree(ROOT / "workspace" / "test-first-child-bootstrap-from-endpoint", ignore_errors=True)
             shutil.rmtree(ROOT / ".loop" / "test-first-child-bootstrap-from-endpoint", ignore_errors=True)
+            shutil.rmtree(ROOT / "workspace" / "test-first-child-bootstrap-whole-paper", ignore_errors=True)
+            shutil.rmtree(ROOT / ".loop" / "test-first-child-bootstrap-whole-paper", ignore_errors=True)
 
     print("[loop-system-first-child-bootstrap] OK")
     return 0

@@ -119,6 +119,63 @@ def _derive_endpoint_context_refs(
     return _dedupe_refs([str(artifact_path.resolve()), *list(explicit_context_refs), *path_refs, *relative_refs])
 
 
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _looks_like_whole_paper_benchmark(*texts: str) -> bool:
+    haystack = "\n".join(str(item or "") for item in texts).lower()
+    markers = (
+        "whole-paper",
+        "whole paper",
+        "faithful complete formalization",
+        "final integration / final evaluation",
+        "extraction agent",
+        "proof-relevant appendix",
+        "整篇论文",
+    )
+    return any(marker in haystack for marker in markers)
+
+
+def _curate_endpoint_context_refs(
+    *,
+    refs: list[str],
+    root_goal: str,
+    child_goal_slice: str,
+) -> list[str]:
+    if not _looks_like_whole_paper_benchmark(root_goal, child_goal_slice):
+        return _dedupe_refs(refs)
+
+    repo_root = product_repo_root().resolve()
+    leanatlas_root = repo_root.parent.resolve()
+    disallowed_exact_refs = {
+        str((leanatlas_root / "docs" / "agents" / "OPERATOR_WORKFLOW.md").resolve()),
+        str((leanatlas_root / ".agents" / "skills" / "leanatlas-operator-proof-loop" / "SKILL.md").resolve()),
+    }
+    runtime_roots = [
+        (repo_root / ".loop").resolve(),
+        (repo_root / "workspace").resolve(),
+    ]
+    curated: list[str] = []
+    seen: set[str] = set()
+    for raw_ref in refs:
+        normalized_ref = str(Path(str(raw_ref or "")).expanduser().resolve())
+        if not normalized_ref or normalized_ref in seen:
+            continue
+        if normalized_ref in disallowed_exact_refs:
+            continue
+        resolved_path = Path(normalized_ref)
+        if any(_path_is_within(resolved_path, runtime_root) for runtime_root in runtime_roots):
+            continue
+        seen.add(normalized_ref)
+        curated.append(normalized_ref)
+    return curated
+
+
 def _path_missing_or_empty(path: Path) -> bool:
     if not path.exists():
         return True
@@ -984,6 +1041,11 @@ def bootstrap_first_implementer_from_endpoint(*, authority: KernelMutationAuthor
         artifact_path=artifact_path,
         artifact_payload=artifact_payload,
         explicit_context_refs=[str(item) for item in (payload.get("context_refs") or [])],
+    )
+    context_refs = _curate_endpoint_context_refs(
+        refs=context_refs,
+        root_goal=root_goal,
+        child_goal_slice=child_goal_slice,
     )
     task_slug = _nonempty(payload.get("task_slug")) or _default_task_slug(
         artifact_payload=artifact_payload,
