@@ -324,6 +324,12 @@ def _render_child_prompt(
     local_input_helper = (repo_root / "scripts" / "find_local_input_candidates.sh").resolve()
     split_submit_helper = (repo_root / "scripts" / "submit_split_request_from_handoff.sh").resolve()
     activate_submit_helper = (repo_root / "scripts" / "submit_activate_request_from_handoff.sh").resolve()
+    slice_scope_guard_lines: list[str] = []
+    if not _use_whole_paper_evaluator_surface(node):
+        slice_scope_guard_lines = [
+            "This node is slice-scoped and does not own whole-paper terminal classification authority.",
+            "If you emit `WHOLE_PAPER_STATUS.json`, keep it slice-local and do not claim whole-paper `TERMINAL` classifications such as `paper defect exposed`, `external dependency blocked`, or `whole-paper faithful complete formalization`.",
+        ]
     return "\n".join(
         [
             "Read and follow:",
@@ -338,6 +344,7 @@ def _render_child_prompt(
             "Build in the live artifact root first and treat the workspace mirror as publish-only.",
             "Publish through the exact publication runner before evaluator or terminal report.",
             "A child-authored WHOLE_PAPER_STATUS.json or branch README is not a publication receipt.",
+            *slice_scope_guard_lines,
             "Do not inspect sibling workspace task folders or historical deliverables as templates, evidence, or reuse context unless the frozen handoff explicitly names that exact reuse target.",
             "When this prompt names a committed repo-shipped wrapper or helper, call it directly before reading its source or tests unless the direct path fails.",
             "Treat exact frozen refs in the handoff/prompt as authoritative and do not guess alternate repo-root or lookalike paths before using them.",
@@ -694,6 +701,7 @@ def _render_slice_scoped_evaluator_final_effects_text(
         ),
         "- This evaluator judges only the slice-local deliverable surface for this node.",
         "- It must not claim whole-paper terminal closure or whole-paper completion for unrelated nodes.",
+        "- It must not claim whole-paper terminal classifications reserved for the dedicated whole-paper closeout surface.",
     ]
     if required_output_paths:
         lines.extend(["", "## Required Outputs", ""])
@@ -779,13 +787,17 @@ def _render_slice_scoped_evaluator_manual(
 def _child_goal_requests_whole_paper_closeout(node: NodeSpec) -> bool:
     text = f"{node.node_id} {node.goal_slice}".lower()
     markers = (
-        "whole-paper",
-        "whole paper",
         "final integration",
         "final evaluation",
         "final outcome",
         "whole-paper closeout",
+        "whole paper closeout",
         "whole-paper terminal",
+        "whole paper terminal",
+        "whole-paper final integration",
+        "whole paper final integration",
+        "whole-paper final outcome",
+        "whole paper final outcome",
     )
     return any(marker in text for marker in markers)
 

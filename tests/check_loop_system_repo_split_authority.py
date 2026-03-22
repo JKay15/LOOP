@@ -900,6 +900,86 @@ def _authoritative_child_result_sync_case() -> int:
     return 0
 
 
+def _source_split_continuation_sync_case() -> int:
+    from loop_product.dispatch.publication import publish_workspace_artifact_snapshot
+    from loop_product.kernel.authority import kernel_internal_authority
+    from loop_product.kernel.query import query_authority_view
+    from loop_product.kernel.state import load_kernel_state
+    from loop_product.protocols.node import NodeStatus
+    from loop_product.runtime_paths import node_live_artifact_root
+
+    with tempfile.TemporaryDirectory(prefix="loop_system_split_continue_sync_") as td:
+        state_root = Path(td) / ".loop"
+        _persist_base_state(state_root)
+        authority = kernel_internal_authority()
+        kernel_state = load_kernel_state(state_root)
+        source_record = dict(kernel_state.nodes.get("child-implementer-001") or {})
+        source_workspace_root = Path(str(source_record.get("workspace_root") or "")).expanduser().resolve()
+        live_root = node_live_artifact_root(
+            state_root=state_root,
+            node_id="child-implementer-001",
+            workspace_mirror_relpath="deliverables/primary_artifact",
+        )
+        live_root.mkdir(parents=True, exist_ok=True)
+        (live_root / "README.md").write_text("# split continuation\n", encoding="utf-8")
+        (live_root / "partition").mkdir(parents=True, exist_ok=True)
+        (live_root / "partition" / "PARTITION_SUMMARY.md").write_text("slice release summary\n", encoding="utf-8")
+        publish_workspace_artifact_snapshot(
+            node_id="child-implementer-001",
+            live_artifact_ref=live_root,
+            publish_artifact_ref=source_workspace_root / "deliverables" / "primary_artifact",
+            publication_receipt_ref=state_root
+            / "artifacts"
+            / "publication"
+            / "child-implementer-001"
+            / "WorkspaceArtifactPublicationReceipt.json",
+        )
+        result_ref = state_root / "artifacts" / "child-implementer-001" / "result.json"
+        result_ref.parent.mkdir(parents=True, exist_ok=True)
+        result_ref.write_text(
+            json.dumps(
+                {
+                    "schema": "loop_product.implementer_result",
+                    "schema_version": "0.1.0",
+                    "node_id": "child-implementer-001",
+                    "status": "IN_PROGRESS",
+                    "outcome": "SPLIT_ACCEPTED_CONTINUE_IMPLEMENTATION",
+                    "summary": "authoritative source result published partition output and accepted deferred split",
+                    "split_state": {
+                        "proposed": True,
+                        "accepted": True,
+                        "mode": "deferred",
+                        "accepted_target_nodes": ["child-linear-001"],
+                    },
+                    "whole_paper_status": {
+                        "status": "IN_PROGRESS",
+                        "current_phase": "PARTITION_REVIEW",
+                        "artifact_ready_for_evaluator": False,
+                    },
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        authority_view = query_authority_view(state_root)
+        node_graph = {item["node_id"]: item for item in authority_view["node_graph"]}
+        source_graph = node_graph.get("child-implementer-001")
+        if source_graph is None:
+            return _fail("split continuation sync case must preserve the source node in authority view")
+        if source_graph.get("status") != NodeStatus.BLOCKED.value:
+            return _fail("source split-continuation result must normalize the source node to BLOCKED instead of leaving it ACTIVE")
+        source_state = json.loads((state_root / "state" / "child-implementer-001.json").read_text(encoding="utf-8"))
+        if source_state.get("status") != NodeStatus.BLOCKED.value:
+            return _fail("source split-continuation result must persist BLOCKED lifecycle to node state")
+        runtime_state = dict(source_state.get("runtime_state") or {})
+        if runtime_state.get("attachment_state") != "TERMINAL":
+            return _fail("source split-continuation result must mark the source runtime attachment as TERMINAL")
+
+    return 0
+
+
 def main() -> int:
     try:
         rc = _accepted_split_case()
@@ -912,6 +992,9 @@ def main() -> int:
         if rc:
             return rc
         rc = _authoritative_child_result_sync_case()
+        if rc:
+            return rc
+        rc = _source_split_continuation_sync_case()
         if rc:
             return rc
         rc = _rejected_split_case()

@@ -360,7 +360,10 @@ def main() -> int:
                 shutil.rmtree(split_workspace_root)
             split_workspace_root.mkdir(parents=True, exist_ok=True)
             split_node_id = f"{str(result.get('node_id') or '')}__slice"
-            split_goal_slice = "faithfully formalize only the bounded utility appendix slice"
+            split_goal_slice = (
+                "faithfully formalize only the bounded utility appendix slice "
+                "without mutating the whole-paper coverage ledger owned by the source node"
+            )
             kernel_state = load_kernel_state(state_root)
             split_node = materialize_child(
                 state_root=state_root,
@@ -404,6 +407,9 @@ def main() -> int:
             split_bootstrap = bootstrap_first_implementer_node(**split_request)
             Draft202012Validator(result_schema).validate(split_bootstrap)
             split_handoff = json.loads(Path(str(split_bootstrap.get("handoff_json_ref") or "")).read_text(encoding="utf-8"))
+            split_child_prompt = Path(str(split_bootstrap.get("child_prompt_ref") or ""))
+            if not split_child_prompt.exists():
+                return _fail("split child bootstrap must materialize a child prompt")
             split_bundle_root = (state_root / "artifacts" / "bootstrap" / split_node.node_id).resolve()
             split_submission_ref = str((split_bundle_root / "EvaluatorNodeSubmission.json").resolve())
             split_final_effects_ref = str((split_bundle_root / "EvaluatorFinalEffects.md").resolve())
@@ -414,11 +420,21 @@ def main() -> int:
             split_submission_payload = json.loads(Path(split_submission_ref).read_text(encoding="utf-8"))
             if str(split_submission_payload.get("goal_slice") or "") != split_goal_slice:
                 return _fail("split child evaluator submission must preserve the narrowed slice goal")
+            split_manual_ref = str(split_submission_payload.get("product_manual_ref") or "")
+            if not split_manual_ref:
+                return _fail("split child evaluator submission must persist a product_manual_ref")
+            split_manual_text = Path(split_manual_ref).read_text(encoding="utf-8")
+            if "# Slice-Scoped Evaluator Product Manual" not in split_manual_text:
+                return _fail("split child mentioning whole-paper dependency text must still receive the slice-scoped evaluator manual")
             split_final_effects_text = Path(split_final_effects_ref).read_text(encoding="utf-8").lower()
             if "whole-paper faithful complete formalization" in split_final_effects_text:
                 return _fail("split child evaluator bundle must not reuse whole-paper final effects text")
             if "paper defect exposed" in split_final_effects_text and "external dependency blocked" in split_final_effects_text:
                 return _fail("split child evaluator bundle must stay slice-scoped instead of advertising whole-paper terminal classifications")
+            if "must not claim whole-paper terminal classifications" not in split_final_effects_text:
+                return _fail("split child evaluator final effects must explicitly forbid whole-paper terminal classification claims")
+            if "this node is slice-scoped and does not own whole-paper terminal classification authority" not in split_child_prompt.read_text(encoding="utf-8").lower():
+                return _fail("split child prompt must explicitly deny whole-paper terminal classification authority for ordinary slices")
 
             launch_spec = dict(result.get("launch_spec") or {})
             argv = list(launch_spec.get("argv") or [])

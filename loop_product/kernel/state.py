@@ -299,13 +299,33 @@ def _accepted_deferred_split(payload: dict[str, Any]) -> bool:
     return bool(deferred.get("accepted"))
 
 
+def _split_continuation_outcome(payload: dict[str, Any]) -> str:
+    return str(payload.get("outcome") or "").strip().upper()
+
+
+def authoritative_result_payload_split_release_ready(payload: dict[str, Any]) -> bool:
+    outcome = _split_continuation_outcome(payload)
+    if outcome == "SPLIT_ACCEPTED_CONTINUE_IMPLEMENTATION":
+        split_state = dict(payload.get("split_state") or payload.get("split_report") or {})
+        if split_state:
+            accepted = bool(split_state.get("accepted"))
+            if accepted:
+                return True
+            if list(split_state.get("accepted_target_nodes") or []):
+                return True
+        return True
+    return False
+
+
 def _normalized_status_from_authoritative_result(
     *,
     current_status: str,
     payload: dict[str, Any],
 ) -> str:
-    outcome = str(payload.get("outcome") or "").strip().upper()
+    outcome = _split_continuation_outcome(payload)
     raw_status = str(payload.get("status") or "").strip().upper()
+    if outcome == "SPLIT_ACCEPTED_CONTINUE_IMPLEMENTATION":
+        return NodeStatus.BLOCKED.value
     if outcome == "SPLIT_ACCEPTED_AWAITING_CHILDREN":
         return NodeStatus.BLOCKED.value
     if _accepted_deferred_split(payload):
@@ -387,7 +407,9 @@ def _required_output_paths_for_node_payload(node_payload: dict[str, Any]) -> lis
 
 def authoritative_result_payload_dependency_ready(payload: dict[str, Any]) -> bool:
     status = str(payload.get("status") or "").strip().upper()
-    outcome = str(payload.get("outcome") or "").strip().upper()
+    outcome = _split_continuation_outcome(payload)
+    if authoritative_result_payload_split_release_ready(payload):
+        return True
     if _accepted_deferred_split(payload):
         return True
     if status not in _TERMINAL_DEPENDENCY_NODE_STATUSES:
@@ -426,6 +448,34 @@ def authoritative_node_dependency_ready(*, state_root: Path, node_payload: dict[
         if not bool(publication_gate.get("ready")):
             return False
     return authoritative_result_payload_dependency_ready(dict(result_payload or {}))
+
+
+def authoritative_node_split_release_ready(*, state_root: Path, node_payload: dict[str, Any]) -> bool:
+    from loop_product.dispatch.publication import workspace_publication_ready_for_terminal_state
+
+    runtime_state = normalize_runtime_state(dict(node_payload.get("runtime_state") or {}))
+    if str(runtime_state.get("attachment_state") or "") != RuntimeAttachmentState.TERMINAL.value:
+        return False
+    result_ref = _authoritative_result_ref_for_node(
+        state_root=state_root,
+        node_id=str(node_payload.get("node_id") or ""),
+        node_payload=dict(node_payload or {}),
+    )
+    if not result_ref.exists():
+        return False
+    try:
+        result_payload = json.loads(result_ref.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    workspace_root = str(node_payload.get("workspace_root") or "").strip()
+    if workspace_root:
+        publication_gate = workspace_publication_ready_for_terminal_state(
+            workspace_root=workspace_root,
+            required_output_paths=_required_output_paths_for_node_payload(node_payload),
+        )
+        if not bool(publication_gate.get("ready")):
+            return False
+    return authoritative_result_payload_split_release_ready(dict(result_payload or {}))
 
 
 def _workspace_artifact_hygiene_sync(*, kernel_state: KernelState) -> None:

@@ -1541,6 +1541,143 @@ def main() -> int:
         else:
             return _fail("split-child evaluator launch must fail closed when declared required outputs are still missing")
 
+        split_child_surface_gate_state_root = temp_root / ".loop" / "split_child_surface_gate"
+        split_child_surface_gate_workspace_root = temp_root / "split_child_surface_gate_workspace"
+        split_child_surface_gate_artifact_root = split_child_surface_gate_workspace_root / "deliverables" / "primary_artifact"
+        split_child_surface_gate_artifact_root.mkdir(parents=True, exist_ok=True)
+        ensure_runtime_tree(split_child_surface_gate_state_root)
+        split_child_surface_root_node = NodeSpec(
+            node_id="split-child-surface-gate-root",
+            node_kind="kernel",
+            goal_slice="exercise split-child whole-paper evaluator surface gate",
+            parent_node_id=None,
+            generation=0,
+            round_id="R0",
+            execution_policy={"mode": "kernel"},
+            reasoning_profile={"role": "kernel", "thinking_budget": "medium"},
+            budget_profile={"max_rounds": 1},
+            allowed_actions=["dispatch", "submit", "audit"],
+            delegation_ref="",
+            result_sink_ref="artifacts/split_child_surface_gate/root_summary.json",
+            lineage_ref="split-child-surface-gate-root",
+            status=NodeStatus.ACTIVE,
+        )
+        split_child_surface_source_node = NodeSpec(
+            node_id="split-child-surface-gate-source",
+            node_kind="implementer",
+            goal_slice="source whole-paper node that already released a split child slice",
+            parent_node_id=split_child_surface_root_node.node_id,
+            generation=1,
+            round_id="R1",
+            execution_policy={"sandbox_mode": "danger-full-access"},
+            reasoning_profile={"role": "implementer", "thinking_budget": "high"},
+            budget_profile={"max_rounds": 1},
+            allowed_actions=["evaluate", "report", "split_request"],
+            delegation_ref="state/delegations/split-child-surface-gate-source.json",
+            result_sink_ref="artifacts/split_child_surface_gate/source_result.json",
+            lineage_ref="split-child-surface-gate-root->split-child-surface-gate-source",
+            status=NodeStatus.BLOCKED,
+        )
+        split_child_surface_node = NodeSpec(
+            node_id="split-child-surface-gate-mrc",
+            node_kind="implementer",
+            goal_slice=(
+                "faithfully formalize the MRC appendix slice without mutating the whole-paper coverage ledger "
+                "owned by the source node"
+            ),
+            parent_node_id=split_child_surface_source_node.node_id,
+            generation=2,
+            round_id="R1.S2",
+            execution_policy={"sandbox_mode": "danger-full-access"},
+            reasoning_profile={"role": "implementer", "thinking_budget": "high"},
+            budget_profile={"max_rounds": 1},
+            allowed_actions=["evaluate", "report", "split_request"],
+            delegation_ref="state/delegations/split-child-surface-gate-mrc.json",
+            result_sink_ref="artifacts/split_child_surface_gate/implementer_result.json",
+            lineage_ref="split-child-surface-gate-root->split-child-surface-gate-mrc",
+            status=NodeStatus.ACTIVE,
+        )
+        split_child_surface_kernel_state = KernelState(
+            task_id="split-child-surface-gate",
+            root_goal="reject non-final split children that try to use whole-paper evaluator surfaces",
+            root_node_id=split_child_surface_root_node.node_id,
+        )
+        split_child_surface_kernel_state.register_node(split_child_surface_root_node)
+        split_child_surface_kernel_state.register_node(split_child_surface_source_node)
+        split_child_surface_kernel_state.register_node(split_child_surface_node)
+        persist_kernel_state(
+            split_child_surface_gate_state_root,
+            split_child_surface_kernel_state,
+            authority=kernel_internal_authority(),
+        )
+        (split_child_surface_gate_artifact_root / "README.md").write_text("# README\n", encoding="utf-8")
+        (split_child_surface_gate_artifact_root / "TRACEABILITY.md").write_text("# Traceability\n", encoding="utf-8")
+        (split_child_surface_gate_artifact_root / "WHOLE_PAPER_STATUS.json").write_text(
+            json.dumps(
+                {
+                    "status": "TERMINAL",
+                    "terminal_classification": "paper defect exposed",
+                    "scope": "slice-local draft that should not own whole-paper closeout",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        split_child_surface_manual_ref = split_child_surface_gate_workspace_root / "PRODUCT_MANUAL.md"
+        split_child_surface_manual_ref.write_text("# Manual\n\nMRC split child lane.\n", encoding="utf-8")
+        split_child_surface_final_effects_ref = split_child_surface_gate_workspace_root / "FINAL_EFFECTS.md"
+        split_child_surface_final_effects_ref.write_text(
+            "\n".join(
+                [
+                    "# Final Effects",
+                    "",
+                    "- whole-paper faithful complete formalization",
+                    "- paper defect exposed",
+                    "- external dependency blocked",
+                    "- this text is intentionally wrong for a non-final split child",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        split_child_surface_receipt_ref = _write_publication_receipt(
+            split_child_surface_gate_state_root
+            / "artifacts"
+            / "publication"
+            / split_child_surface_node.node_id
+            / "WorkspaceArtifactPublicationReceipt.json",
+            node_id=split_child_surface_node.node_id,
+            live_artifact_ref=split_child_surface_gate_artifact_root,
+            publish_artifact_ref=split_child_surface_gate_artifact_root,
+        )
+        split_child_surface_submission = build_evaluator_submission_for_frozen_task(
+            target_node=split_child_surface_node,
+            workspace_root=split_child_surface_gate_workspace_root,
+            output_root=split_child_surface_gate_state_root / "artifacts" / "evaluator_split_child_surface_gate_runs",
+            implementation_package_ref=split_child_surface_gate_artifact_root,
+            artifact_publication_receipt_ref=split_child_surface_receipt_ref,
+            product_manual_ref=split_child_surface_manual_ref,
+            final_effects_text_ref=split_child_surface_final_effects_ref,
+            required_output_paths=["README.md", "TRACEABILITY.md", "WHOLE_PAPER_STATUS.json"],
+            role_agent_cmd=_fixture_role_agent_cmd(scenario="wave_sequence"),
+        )
+        try:
+            run_evaluator_node_until_terminal(
+                state_root=split_child_surface_gate_state_root,
+                submission=split_child_surface_submission,
+                max_same_run_recovery_attempts=0,
+            )
+        except ValueError as exc:
+            msg = str(exc).lower()
+            if "whole-paper evaluator preflight" not in msg or "reserved for root or dedicated final integration" not in msg:
+                return _fail(
+                    "split-child whole-paper surface rejection must explain that only root or dedicated final integration nodes may use whole-paper evaluator surfaces"
+                )
+        else:
+            return _fail("non-final split children must fail closed before evaluator launch when they try to use whole-paper evaluator surfaces")
+
         publication_receipt_gate_state_root = temp_root / ".loop" / "publication_receipt_gate"
         publication_receipt_gate_workspace_root = temp_root / "publication_receipt_gate_workspace"
         publication_receipt_gate_artifact_root = publication_receipt_gate_workspace_root / "deliverables" / "primary_artifact"

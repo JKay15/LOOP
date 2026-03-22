@@ -400,6 +400,178 @@ def _authoritative_deferred_result_continuation_case() -> int:
     return 0
 
 
+def _split_continuation_release_activation_case() -> int:
+    import loop_product.kernel.topology as topology_module
+
+    from loop_product.dispatch.child_dispatch import materialize_child
+    from loop_product.dispatch.publication import publish_workspace_artifact_snapshot
+    from loop_product.kernel.authority import kernel_internal_authority
+    from loop_product.kernel.query import query_authority_view
+    from loop_product.kernel.state import load_kernel_state, persist_kernel_state, persist_node_snapshot
+    from loop_product.protocols.node import NodeStatus
+    from loop_product.runtime_paths import node_live_artifact_root
+
+    with tempfile.TemporaryDirectory(prefix="loop_system_split_continue_release_activation_") as td:
+        state_root = Path(td) / ".loop"
+        _persist_base_state(state_root)
+        authority = kernel_internal_authority()
+        kernel_state = load_kernel_state(state_root)
+        source_record = kernel_state.nodes["child-implementer-001"]
+        source_workspace_root = Path(str(source_record.get("workspace_root") or "")).expanduser().resolve()
+        live_root = node_live_artifact_root(
+            state_root=state_root,
+            node_id="child-implementer-001",
+            workspace_mirror_relpath="deliverables/primary_artifact",
+        )
+        live_root.mkdir(parents=True, exist_ok=True)
+        (live_root / "README.md").write_text("# source split release\n", encoding="utf-8")
+        (live_root / "partition").mkdir(parents=True, exist_ok=True)
+        (live_root / "partition" / "PARTITION_SUMMARY.md").write_text("linear slice released\n", encoding="utf-8")
+        publish_workspace_artifact_snapshot(
+            node_id="child-implementer-001",
+            live_artifact_ref=live_root,
+            publish_artifact_ref=source_workspace_root / "deliverables" / "primary_artifact",
+            publication_receipt_ref=state_root
+            / "artifacts"
+            / "publication"
+            / "child-implementer-001"
+            / "WorkspaceArtifactPublicationReceipt.json",
+        )
+        source_record["runtime_state"] = {
+            "attachment_state": "TERMINAL",
+            "observed_at": "",
+            "summary": "source lane stopped after publishing split release artifacts",
+            "observation_kind": "authoritative_result",
+            "evidence_refs": [],
+        }
+        persist_node_snapshot(state_root, source_record, authority=authority)
+        persist_kernel_state(state_root, kernel_state, authority=authority)
+        result_ref = state_root / "artifacts" / "child-implementer-001" / "result.json"
+        result_ref.parent.mkdir(parents=True, exist_ok=True)
+        result_ref.write_text(
+            json.dumps(
+                {
+                    "schema": "loop_product.implementer_result",
+                    "schema_version": "0.1.0",
+                    "node_id": "child-implementer-001",
+                    "status": "IN_PROGRESS",
+                    "outcome": "SPLIT_ACCEPTED_CONTINUE_IMPLEMENTATION",
+                    "summary": "source published partition outputs and released the linear slice after deferred split acceptance",
+                    "split_state": {
+                        "proposed": True,
+                        "accepted": True,
+                        "mode": "deferred",
+                        "accepted_target_nodes": ["child-linear-001"],
+                    },
+                    "whole_paper_status": {
+                        "status": "IN_PROGRESS",
+                        "current_phase": "PARTITION_REVIEW",
+                        "artifact_ready_for_evaluator": False,
+                    },
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        child_workspace_root = ROOT / "workspace" / "test-split-continuation-release-child"
+        shutil.rmtree(child_workspace_root, ignore_errors=True)
+        child_node = materialize_child(
+            state_root=state_root,
+            kernel_state=kernel_state,
+            parent_node_id="child-implementer-001",
+            node_id="child-linear-001",
+            goal_slice="formalize the released linear slice after deferred split acceptance",
+            round_id="R1.child-linear-001",
+            execution_policy={"agent_provider": "codex_cli", "sandbox_mode": "workspace-write"},
+            reasoning_profile={"thinking_budget": "high", "role": "implementer"},
+            budget_profile={"max_rounds": 1},
+            workspace_root=str(child_workspace_root.resolve()),
+            depends_on_node_ids=["child-implementer-001"],
+            activation_condition="after:child-implementer-001:split_accepted_and_linear_slice_released",
+            result_sink_ref="artifacts/child-linear-001/result.json",
+            authority=authority,
+        )
+        child_record = kernel_state.nodes[child_node.node_id]
+        child_record["status"] = NodeStatus.PLANNED.value
+        persist_node_snapshot(state_root, child_record, authority=authority)
+        persist_kernel_state(state_root, kernel_state, authority=authority)
+        _write_source_handoff(
+            state_root=state_root,
+            workspace_root=Path(child_node.workspace_root),
+            source_node=child_node,
+        )
+
+        bootstrap_calls: list[dict[str, object]] = []
+        launch_calls: list[dict[str, object]] = []
+        original_bootstrap = getattr(topology_module, "bootstrap_first_implementer_node", None)
+        original_launch = getattr(topology_module, "launch_child_from_result_ref", None)
+
+        def _fake_bootstrap(**kwargs):
+            bootstrap_calls.append(dict(kwargs))
+            bootstrap_ref = state_root / "artifacts" / "bootstrap" / f"{kwargs['node_id']}__bootstrap.json"
+            bootstrap_ref.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "bootstrap_result_ref": str(bootstrap_ref.resolve()),
+                "node_id": str(kwargs["node_id"]),
+                "workspace_root": str(kwargs["workspace_root"]),
+                "state_root": str(kwargs["state_root"]),
+                "launch_spec": {
+                    "argv": ["/bin/echo", "split-release-activate"],
+                    "env": {},
+                    "cwd": str(kwargs["workspace_root"]),
+                    "stdin_path": str((Path(str(kwargs["workspace_root"])) / "CHILD_PROMPT.md").resolve()),
+                },
+            }
+            bootstrap_ref.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            return payload
+
+        def _fake_launch(*, result_ref: str | Path, startup_probe_ms: int = 1500, startup_health_timeout_ms: int = 12000):
+            del startup_probe_ms, startup_health_timeout_ms
+            launch_calls.append({"result_ref": str(Path(result_ref).resolve())})
+            return {"launch_result_ref": str(Path(result_ref).resolve())}
+
+        topology_module.bootstrap_first_implementer_node = _fake_bootstrap
+        topology_module.launch_child_from_result_ref = _fake_launch
+        previous_runtime_status_mode = os.environ.get("LOOP_CHILD_RUNTIME_STATUS_MODE")
+        os.environ["LOOP_CHILD_RUNTIME_STATUS_MODE"] = "direct"
+        try:
+            authority_view = query_authority_view(state_root)
+            node_graph = {item["node_id"]: item for item in authority_view["node_graph"]}
+            if node_graph.get("child-implementer-001", {}).get("status") != NodeStatus.BLOCKED.value:
+                return _fail("split continuation release case must normalize the source into BLOCKED before child activation")
+            if node_graph.get("child-linear-001", {}).get("status") != NodeStatus.ACTIVE.value:
+                return _fail("split continuation release case must auto-activate the released deferred child")
+            if len(bootstrap_calls) != 1 or len(launch_calls) != 1:
+                return _fail("released deferred child must bootstrap and launch exactly once after authoritative sync")
+            accepted_envelopes = json.loads((state_root / "state" / "accepted_envelopes.json").read_text(encoding="utf-8"))
+            activate_envelopes = [
+                env
+                for env in accepted_envelopes
+                if ((env.get("payload") or {}).get("topology_mutation") or {}).get("kind") == "activate"
+            ]
+            if len(activate_envelopes) != 1:
+                return _fail("split continuation release case must submit exactly one accepted activate proposal")
+        finally:
+            if previous_runtime_status_mode is None:
+                os.environ.pop("LOOP_CHILD_RUNTIME_STATUS_MODE", None)
+            else:
+                os.environ["LOOP_CHILD_RUNTIME_STATUS_MODE"] = previous_runtime_status_mode
+            if original_bootstrap is not None:
+                topology_module.bootstrap_first_implementer_node = original_bootstrap
+            else:
+                delattr(topology_module, "bootstrap_first_implementer_node")
+            if original_launch is not None:
+                topology_module.launch_child_from_result_ref = original_launch
+            else:
+                delattr(topology_module, "launch_child_from_result_ref")
+            shutil.rmtree(child_workspace_root, ignore_errors=True)
+
+    return 0
+
+
 def _default_budget_parallel_split_case() -> int:
     from loop_product.kernel.state import load_kernel_state
     from loop_product.kernel.submit import submit_topology_mutation
@@ -634,6 +806,9 @@ def main() -> int:
         if rc:
             return rc
         rc = _authoritative_deferred_result_continuation_case()
+        if rc:
+            return rc
+        rc = _split_continuation_release_activation_case()
         if rc:
             return rc
         rc = _default_budget_parallel_split_case()

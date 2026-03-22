@@ -82,6 +82,11 @@ def _classify_terminal_result(payload: Mapping[str, Any]) -> str:
     return "MISSING"
 
 
+def _is_split_continuation_result(payload: Mapping[str, Any]) -> bool:
+    outcome = str(payload.get("outcome") or "").strip().upper()
+    return outcome == "SPLIT_ACCEPTED_CONTINUE_IMPLEMENTATION"
+
+
 def _build_recovery_payload(
     *,
     status: Mapping[str, Any],
@@ -486,12 +491,19 @@ def supervise_child_until_settled(
             and str(status.get("lifecycle_status") or "") in {"BLOCKED", "COMPLETED", "FAILED"}
             and str(status.get("runtime_attachment_state") or "") == "TERMINAL"
         )
+        split_continuation_stopped = (
+            classification == "MISSING"
+            and result_ref.exists()
+            and not bool(status.get("pid_alive"))
+            and _is_split_continuation_result(result_payload or {})
+        )
         incomplete_terminal_stopped = (
             classification == "MISSING"
             and result_ref.exists()
             and not bool(status.get("pid_alive"))
+            and not _is_split_continuation_result(result_payload or {})
         )
-        if authoritative_terminal_stopped:
+        if authoritative_terminal_stopped or split_continuation_stopped:
             result = {
                 "launch_result_ref": str(_absolute(launch_result_ref)),
                 "latest_launch_result_ref": str(current_launch_result_ref),

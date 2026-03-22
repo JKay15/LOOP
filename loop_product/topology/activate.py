@@ -6,7 +6,12 @@ from typing import Any
 
 from pathlib import Path
 
-from loop_product.kernel.state import ACTIVE_NODE_STATUSES, KernelState, authoritative_node_dependency_ready
+from loop_product.kernel.state import (
+    ACTIVE_NODE_STATUSES,
+    KernelState,
+    authoritative_node_dependency_ready,
+    authoritative_node_split_release_ready,
+)
 from loop_product.protocols.topology import TopologyMutation
 from loop_product.runtime_paths import require_runtime_root
 from loop_product.topology.budget import normalized_complexity_budget
@@ -63,6 +68,13 @@ def _condition_satisfied(kernel_state: KernelState, condition: str, *, state_roo
             kernel_state=kernel_state,
             dependency_node_id=dependency_node_id,
             state_root=state_root,
+        ), ""
+    if requirement.startswith("split_accepted_and_") and requirement.endswith("_released"):
+        if state_root is None:
+            return False, ""
+        return authoritative_node_split_release_ready(
+            state_root=require_runtime_root(state_root),
+            node_payload=dependency,
         ), ""
     if requirement == "completed":
         return dependency_status == "COMPLETED", ""

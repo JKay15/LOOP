@@ -100,6 +100,21 @@ _WHOLE_PAPER_TERMINAL_CLASSIFICATIONS = {
     "paper defect exposed",
     "external dependency blocked",
 }
+_WHOLE_PAPER_CLOSEOUT_MARKERS = (
+    "final integration",
+    "final evaluation",
+    "final outcome",
+    "whole-paper closeout",
+    "whole paper closeout",
+    "whole-paper terminal",
+    "whole paper terminal",
+    "whole-paper final integration",
+    "whole paper final integration",
+    "whole-paper final outcome",
+    "whole paper final outcome",
+)
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -121,6 +136,23 @@ def _is_whole_paper_benchmark_submission(submission: EvaluatorNodeSubmission) ->
         return False
     normalized = text.lower()
     return all(token in normalized for token in _WHOLE_PAPER_TERMINAL_CLASSIFICATIONS)
+
+
+def _submission_target_requests_whole_paper_closeout(submission: EvaluatorNodeSubmission) -> bool:
+    text = f"{submission.target_node_id} {submission.goal_slice}".lower()
+    return any(marker in text for marker in _WHOLE_PAPER_CLOSEOUT_MARKERS)
+
+
+def _submission_may_use_whole_paper_surface(submission: EvaluatorNodeSubmission, *, state_root: Path | None = None) -> bool:
+    parent = str(submission.parent_node_id or "").strip()
+    if parent in {"", "root-kernel"}:
+        return True
+    if state_root is not None:
+        kernel_state = load_kernel_state(state_root)
+        parent_payload = dict(kernel_state.nodes.get(parent) or {})
+        if str(parent_payload.get("node_kind") or "").strip() == "kernel":
+            return True
+    return _submission_target_requests_whole_paper_closeout(submission)
 
 
 def _whole_paper_terminal_status_path(artifact_root: Path) -> Path:
@@ -253,6 +285,12 @@ def _enforce_required_output_preflight(submission: EvaluatorNodeSubmission) -> N
 def _enforce_whole_paper_preflight(submission: EvaluatorNodeSubmission) -> None:
     if not _is_whole_paper_benchmark_submission(submission):
         return
+    state_root = _derive_state_root_from_submission(submission)
+    if not _submission_may_use_whole_paper_surface(submission, state_root=state_root):
+        raise ValueError(
+            "whole-paper evaluator preflight is reserved for root or dedicated final integration / closeout nodes; "
+            f"target node {submission.target_node_id} is a slice-scoped child and must not use whole-paper evaluator surfaces"
+        )
     artifact_root = Path(submission.implementation_package_ref).expanduser().resolve()
     if not artifact_root.exists() or not artifact_root.is_dir():
         raise ValueError(
@@ -285,7 +323,6 @@ def _enforce_whole_paper_preflight(submission: EvaluatorNodeSubmission) -> None:
             "whole-paper evaluator preflight requires WHOLE_PAPER_STATUS.json to use one of the allowed terminal "
             f"classifications: {sorted(_WHOLE_PAPER_TERMINAL_CLASSIFICATIONS)}"
         )
-    state_root = _derive_state_root_from_submission(submission)
     kernel_state = load_kernel_state(state_root)
     target_payload = dict(kernel_state.nodes.get(submission.target_node_id) or {})
     depends_on = [str(item).strip() for item in list(target_payload.get("depends_on_node_ids") or []) if str(item).strip()]

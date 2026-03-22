@@ -340,6 +340,108 @@ def main() -> int:
         if blocked_recovery_calls or blocked_launch_calls:
             return _fail("authoritative blocked result must not trigger recovery or relaunch")
 
+        workspace_root = ROOT / "workspace" / "test-child-supervision-split-continuation"
+        state_root = ROOT / ".loop" / "test-child-supervision-split-continuation"
+        shutil.rmtree(workspace_root, ignore_errors=True)
+        shutil.rmtree(state_root, ignore_errors=True)
+        bootstrap = bootstrap_first_implementer_node(
+            mode="fresh",
+            task_slug="test-child-supervision-split-continuation",
+            root_goal="bootstrap one implementer node for split-continuation supervision validation",
+            child_goal_slice="stop at an authoritative split-continuation result without attempting orphaned-active recovery",
+            endpoint_artifact_ref=str(endpoint.resolve()),
+            workspace_root=str(workspace_root),
+            state_root=str(state_root),
+            workspace_mirror_relpath="deliverables/primary_artifact",
+            external_publish_target=str((temp_root / "Desktop" / "out-split-continue").resolve()),
+            context_refs=[],
+        )
+
+        node_id = str(bootstrap["node_id"])
+        implementer_result_ref = state_root / "artifacts" / node_id / "implementer_result.json"
+        implementer_result_ref.parent.mkdir(parents=True, exist_ok=True)
+        implementer_result_ref.write_text(
+            json.dumps(
+                {
+                    "schema": "loop_product.implementer_result",
+                    "schema_version": "0.1.0",
+                    "node_id": node_id,
+                    "status": "IN_PROGRESS",
+                    "outcome": "SPLIT_ACCEPTED_CONTINUE_IMPLEMENTATION",
+                    "summary": "authoritative split-continuation result published a deferred split release point",
+                    "split_state": {
+                        "proposed": True,
+                        "accepted": True,
+                        "mode": "deferred",
+                        "accepted_target_nodes": ["child-linear-001"],
+                    },
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        launch_result_ref_split = state_root / "artifacts" / "launches" / node_id / "attempt_001" / "ChildLaunchResult.json"
+        launch_result_ref_split.parent.mkdir(parents=True, exist_ok=True)
+        launch_result_ref_split.write_text(
+            json.dumps(
+                {
+                    "launch_result_ref": str(launch_result_ref_split.resolve()),
+                    "node_id": node_id,
+                    "state_root": str(state_root.resolve()),
+                    "workspace_root": str(workspace_root.resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        split_continuation_recovery_calls: list[dict[str, object]] = []
+        split_continuation_launch_calls: list[str] = []
+
+        def _split_continuation_status_reader(*, result_ref: str | Path, stall_threshold_s: float = 60.0) -> dict[str, object]:
+            return {
+                "launch_result_ref": str(Path(result_ref).resolve()),
+                "status_result_ref": str((temp_root / "split-continuation-status.json").resolve()),
+                "node_id": node_id,
+                "state_root": str(state_root.resolve()),
+                "workspace_root": str(workspace_root.resolve()),
+                "pid_alive": False,
+                "recovery_eligible": False,
+                "stall_threshold_s": stall_threshold_s,
+                "lifecycle_status": "ACTIVE",
+                "runtime_attachment_state": "UNOBSERVED",
+                "recovery_reason": "active_without_live_pid_unconfirmed",
+            }
+
+        def _split_continuation_recovery_runner(**payload):
+            split_continuation_recovery_calls.append(dict(payload))
+            raise AssertionError("split-continuation result must not route into orphaned-active recovery")
+
+        def _split_continuation_launcher(*, result_ref: str | Path, startup_probe_ms: int = 1500, startup_health_timeout_ms: int = 12000):
+            del result_ref, startup_probe_ms, startup_health_timeout_ms
+            split_continuation_launch_calls.append("called")
+            raise AssertionError("split-continuation result must not relaunch")
+
+        split_continuation_result = supervise_child_until_settled(
+            launch_result_ref=launch_result_ref_split,
+            poll_interval_s=0.0,
+            stall_threshold_s=0.0,
+            max_recoveries=1,
+            max_wall_clock_s=0.0,
+            runtime_status_reader=_split_continuation_status_reader,
+            recovery_runner=_split_continuation_recovery_runner,
+            launcher=_split_continuation_launcher,
+            sleep_fn=lambda _: None,
+        )
+        Draft202012Validator(supervision_schema).validate(split_continuation_result)
+        if str(split_continuation_result.get("settled_reason") or "") != "authoritative_result":
+            return _fail("split-continuation result must settle through authoritative-result handling")
+        if split_continuation_recovery_calls or split_continuation_launch_calls:
+            return _fail("split-continuation result must not trigger recovery or relaunch")
+
         workspace_root = ROOT / "workspace" / "test-child-supervision-provider-capacity"
         state_root = ROOT / ".loop" / "test-child-supervision-provider-capacity"
         shutil.rmtree(workspace_root, ignore_errors=True)
