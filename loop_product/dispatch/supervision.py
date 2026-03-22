@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from loop_product.artifact_hygiene import artifact_fingerprint
 from loop_product.dispatch.child_progress_snapshot import child_progress_snapshot_from_launch_result_ref
 from loop_product.dispatch.launch_runtime import terminate_runtime_owned_launch_result_ref
 from loop_product.evaluator_authority import authoritative_result_conflicts_with_inflight_evaluator
@@ -186,6 +188,30 @@ def _load_frozen_handoff(*, state_root: Path, node_id: str, workspace_root: Path
     return _load_optional_json((workspace_root / "FROZEN_HANDOFF.json").resolve())
 
 
+def _artifact_root_candidates(*, workspace_root: Path, handoff: Mapping[str, Any]) -> list[Path]:
+    candidates: list[Path] = []
+    for artifact_ref in (
+        str(handoff.get("workspace_live_artifact_ref") or "").strip(),
+        str(handoff.get("workspace_mirror_ref") or "").strip(),
+    ):
+        if artifact_ref:
+            candidates.append(_absolute(artifact_ref))
+    for artifact_relpath in (
+        str(handoff.get("workspace_live_artifact_relpath") or "").strip(),
+        str(handoff.get("workspace_mirror_relpath") or "").strip(),
+    ):
+        if artifact_relpath:
+            candidates.append((workspace_root / artifact_relpath).resolve())
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        deduped.append(candidate)
+    return deduped
+
+
 def _path_has_nonempty_file(path: Path) -> bool:
     if not path.exists():
         return False
@@ -236,6 +262,15 @@ def _required_workspace_artifact_materialized(snapshot: Mapping[str, Any]) -> bo
     workspace_result_sink_relpath = str(handoff.get("workspace_result_sink_relpath") or "").strip()
     if workspace_result_sink_relpath:
         candidates.append((workspace_root / workspace_result_sink_relpath).resolve())
+    startup_required_output_paths = [
+        str(item).strip() for item in list(handoff.get("startup_required_output_paths") or []) if str(item).strip()
+    ]
+    artifact_root_candidates = _artifact_root_candidates(workspace_root=workspace_root, handoff=handoff)
+    if startup_required_output_paths:
+        for relpath in startup_required_output_paths:
+            if not any(_path_has_nonempty_file((root / relpath).resolve()) for root in artifact_root_candidates):
+                return False
+        return True
     seen: set[Path] = set()
     for candidate in candidates:
         if candidate in seen:
@@ -244,6 +279,38 @@ def _required_workspace_artifact_materialized(snapshot: Mapping[str, Any]) -> bo
         if _path_has_nonempty_file(candidate):
             return True
     return False
+
+
+def _artifact_tree_progress_fingerprint(snapshot: Mapping[str, Any]) -> str:
+    workspace_root_raw = str(snapshot.get("workspace_root") or "").strip()
+    if not workspace_root_raw:
+        return ""
+    workspace_root = _absolute(workspace_root_raw)
+    state_root_raw = str(snapshot.get("state_root") or "").strip()
+    node_id = str(snapshot.get("node_id") or "").strip()
+    if not state_root_raw or not node_id:
+        return ""
+    handoff = _load_frozen_handoff(
+        state_root=_absolute(state_root_raw),
+        node_id=node_id,
+        workspace_root=workspace_root,
+    )
+    digest = hashlib.sha256()
+    observed = False
+    for root in _artifact_root_candidates(workspace_root=workspace_root, handoff=handoff):
+        if not root.exists():
+            continue
+        observed = True
+        fingerprint = artifact_fingerprint(root, ignore_runtime_heavy=True)
+        digest.update(str(root).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(fingerprint.get("artifact_kind") or "").encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(fingerprint.get("fingerprint") or "").encode("utf-8"))
+        digest.update(b"\0")
+    if not observed:
+        return ""
+    return digest.hexdigest()
 
 
 def _startup_reasoning_budget(*, state_root: Path, node_id: str, status: Mapping[str, Any]) -> str:
@@ -311,6 +378,29 @@ def _placeholder_only_progress_snapshot(snapshot: Mapping[str, Any]) -> bool:
     return all(any(marker in line for marker in _PLACEHOLDER_LOG_MARKERS) for line in recent_lines)
 
 
+def _snapshot_has_machine_progress_exemption(snapshot: Mapping[str, Any]) -> bool:
+    if bool(snapshot.get("terminal_result_present")):
+        return True
+    if str(snapshot.get("implementer_result_ref") or "").strip():
+        return True
+    if str(snapshot.get("implementer_outcome") or "").strip():
+        return True
+    if str(snapshot.get("implementer_verdict") or "").strip():
+        return True
+    if str(snapshot.get("evaluator_status") or "").strip():
+        return True
+    for key in (
+        "evaluator_running_unit_ids",
+        "evaluator_completed_unit_ids",
+        "evaluator_blocked_retryable_unit_ids",
+        "evaluator_blocked_terminal_unit_ids",
+        "evaluator_pending_unit_ids",
+    ):
+        if list(snapshot.get(key) or []):
+            return True
+    return False
+
+
 def supervise_child_until_settled(
     *,
     launch_result_ref: str | Path,
@@ -334,6 +424,8 @@ def supervise_child_until_settled(
     placeholder_progress_fingerprint = ""
     placeholder_progress_started_at = 0.0
     empty_required_artifact_started_at = 0.0
+    artifact_progress_fingerprint = ""
+    artifact_progress_started_at = 0.0
     if progress_snapshot_reader is None:
         def _default_progress_snapshot_reader(*, result_ref: str | Path, stall_threshold_s: float = 60.0) -> dict[str, Any]:
             return child_progress_snapshot_from_launch_result_ref(
@@ -425,6 +517,46 @@ def supervise_child_until_settled(
                     return result
             else:
                 empty_required_artifact_started_at = 0.0
+                if not _snapshot_has_machine_progress_exemption(snapshot):
+                    artifact_tree_fingerprint = _artifact_tree_progress_fingerprint(snapshot)
+                    if artifact_tree_fingerprint:
+                        if artifact_tree_fingerprint != artifact_progress_fingerprint:
+                            artifact_progress_fingerprint = artifact_tree_fingerprint
+                            artifact_progress_started_at = observed_at
+                        elif artifact_progress_started_at > 0.0 and (
+                            observed_at - artifact_progress_started_at
+                        ) >= float(no_substantive_progress_window_s):
+                            launch_terminator(result_ref=str(current_launch_result_ref))
+                            status = runtime_status_reader(
+                                result_ref=str(current_launch_result_ref),
+                                stall_threshold_s=stall_threshold_s,
+                            )
+                            if bool(status.get("pid_alive")):
+                                sleep_fn(max(0.05, float(poll_interval_s)))
+                                continue
+                            result = {
+                                "launch_result_ref": str(_absolute(launch_result_ref)),
+                                "latest_launch_result_ref": str(current_launch_result_ref),
+                                "node_id": node_id,
+                                "state_root": str(state_root),
+                                "workspace_root": str(status.get("workspace_root") or ""),
+                                "settled": True,
+                                "settled_reason": "no_substantive_progress",
+                                "recoveries_used": recoveries_used,
+                                "implementer_result_ref": "",
+                                "implementer_outcome": "",
+                                "evaluator_verdict": "",
+                                "status_result_ref": str(status.get("status_result_ref") or ""),
+                                "history": history,
+                            }
+                            validate_repo_object("LoopChildSupervisionResult.schema.json", result)
+                            return result
+                    else:
+                        artifact_progress_fingerprint = ""
+                        artifact_progress_started_at = 0.0
+                else:
+                    artifact_progress_fingerprint = ""
+                    artifact_progress_started_at = 0.0
             if _placeholder_only_progress_snapshot(snapshot):
                 snapshot_fingerprint = _progress_snapshot_fingerprint(snapshot)
                 if snapshot_fingerprint != placeholder_progress_fingerprint:
@@ -463,6 +595,8 @@ def supervise_child_until_settled(
             placeholder_progress_fingerprint = ""
             placeholder_progress_started_at = 0.0
             empty_required_artifact_started_at = 0.0
+            artifact_progress_fingerprint = ""
+            artifact_progress_started_at = 0.0
 
         if classification == "PASS":
             result = {
@@ -596,6 +730,8 @@ def supervise_child_until_settled(
             placeholder_progress_fingerprint = ""
             placeholder_progress_started_at = 0.0
             empty_required_artifact_started_at = 0.0
+            artifact_progress_fingerprint = ""
+            artifact_progress_started_at = 0.0
             continue
 
         if max_wall_clock_s > 0 and (now_fn() - started_at) >= max_wall_clock_s:

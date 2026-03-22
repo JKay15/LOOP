@@ -199,8 +199,11 @@ def _accepted_split_case() -> int:
         source_node = _base_source_node()
         bootstrap_calls: list[dict[str, object]] = []
         launch_calls: list[dict[str, object]] = []
+        supervision_calls: list[dict[str, object]] = []
         original_bootstrap = getattr(topology_module, "bootstrap_first_implementer_node", None)
         original_launch = getattr(topology_module, "launch_child_from_result_ref", None)
+        original_supervision = getattr(topology_module, "ensure_child_supervision_running", None)
+        original_supervision = getattr(topology_module, "ensure_child_supervision_running", None)
 
         def _fake_bootstrap(**kwargs):
             bootstrap_calls.append(dict(kwargs))
@@ -217,10 +220,24 @@ def _accepted_split_case() -> int:
 
         def _fake_launch_child_from_result_ref(**kwargs):
             launch_calls.append(dict(kwargs))
-            return {"launch_decision": "test-only", "source_result_ref": str(kwargs.get("result_ref") or "")}
+            bootstrap_ref = Path(str(kwargs.get("result_ref") or "")).resolve()
+            launch_result_ref = bootstrap_ref.parent / "ChildLaunchResult.json"
+            return {
+                "launch_decision": "test-only",
+                "source_result_ref": str(bootstrap_ref),
+                "launch_result_ref": str(launch_result_ref.resolve()),
+            }
+
+        def _fake_ensure_child_supervision_running(**kwargs):
+            supervision_calls.append(dict(kwargs))
+            return {
+                "launch_result_ref": str(Path(str(kwargs.get("launch_result_ref") or "")).resolve()),
+                "status": "test-only",
+            }
 
         topology_module.bootstrap_first_implementer_node = _fake_bootstrap
         topology_module.launch_child_from_result_ref = _fake_launch_child_from_result_ref
+        topology_module.ensure_child_supervision_running = _fake_ensure_child_supervision_running
         mutation = build_split_request(
             source_node=source_node,
             target_nodes=[
@@ -300,6 +317,8 @@ def _accepted_split_case() -> int:
                 )
             if len(launch_calls) != 2:
                 return _fail("accepted parallel split must immediately materialize a launch attempt for each accepted child")
+            if len(supervision_calls) != 2:
+                return _fail("accepted parallel split must automatically attach committed supervision to each launched child")
             bootstrapped_ids = {str(item.get('node_id') or '') for item in bootstrap_calls}
             if bootstrapped_ids != {"child-review-001", "child-repair-001"}:
                 return _fail("accepted split must bootstrap the exact accepted child ids")
@@ -332,6 +351,10 @@ def _accepted_split_case() -> int:
                 topology_module.launch_child_from_result_ref = original_launch
             else:
                 delattr(topology_module, "launch_child_from_result_ref")
+            if original_supervision is not None:
+                topology_module.ensure_child_supervision_running = original_supervision
+            else:
+                delattr(topology_module, "ensure_child_supervision_running")
 
     return 0
 
@@ -387,8 +410,10 @@ def _parallel_split_with_dependency_bound_child_case() -> int:
         source_node = _base_source_node()
         bootstrap_calls: list[dict[str, object]] = []
         launch_calls: list[dict[str, object]] = []
+        supervision_calls: list[dict[str, object]] = []
         original_bootstrap = getattr(topology_module, "bootstrap_first_implementer_node", None)
         original_launch = getattr(topology_module, "launch_child_from_result_ref", None)
+        original_supervision = getattr(topology_module, "ensure_child_supervision_running", None)
 
         def _fake_bootstrap(**kwargs):
             bootstrap_calls.append(dict(kwargs))
@@ -405,10 +430,24 @@ def _parallel_split_with_dependency_bound_child_case() -> int:
 
         def _fake_launch_child_from_result_ref(**kwargs):
             launch_calls.append(dict(kwargs))
-            return {"launch_decision": "test-only", "source_result_ref": str(kwargs.get("result_ref") or "")}
+            bootstrap_ref = Path(str(kwargs.get("result_ref") or "")).resolve()
+            launch_result_ref = bootstrap_ref.parent / "ChildLaunchResult.json"
+            return {
+                "launch_decision": "test-only",
+                "source_result_ref": str(bootstrap_ref),
+                "launch_result_ref": str(launch_result_ref.resolve()),
+            }
+
+        def _fake_ensure_child_supervision_running(**kwargs):
+            supervision_calls.append(dict(kwargs))
+            return {
+                "launch_result_ref": str(Path(str(kwargs.get("launch_result_ref") or "")).resolve()),
+                "status": "test-only",
+            }
 
         topology_module.bootstrap_first_implementer_node = _fake_bootstrap
         topology_module.launch_child_from_result_ref = _fake_launch_child_from_result_ref
+        topology_module.ensure_child_supervision_running = _fake_ensure_child_supervision_running
         try:
             try:
                 build_split_request(
@@ -467,8 +506,10 @@ def _parallel_split_dependency_gated_prose_rationale_case() -> int:
         source_node = _base_source_node()
         bootstrap_calls: list[dict[str, object]] = []
         launch_calls: list[dict[str, object]] = []
+        supervision_calls: list[dict[str, object]] = []
         original_bootstrap = getattr(topology_module, "bootstrap_first_implementer_node", None)
         original_launch = getattr(topology_module, "launch_child_from_result_ref", None)
+        original_supervision = getattr(topology_module, "ensure_child_supervision_running", None)
 
         def _fake_bootstrap(**kwargs):
             bootstrap_calls.append(dict(kwargs))
@@ -485,10 +526,24 @@ def _parallel_split_dependency_gated_prose_rationale_case() -> int:
 
         def _fake_launch_child_from_result_ref(**kwargs):
             launch_calls.append(dict(kwargs))
-            return {"launch_decision": "test-only", "source_result_ref": str(kwargs.get("result_ref") or "")}
+            bootstrap_ref = Path(str(kwargs.get("result_ref") or "")).resolve()
+            launch_result_ref = bootstrap_ref.parent / "ChildLaunchResult.json"
+            return {
+                "launch_decision": "test-only",
+                "source_result_ref": str(bootstrap_ref),
+                "launch_result_ref": str(launch_result_ref.resolve()),
+            }
+
+        def _fake_ensure_child_supervision_running(**kwargs):
+            supervision_calls.append(dict(kwargs))
+            return {
+                "launch_result_ref": str(Path(str(kwargs.get("launch_result_ref") or "")).resolve()),
+                "status": "test-only",
+            }
 
         topology_module.bootstrap_first_implementer_node = _fake_bootstrap
         topology_module.launch_child_from_result_ref = _fake_launch_child_from_result_ref
+        topology_module.ensure_child_supervision_running = _fake_ensure_child_supervision_running
         mutation = build_split_request(
             source_node=source_node,
             target_nodes=[
@@ -527,6 +582,8 @@ def _parallel_split_dependency_gated_prose_rationale_case() -> int:
                 return _fail("dependency-gated child should remain PLANNED until activation")
             if len(bootstrap_calls) != 1 or len(launch_calls) != 1:
                 return _fail("only the dependency-free child should bootstrap and launch immediately in this case")
+            if len(supervision_calls) != 1:
+                return _fail("only the immediately launched dependency-free child should get committed supervision in this case")
 
             final_state = json.loads((state_root / "state" / "child-final-001.json").read_text(encoding="utf-8"))
             if final_state.get("depends_on_node_ids") != ["child-extraction-001"]:
@@ -544,6 +601,10 @@ def _parallel_split_dependency_gated_prose_rationale_case() -> int:
                 topology_module.launch_child_from_result_ref = original_launch
             else:
                 delattr(topology_module, "launch_child_from_result_ref")
+            if original_supervision is not None:
+                topology_module.ensure_child_supervision_running = original_supervision
+            else:
+                delattr(topology_module, "ensure_child_supervision_running")
 
     return 0
 
@@ -562,8 +623,10 @@ def _split_required_outputs_persist_case() -> int:
         source_node = _base_source_node()
         bootstrap_calls: list[dict[str, object]] = []
         launch_calls: list[dict[str, object]] = []
+        supervision_calls: list[dict[str, object]] = []
         original_bootstrap = getattr(topology_module, "bootstrap_first_implementer_node", None)
         original_launch = getattr(topology_module, "launch_child_from_result_ref", None)
+        original_supervision = getattr(topology_module, "ensure_child_supervision_running", None)
 
         def _fake_bootstrap(**kwargs):
             bootstrap_calls.append(dict(kwargs))
@@ -580,15 +643,33 @@ def _split_required_outputs_persist_case() -> int:
 
         def _fake_launch_child_from_result_ref(**kwargs):
             launch_calls.append(dict(kwargs))
-            return {"launch_decision": "test-only", "source_result_ref": str(kwargs.get("result_ref") or "")}
+            bootstrap_ref = Path(str(kwargs.get("result_ref") or "")).resolve()
+            launch_result_ref = bootstrap_ref.parent / "ChildLaunchResult.json"
+            return {
+                "launch_decision": "test-only",
+                "source_result_ref": str(bootstrap_ref),
+                "launch_result_ref": str(launch_result_ref.resolve()),
+            }
+
+        def _fake_ensure_child_supervision_running(**kwargs):
+            supervision_calls.append(dict(kwargs))
+            return {
+                "launch_result_ref": str(Path(str(kwargs.get("launch_result_ref") or "")).resolve()),
+                "status": "test-only",
+            }
 
         topology_module.bootstrap_first_implementer_node = _fake_bootstrap
         topology_module.launch_child_from_result_ref = _fake_launch_child_from_result_ref
+        topology_module.ensure_child_supervision_running = _fake_ensure_child_supervision_running
         required_output_paths = [
             "formalization/appendix_claim_inventory.json",
             "formalization/appendix_claims.lean",
             "PARTITION/external_dependency_candidates.json",
             "WHOLE_PAPER_STATUS.json",
+        ]
+        startup_required_output_paths = [
+            "README.md",
+            "formalization/appendix_claim_inventory.json",
         ]
         mutation = build_split_request(
             source_node=source_node,
@@ -597,6 +678,7 @@ def _split_required_outputs_persist_case() -> int:
                     "node_id": "child-appendix-001",
                     "goal_slice": "formalize appendix support claims and close named external dependencies",
                     "required_output_paths": required_output_paths,
+                    "startup_required_output_paths": startup_required_output_paths,
                 },
                 {
                     "node_id": "child-followup-001",
@@ -625,12 +707,24 @@ def _split_required_outputs_persist_case() -> int:
             appendix_delegation = json.loads(appendix_delegation_path.read_text(encoding="utf-8"))
             if appendix_state.get("required_output_paths") != required_output_paths:
                 return _fail("accepted split child node state must preserve required_output_paths from the reviewed target payload")
+            if appendix_state.get("startup_required_output_paths") != startup_required_output_paths:
+                return _fail(
+                    "accepted split child node state must preserve startup_required_output_paths from the reviewed target payload"
+                )
             if appendix_delegation.get("required_output_paths") != required_output_paths:
                 return _fail("accepted split child delegation must preserve required_output_paths from the reviewed target payload")
+            if appendix_delegation.get("startup_required_output_paths") != startup_required_output_paths:
+                return _fail(
+                    "accepted split child delegation must preserve startup_required_output_paths from the reviewed target payload"
+                )
             if len(bootstrap_calls) != 1 or len(launch_calls) != 1:
                 return _fail("only the dependency-free required-output child should bootstrap immediately in this case")
+            if len(supervision_calls) != 1:
+                return _fail("required-output split must automatically supervise each immediately launched child")
             if bootstrap_calls[0].get("required_output_paths") != required_output_paths:
                 return _fail("split child bootstrap request must surface required_output_paths for frozen handoff generation")
+            if bootstrap_calls[0].get("startup_required_output_paths") != startup_required_output_paths:
+                return _fail("split child bootstrap request must surface startup_required_output_paths for frozen handoff generation")
             bootstrap_workspace_root = Path(str(bootstrap_calls[0].get("workspace_root") or "")).expanduser().resolve()
             bootstrap_live_relpath = str(bootstrap_calls[0].get("workspace_live_artifact_relpath") or "")
             bootstrap_live_root = (bootstrap_workspace_root / bootstrap_live_relpath).resolve()
@@ -661,6 +755,10 @@ def _split_required_outputs_persist_case() -> int:
                 topology_module.launch_child_from_result_ref = original_launch
             else:
                 delattr(topology_module, "launch_child_from_result_ref")
+            if original_supervision is not None:
+                topology_module.ensure_child_supervision_running = original_supervision
+            else:
+                delattr(topology_module, "ensure_child_supervision_running")
 
     return 0
 

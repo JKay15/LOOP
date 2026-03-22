@@ -136,6 +136,12 @@
         "type": "string"
       }
     },
+    "startup_required_output_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "workspace_root": {
       "type": "string"
     },

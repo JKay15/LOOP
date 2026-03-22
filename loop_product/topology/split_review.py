@@ -105,6 +105,7 @@ def _normalize_target_payloads(
         terminal_authority_scope_raw = target.get("terminal_authority_scope")
         depends_on_raw = target.get("depends_on_node_ids")
         required_output_paths_raw = target.get("required_output_paths")
+        startup_required_output_paths_raw = target.get("startup_required_output_paths")
         explicit_generation = target.get("generation")
         activation_condition_raw = str(target.get("activation_condition") or "").strip()
         activation_rationale = str(target.get("activation_rationale") or "").strip()
@@ -150,6 +151,17 @@ def _normalize_target_payloads(
             resolved_required_output_paths = [str(item).strip() for item in required_output_paths_raw if str(item).strip()]
         else:
             errors.append(f"target {node_id or index} required_output_paths must be a list of strings")
+            continue
+        if startup_required_output_paths_raw in (None, ""):
+            resolved_startup_required_output_paths: list[str] = []
+        elif isinstance(startup_required_output_paths_raw, SequenceABC) and not isinstance(
+            startup_required_output_paths_raw, (str, bytes)
+        ):
+            resolved_startup_required_output_paths = [
+                str(item).strip() for item in startup_required_output_paths_raw if str(item).strip()
+            ]
+        else:
+            errors.append(f"target {node_id or index} startup_required_output_paths must be a list of strings")
             continue
         if explicit_generation not in {None, ""}:
             try:
@@ -200,6 +212,7 @@ def _normalize_target_payloads(
                     TERMINAL_AUTHORITY_SCOPE_SPEC,
                 ),
                 "required_output_paths": resolved_required_output_paths,
+                "startup_required_output_paths": resolved_startup_required_output_paths,
                 "workspace_root": str(target.get("workspace_root") or ""),
                 "codex_home": str(target.get("codex_home") or ""),
                 "depends_on_node_ids": resolved_depends_on,

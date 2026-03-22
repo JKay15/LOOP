@@ -910,7 +910,16 @@ def main() -> int:
             workspace_mirror_relpath="deliverables/primary_artifact",
             external_publish_target=str((temp_root / "Desktop" / "out-empty-workspace").resolve()),
             context_refs=[],
+            startup_required_output_paths=[
+                "README.md",
+                "WHOLE_PAPER_STATUS.json",
+                "extraction/source_structure.json",
+            ],
         )
+
+        startup_live_root = Path(str(bootstrap.get("workspace_live_artifact_ref") or "")).resolve()
+        startup_live_root.mkdir(parents=True, exist_ok=True)
+        (startup_live_root / "notes.txt").write_text("unrelated placeholder\n", encoding="utf-8")
 
         node_id = str(bootstrap["node_id"])
         launch_result_ref_1 = state_root / "artifacts" / "launches" / node_id / "attempt_001" / "ChildLaunchResult.json"
@@ -1024,7 +1033,9 @@ def main() -> int:
         )
         Draft202012Validator(supervision_schema).validate(empty_workspace_result)
         if str(empty_workspace_result.get("settled_reason") or "") != "no_substantive_progress":
-            return _fail("supervision helper must stop a live child that keeps the workspace mirror empty while repeatedly claiming it is writing the first artifact batch")
+            return _fail(
+                "supervision helper must stop a live child whose startup_required_output_paths remain missing even if unrelated files appear under the live artifact root"
+            )
         if not bool(empty_workspace_result.get("settled")):
             return _fail("empty-workspace no-substantive-progress stop points must be settled only after the live child has been stopped")
         if empty_workspace_recovery_calls:
@@ -1326,6 +1337,153 @@ def main() -> int:
             return _fail("non-empty live artifact roots must satisfy required-progress detection even while the publish root is still empty")
         if live_root_recovery_calls or live_root_launch_calls or live_root_terminator_calls:
             return _fail("live-root startup progress must not trigger recovery, relaunch, or termination before the bounded wall clock expires")
+
+        workspace_root = ROOT / "workspace" / "test-child-supervision-post-startup-stagnation"
+        state_root = ROOT / ".loop" / "test-child-supervision-post-startup-stagnation"
+        shutil.rmtree(workspace_root, ignore_errors=True)
+        shutil.rmtree(state_root, ignore_errors=True)
+        bootstrap = bootstrap_first_implementer_node(
+            mode="fresh",
+            task_slug="test-child-supervision-post-startup-stagnation",
+            root_goal="bootstrap one implementer node for post-startup stagnation validation",
+            child_goal_slice="stop truthfully when startup-required outputs are present but the live artifact tree stops changing before any evaluator-backed progress",
+            endpoint_artifact_ref=str(endpoint.resolve()),
+            workspace_root=str(workspace_root),
+            state_root=str(state_root),
+            workspace_mirror_relpath="deliverables/primary_artifact",
+            external_publish_target=str((temp_root / "Desktop" / "out-post-startup-stagnation").resolve()),
+            context_refs=[],
+            startup_required_output_paths=[
+                "README.md",
+                "WHOLE_PAPER_STATUS.json",
+                "analysis/internal_dependency_graph.json",
+            ],
+        )
+
+        node_id = str(bootstrap["node_id"])
+        launch_result_ref_1 = state_root / "artifacts" / "launches" / node_id / "attempt_001" / "ChildLaunchResult.json"
+        launch_result_ref_1.parent.mkdir(parents=True, exist_ok=True)
+        launch_result_ref_1.write_text(
+            json.dumps(
+                {
+                    "launch_result_ref": str(launch_result_ref_1.resolve()),
+                    "launch_decision": "started",
+                    "node_id": node_id,
+                    "state_root": str(state_root.resolve()),
+                    "workspace_root": str(workspace_root.resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        stagnation_live_root = Path(str(bootstrap.get("workspace_live_artifact_ref") or "")).resolve()
+        stagnation_live_root.mkdir(parents=True, exist_ok=True)
+        (stagnation_live_root / "README.md").write_text("# startup batch\n", encoding="utf-8")
+        (stagnation_live_root / "WHOLE_PAPER_STATUS.json").write_text('{"status":"STARTUP"}\n', encoding="utf-8")
+        (stagnation_live_root / "analysis").mkdir(parents=True, exist_ok=True)
+        (stagnation_live_root / "analysis" / "internal_dependency_graph.json").write_text(
+            '{"nodes": [], "edges": []}\n',
+            encoding="utf-8",
+        )
+
+        stagnation_status_calls = {"count": 0}
+        stagnation_recovery_calls: list[dict[str, object]] = []
+        stagnation_launch_calls: list[str] = []
+        stagnation_terminator_calls: list[str] = []
+        stagnation_now = {"t": 5000.0}
+        stagnation_pid_alive = {"value": True}
+
+        def _stagnation_status_reader(*, result_ref: str | Path, stall_threshold_s: float = 60.0) -> dict[str, object]:
+            launch_result_ref = str(Path(result_ref).resolve())
+            stagnation_status_calls["count"] += 1
+            status_ref = temp_root / f"post-startup-stagnation-status-{stagnation_status_calls['count']}.json"
+            return {
+                "launch_result_ref": launch_result_ref,
+                "status_result_ref": str(status_ref.resolve()),
+                "node_id": node_id,
+                "state_root": str(state_root.resolve()),
+                "workspace_root": str(workspace_root.resolve()),
+                "pid_alive": bool(stagnation_pid_alive["value"]),
+                "recovery_eligible": False,
+                "stall_threshold_s": stall_threshold_s,
+                "lifecycle_status": "ACTIVE" if stagnation_pid_alive["value"] else "BLOCKED",
+                "recovery_reason": "live_pid_still_attached",
+                "latest_log_age_s": 0.1,
+            }
+
+        stagnation_snapshot = {
+            "node_id": node_id,
+            "workspace_root": str(workspace_root.resolve()),
+            "state_root": str(state_root.resolve()),
+            "pid_alive": True,
+            "lifecycle_status": "ACTIVE",
+            "phase_hint": "IMPLEMENTING",
+            "terminal_result_present": False,
+            "implementer_result_ref": "",
+            "implementer_outcome": "",
+            "implementer_verdict": "",
+            "implementer_retryable": False,
+            "evaluator_status": "",
+            "evaluator_running_unit_ids": [],
+            "evaluator_completed_unit_ids": [],
+            "evaluator_blocked_retryable_unit_ids": [],
+            "evaluator_blocked_terminal_unit_ids": [],
+            "evaluator_pending_unit_ids": [],
+            "observed_doc_refs": [
+                str((stagnation_live_root / "README.md").resolve()),
+                str((stagnation_live_root / "WHOLE_PAPER_STATUS.json").resolve()),
+                str((stagnation_live_root / "analysis" / "internal_dependency_graph.json").resolve()),
+            ],
+            "recent_log_lines": [
+                "The startup-required extraction batch is already present in the live artifact root.",
+                "I am thinking through the next split boundary before touching any additional artifact files.",
+                "No evaluator has started and no authoritative result exists yet.",
+            ],
+        }
+
+        def _stagnation_snapshot_reader(*, result_ref: str | Path, stall_threshold_s: float = 60.0) -> dict[str, object]:
+            del result_ref, stall_threshold_s
+            return dict(stagnation_snapshot)
+
+        def _stagnation_recovery_runner(**payload):
+            stagnation_recovery_calls.append(dict(payload))
+            return {}
+
+        def _stagnation_launcher(*, result_ref: str | Path, startup_probe_ms: int = 1500, startup_health_timeout_ms: int = 12000):
+            del result_ref, startup_probe_ms, startup_health_timeout_ms
+            stagnation_launch_calls.append("unexpected")
+            return {}
+
+        def _stagnation_terminator(*, result_ref: str | Path):
+            stagnation_terminator_calls.append(str(Path(result_ref).resolve()))
+            stagnation_pid_alive["value"] = False
+
+        stagnation_result = supervise_child_until_settled(
+            launch_result_ref=launch_result_ref_1,
+            poll_interval_s=10.0,
+            stall_threshold_s=60.0,
+            max_recoveries=2,
+            max_wall_clock_s=30.0,
+            runtime_status_reader=_stagnation_status_reader,
+            recovery_runner=_stagnation_recovery_runner,
+            launcher=_stagnation_launcher,
+            launch_terminator=_stagnation_terminator,
+            progress_snapshot_reader=_stagnation_snapshot_reader,
+            no_substantive_progress_window_s=5.0,
+            now_fn=lambda: stagnation_now["t"],
+            sleep_fn=lambda seconds: stagnation_now.__setitem__("t", stagnation_now["t"] + float(seconds)),
+        )
+        Draft202012Validator(supervision_schema).validate(stagnation_result)
+        if str(stagnation_result.get("settled_reason") or "") != "no_substantive_progress":
+            return _fail(
+                "supervision helper must stop a live child once startup_required_output_paths are present but the live artifact tree remains unchanged without evaluator-backed progress"
+            )
+        if stagnation_recovery_calls or stagnation_launch_calls:
+            return _fail("post-startup stagnation must not pretend the child is recovery-eligible or relaunch it automatically")
+        if stagnation_terminator_calls != [str(launch_result_ref_1.resolve())]:
+            return _fail("post-startup stagnation must terminate the live child before returning")
 
     print("[loop-system-child-supervision-helper] OK")
     return 0

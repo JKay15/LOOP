@@ -197,8 +197,10 @@ def _accepted_activation_case() -> int:
         _mark_source_completed(state_root, "child-implementer-001")
         bootstrap_calls: list[dict[str, object]] = []
         launch_calls: list[dict[str, object]] = []
+        supervision_calls: list[dict[str, object]] = []
         original_bootstrap = getattr(topology_module, "bootstrap_first_implementer_node", None)
         original_launch = getattr(topology_module, "launch_child_from_result_ref", None)
+        original_supervision = getattr(topology_module, "ensure_child_supervision_running", None)
 
         def _fake_bootstrap(**kwargs):
             bootstrap_calls.append(dict(kwargs))
@@ -221,11 +223,21 @@ def _accepted_activation_case() -> int:
 
         def _fake_launch(*, result_ref: str | Path, startup_probe_ms: int = 1500, startup_health_timeout_ms: int = 12000):
             del startup_probe_ms, startup_health_timeout_ms
-            launch_calls.append({"result_ref": str(Path(result_ref).resolve())})
-            return {"launch_result_ref": str(Path(result_ref).resolve())}
+            bootstrap_ref = Path(result_ref).resolve()
+            launch_result_ref = bootstrap_ref.parent / "ChildLaunchResult.json"
+            launch_calls.append({"result_ref": str(bootstrap_ref), "launch_result_ref": str(launch_result_ref.resolve())})
+            return {"launch_result_ref": str(launch_result_ref.resolve())}
+
+        def _fake_ensure_child_supervision_running(**kwargs):
+            supervision_calls.append(dict(kwargs))
+            return {
+                "launch_result_ref": str(Path(str(kwargs.get("launch_result_ref") or "")).resolve()),
+                "status": "test-only",
+            }
 
         topology_module.bootstrap_first_implementer_node = _fake_bootstrap
         topology_module.launch_child_from_result_ref = _fake_launch
+        topology_module.ensure_child_supervision_running = _fake_ensure_child_supervision_running
 
         try:
             mutation = build_activate_request(
@@ -256,6 +268,8 @@ def _accepted_activation_case() -> int:
                 return _fail("accepted activation must bootstrap the activated deferred child before returning")
             if len(launch_calls) != 1:
                 return _fail("accepted activation must immediately launch the activated deferred child")
+            if len(supervision_calls) != 1:
+                return _fail("accepted activation must automatically attach committed supervision to the launched deferred child")
 
             child_state_path = state_root / "state" / "child-followup-001.json"
             child_delegation_path = state_root / "state" / "delegations" / "child-followup-001.json"
@@ -278,6 +292,10 @@ def _accepted_activation_case() -> int:
                 topology_module.launch_child_from_result_ref = original_launch
             else:
                 delattr(topology_module, "launch_child_from_result_ref")
+            if original_supervision is not None:
+                topology_module.ensure_child_supervision_running = original_supervision
+            else:
+                delattr(topology_module, "ensure_child_supervision_running")
 
     return 0
 
@@ -333,8 +351,10 @@ def _authoritative_deferred_result_continuation_case() -> int:
         )
         bootstrap_calls: list[dict[str, object]] = []
         launch_calls: list[dict[str, object]] = []
+        supervision_calls: list[dict[str, object]] = []
         original_bootstrap = getattr(topology_module, "bootstrap_first_implementer_node", None)
         original_launch = getattr(topology_module, "launch_child_from_result_ref", None)
+        original_supervision = getattr(topology_module, "ensure_child_supervision_running", None)
 
         def _fake_bootstrap(**kwargs):
             bootstrap_calls.append(dict(kwargs))
@@ -357,11 +377,21 @@ def _authoritative_deferred_result_continuation_case() -> int:
 
         def _fake_launch(*, result_ref: str | Path, startup_probe_ms: int = 1500, startup_health_timeout_ms: int = 12000):
             del startup_probe_ms, startup_health_timeout_ms
-            launch_calls.append({"result_ref": str(Path(result_ref).resolve())})
-            return {"launch_result_ref": str(Path(result_ref).resolve())}
+            bootstrap_ref = Path(result_ref).resolve()
+            launch_result_ref = bootstrap_ref.parent / "ChildLaunchResult.json"
+            launch_calls.append({"result_ref": str(bootstrap_ref), "launch_result_ref": str(launch_result_ref.resolve())})
+            return {"launch_result_ref": str(launch_result_ref.resolve())}
+
+        def _fake_ensure_child_supervision_running(**kwargs):
+            supervision_calls.append(dict(kwargs))
+            return {
+                "launch_result_ref": str(Path(str(kwargs.get("launch_result_ref") or "")).resolve()),
+                "status": "test-only",
+            }
 
         topology_module.bootstrap_first_implementer_node = _fake_bootstrap
         topology_module.launch_child_from_result_ref = _fake_launch
+        topology_module.ensure_child_supervision_running = _fake_ensure_child_supervision_running
         previous_runtime_status_mode = os.environ.get("LOOP_CHILD_RUNTIME_STATUS_MODE")
         os.environ["LOOP_CHILD_RUNTIME_STATUS_MODE"] = "direct"
         try:
@@ -377,6 +407,8 @@ def _authoritative_deferred_result_continuation_case() -> int:
                 return _fail("auto-activated deferred child must appear in active_child_nodes")
             if len(bootstrap_calls) != 1 or len(launch_calls) != 1:
                 return _fail("ready deferred continuation must bootstrap and launch the activated child exactly once")
+            if len(supervision_calls) != 1:
+                return _fail("ready deferred continuation must automatically supervise the activated child")
 
             accepted_envelopes = json.loads((state_root / "state" / "accepted_envelopes.json").read_text(encoding="utf-8"))
             activate_envelopes = [
@@ -399,6 +431,10 @@ def _authoritative_deferred_result_continuation_case() -> int:
                 topology_module.launch_child_from_result_ref = original_launch
             else:
                 delattr(topology_module, "launch_child_from_result_ref")
+            if original_supervision is not None:
+                topology_module.ensure_child_supervision_running = original_supervision
+            else:
+                delattr(topology_module, "ensure_child_supervision_running")
 
     return 0
 
@@ -509,8 +545,10 @@ def _split_continuation_release_activation_case() -> int:
 
         bootstrap_calls: list[dict[str, object]] = []
         launch_calls: list[dict[str, object]] = []
+        supervision_calls: list[dict[str, object]] = []
         original_bootstrap = getattr(topology_module, "bootstrap_first_implementer_node", None)
         original_launch = getattr(topology_module, "launch_child_from_result_ref", None)
+        original_supervision = getattr(topology_module, "ensure_child_supervision_running", None)
 
         def _fake_bootstrap(**kwargs):
             bootstrap_calls.append(dict(kwargs))
@@ -533,11 +571,21 @@ def _split_continuation_release_activation_case() -> int:
 
         def _fake_launch(*, result_ref: str | Path, startup_probe_ms: int = 1500, startup_health_timeout_ms: int = 12000):
             del startup_probe_ms, startup_health_timeout_ms
-            launch_calls.append({"result_ref": str(Path(result_ref).resolve())})
-            return {"launch_result_ref": str(Path(result_ref).resolve())}
+            bootstrap_ref = Path(result_ref).resolve()
+            launch_result_ref = bootstrap_ref.parent / "ChildLaunchResult.json"
+            launch_calls.append({"result_ref": str(bootstrap_ref), "launch_result_ref": str(launch_result_ref.resolve())})
+            return {"launch_result_ref": str(launch_result_ref.resolve())}
+
+        def _fake_ensure_child_supervision_running(**kwargs):
+            supervision_calls.append(dict(kwargs))
+            return {
+                "launch_result_ref": str(Path(str(kwargs.get("launch_result_ref") or "")).resolve()),
+                "status": "test-only",
+            }
 
         topology_module.bootstrap_first_implementer_node = _fake_bootstrap
         topology_module.launch_child_from_result_ref = _fake_launch
+        topology_module.ensure_child_supervision_running = _fake_ensure_child_supervision_running
         previous_runtime_status_mode = os.environ.get("LOOP_CHILD_RUNTIME_STATUS_MODE")
         os.environ["LOOP_CHILD_RUNTIME_STATUS_MODE"] = "direct"
         try:
@@ -549,6 +597,8 @@ def _split_continuation_release_activation_case() -> int:
                 return _fail("split continuation release case must auto-activate the released deferred child")
             if len(bootstrap_calls) != 1 or len(launch_calls) != 1:
                 return _fail("released deferred child must bootstrap and launch exactly once after authoritative sync")
+            if len(supervision_calls) != 1:
+                return _fail("released deferred child must automatically attach committed supervision after launch")
             accepted_envelopes = json.loads((state_root / "state" / "accepted_envelopes.json").read_text(encoding="utf-8"))
             activate_envelopes = [
                 env
@@ -570,6 +620,10 @@ def _split_continuation_release_activation_case() -> int:
                 topology_module.launch_child_from_result_ref = original_launch
             else:
                 delattr(topology_module, "launch_child_from_result_ref")
+            if original_supervision is not None:
+                topology_module.ensure_child_supervision_running = original_supervision
+            else:
+                delattr(topology_module, "ensure_child_supervision_running")
             shutil.rmtree(child_workspace_root, ignore_errors=True)
 
     return 0
@@ -699,8 +753,10 @@ def _dependency_ready_parallel_planned_activation_case() -> int:
 
         bootstrap_calls: list[dict[str, object]] = []
         launch_calls: list[dict[str, object]] = []
+        supervision_calls: list[dict[str, object]] = []
         original_bootstrap = getattr(topology_module, "bootstrap_first_implementer_node", None)
         original_launch = getattr(topology_module, "launch_child_from_result_ref", None)
+        original_supervision = getattr(topology_module, "ensure_child_supervision_running", None)
 
         def _fake_bootstrap(**kwargs):
             bootstrap_calls.append(dict(kwargs))
@@ -723,11 +779,21 @@ def _dependency_ready_parallel_planned_activation_case() -> int:
 
         def _fake_launch(*, result_ref: str | Path, startup_probe_ms: int = 1500, startup_health_timeout_ms: int = 12000):
             del startup_probe_ms, startup_health_timeout_ms
-            launch_calls.append({"result_ref": str(Path(result_ref).resolve())})
-            return {"launch_result_ref": str(Path(result_ref).resolve())}
+            bootstrap_ref = Path(result_ref).resolve()
+            launch_result_ref = bootstrap_ref.parent / "ChildLaunchResult.json"
+            launch_calls.append({"result_ref": str(bootstrap_ref), "launch_result_ref": str(launch_result_ref.resolve())})
+            return {"launch_result_ref": str(launch_result_ref.resolve())}
+
+        def _fake_ensure_child_supervision_running(**kwargs):
+            supervision_calls.append(dict(kwargs))
+            return {
+                "launch_result_ref": str(Path(str(kwargs.get("launch_result_ref") or "")).resolve()),
+                "status": "test-only",
+            }
 
         topology_module.bootstrap_first_implementer_node = _fake_bootstrap
         topology_module.launch_child_from_result_ref = _fake_launch
+        topology_module.ensure_child_supervision_running = _fake_ensure_child_supervision_running
         previous_runtime_status_mode = os.environ.get("LOOP_CHILD_RUNTIME_STATUS_MODE")
         os.environ["LOOP_CHILD_RUNTIME_STATUS_MODE"] = "direct"
         try:
@@ -741,6 +807,8 @@ def _dependency_ready_parallel_planned_activation_case() -> int:
                 return _fail("dependency-ready planned child must leave planned_child_nodes after auto-activation")
             if len(bootstrap_calls) != 1 or len(launch_calls) != 1:
                 return _fail("dependency-ready planned child auto-activation must bootstrap and launch exactly once")
+            if len(supervision_calls) != 1:
+                return _fail("dependency-ready planned child auto-activation must attach committed supervision exactly once")
 
             accepted_envelopes = json.loads((state_root / "state" / "accepted_envelopes.json").read_text(encoding="utf-8"))
             activate_envelopes = [
@@ -763,6 +831,10 @@ def _dependency_ready_parallel_planned_activation_case() -> int:
                 topology_module.launch_child_from_result_ref = original_launch
             else:
                 delattr(topology_module, "launch_child_from_result_ref")
+            if original_supervision is not None:
+                topology_module.ensure_child_supervision_running = original_supervision
+            else:
+                delattr(topology_module, "ensure_child_supervision_running")
             for cleanup_root in cleanup_roots:
                 if cleanup_root.exists():
                     shutil.rmtree(cleanup_root, ignore_errors=True)

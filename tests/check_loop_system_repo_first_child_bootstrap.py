@@ -438,6 +438,7 @@ def main() -> int:
                 "external_publish_target": "",
                 "context_refs": [str(endpoint_artifact.resolve()), str(handoff_md.resolve())],
                 "required_output_paths": ["README.md", "TRACEABILITY.md", "WHOLE_PAPER_STATUS.json"],
+                "startup_required_output_paths": ["README.md", "TRACEABILITY.md"],
                 "result_sink_ref": split_node.result_sink_ref,
             }
             Draft202012Validator(request_schema).validate(split_request)
@@ -451,6 +452,8 @@ def main() -> int:
                 return _fail("split child frozen handoff must persist canonical goal_slice alongside child_goal_slice")
             if list(split_handoff.get("required_outputs") or []) != ["README.md", "TRACEABILITY.md", "WHOLE_PAPER_STATUS.json"]:
                 return _fail("split child frozen handoff must persist canonical required_outputs alongside required_output_paths")
+            if list(split_handoff.get("startup_required_output_paths") or []) != ["README.md", "TRACEABILITY.md"]:
+                return _fail("split child frozen handoff must persist canonical startup_required_output_paths")
             if str(split_handoff.get("artifact_scope") or "") != "slice":
                 return _fail("split child frozen handoff must persist explicit artifact_scope=slice instead of inferring scope from prose")
             if str(split_handoff.get("terminal_authority_scope") or "") != "local":
@@ -674,6 +677,17 @@ def main() -> int:
                 return _fail("whole-paper source handoff must preserve explicit artifact_scope=task")
             if str(whole_paper_handoff_payload.get("terminal_authority_scope") or "") != "whole_paper":
                 return _fail("whole-paper source handoff must preserve explicit terminal_authority_scope=whole_paper")
+            expected_whole_paper_startup_outputs = [
+                "README.md",
+                "WHOLE_PAPER_STATUS.json",
+                "extraction/source_structure.json",
+                "extraction/theorem_inventory.json",
+                "analysis/internal_dependency_graph.json",
+            ]
+            if list(whole_paper_request.get("startup_required_output_paths") or []) != expected_whole_paper_startup_outputs:
+                return _fail("whole-paper endpoint bootstrap must emit a machine-readable startup_required_output_paths contract")
+            if list(whole_paper_handoff_payload.get("startup_required_output_paths") or []) != expected_whole_paper_startup_outputs:
+                return _fail("whole-paper frozen handoff must preserve the startup_required_output_paths contract")
 
             expected_whole_paper_refs = {
                 str(whole_paper_endpoint_artifact.resolve()),

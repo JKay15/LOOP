@@ -7,10 +7,11 @@ import os
 from pathlib import Path
 from typing import Any
 
+from loop_product.child_supervision_sidecar import ensure_child_supervision_running
 from loop_product.control_intent import normalize_activation_condition
 from loop_product.dispatch.bootstrap import bootstrap_first_implementer_node
 from loop_product.dispatch.child_dispatch import materialize_child
-from loop_product.dispatch.launch_runtime import launch_child_from_result_ref
+from loop_product.dispatch.launch_runtime import launch_child_from_result_ref, terminate_runtime_owned_launch_result_ref
 from loop_product.kernel.authority import KernelMutationAuthority, require_kernel_authority
 from loop_product.kernel.state import KernelState, persist_node_snapshot
 from loop_product.protocols.control_envelope import ControlEnvelope
@@ -99,6 +100,9 @@ def _child_bootstrap_request_from_source_handoff(
         "workspace_live_artifact_relpath": workspace_live_artifact_relpath,
         "external_publish_target": str(handoff.get("external_publish_target") or ""),
         "required_output_paths": [str(item).strip() for item in list(child_record.get("required_output_paths") or []) if str(item).strip()],
+        "startup_required_output_paths": [
+            str(item).strip() for item in list(child_record.get("startup_required_output_paths") or []) if str(item).strip()
+        ],
         "context_refs": deduped_context_refs,
         "result_sink_ref": result_sink_ref,
     }
@@ -146,6 +150,7 @@ def _bootstrap_and_launch_parallel_children(
         if not node_id:
             continue
         child_record = dict(kernel_state.nodes.get(node_id) or {})
+        launch_result_ref = ""
         try:
             bootstrap_payload = bootstrap_first_implementer_node(
                 authority=authority,
@@ -155,13 +160,22 @@ def _bootstrap_and_launch_parallel_children(
                     child_record=child_record,
                 ),
             )
-            launch_child_from_result_ref(result_ref=str(bootstrap_payload.get("bootstrap_result_ref") or ""))
+            launch_payload = launch_child_from_result_ref(result_ref=str(bootstrap_payload.get("bootstrap_result_ref") or ""))
+            launch_result_ref = str(launch_payload.get("launch_result_ref") or "").strip()
+            if not launch_result_ref:
+                raise ValueError(f"parallel split child launch did not return launch_result_ref for {node_id}")
+            ensure_child_supervision_running(launch_result_ref=launch_result_ref)
         except Exception as exc:  # noqa: BLE001
+            if launch_result_ref:
+                try:
+                    terminate_runtime_owned_launch_result_ref(result_ref=launch_result_ref)
+                except Exception:
+                    pass
             _mark_split_child_launch_failure(
                 state_root=state_root,
                 kernel_state=kernel_state,
                 node_id=node_id,
-                summary=f"parallel split child bootstrap/launch failed: {exc}",
+                summary=f"parallel split child bootstrap/launch/supervision failed: {exc}",
                 authority=authority,
             )
 
@@ -187,7 +201,18 @@ def _bootstrap_and_launch_activated_child(
             child_record=child_record,
         ),
     )
-    launch_child_from_result_ref(result_ref=str(bootstrap_payload.get("bootstrap_result_ref") or ""))
+    launch_payload = launch_child_from_result_ref(result_ref=str(bootstrap_payload.get("bootstrap_result_ref") or ""))
+    launch_result_ref = str(launch_payload.get("launch_result_ref") or "").strip()
+    if not launch_result_ref:
+        raise ValueError(f"activated child launch did not return launch_result_ref for {child_record.get('node_id')!r}")
+    try:
+        ensure_child_supervision_running(launch_result_ref=launch_result_ref)
+    except Exception:
+        try:
+            terminate_runtime_owned_launch_result_ref(result_ref=launch_result_ref)
+        except Exception:
+            pass
+        raise
 
 
 def review_topology_mutation(
@@ -343,6 +368,7 @@ def apply_accepted_topology_mutation(
             artifact_scope=str(target.get("artifact_scope") or "slice"),
             terminal_authority_scope=str(target.get("terminal_authority_scope") or "local"),
             required_output_paths=list(target.get("required_output_paths") or []),
+            startup_required_output_paths=list(target.get("startup_required_output_paths") or []),
             workspace_root=str(target.get("workspace_root") or ""),
             codex_home=str(target.get("codex_home") or ""),
             depends_on_node_ids=list(target.get("depends_on_node_ids") or []),

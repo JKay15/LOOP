@@ -262,6 +262,7 @@ def _build_handoff_payload(
     workspace_live_artifact_relpath: str,
     external_publish_target: str,
     required_output_paths: list[str],
+    startup_required_output_paths: list[str],
     context_refs: list[str],
     result_sink_ref: str,
     workspace_result_sink_relpath: str,
@@ -305,6 +306,9 @@ def _build_handoff_payload(
         "external_publish_target": external_publish_target,
         "required_output_paths": [str(item).strip() for item in list(required_output_paths or []) if str(item).strip()],
         "required_outputs": [str(item).strip() for item in list(required_output_paths or []) if str(item).strip()],
+        "startup_required_output_paths": [
+            str(item).strip() for item in list(startup_required_output_paths or []) if str(item).strip()
+        ],
         "context_refs": agent_context_refs,
         "result_sink_ref": result_sink_ref,
         "workspace_result_sink_relpath": workspace_result_sink_relpath,
@@ -368,9 +372,15 @@ def _render_handoff_md(payload: dict[str, Any]) -> str:
     ]
     context_refs = [str(item) for item in payload.get("context_refs") or []]
     required_output_paths = [str(item) for item in payload.get("required_output_paths") or [] if str(item).strip()]
+    startup_required_output_paths = [
+        str(item) for item in payload.get("startup_required_output_paths") or [] if str(item).strip()
+    ]
     if required_output_paths:
         lines.extend(["", "## Required Outputs", ""])
         lines.extend(f"- `{item}`" for item in required_output_paths)
+    if startup_required_output_paths:
+        lines.extend(["", "## Startup Required Outputs", ""])
+        lines.extend(f"- `{item}`" for item in startup_required_output_paths)
     if context_refs:
         lines.extend(["", "## Context Refs", ""])
         lines.extend(f"- `{item}`" for item in context_refs)
@@ -418,6 +428,7 @@ def _render_child_prompt(
             "Build in the live artifact root first and treat the workspace mirror as publish-only.",
             "Publish through the exact publication runner before evaluator or terminal report.",
             "A child-authored WHOLE_PAPER_STATUS.json or branch README is not a publication receipt.",
+            "If the frozen handoff declares startup required outputs, materialize that exact first batch under the live artifact root before treating the node as substantively underway.",
             *slice_scope_guard_lines,
             "Do not inspect sibling workspace task folders or historical deliverables as templates, evidence, or reuse context unless the frozen handoff explicitly names that exact reuse target.",
             "When this prompt names a committed repo-shipped wrapper or helper, call it directly before reading its source or tests unless the direct path fails.",
@@ -700,6 +711,9 @@ def _normalize_bootstrap_request(payload: dict[str, Any]) -> dict[str, Any]:
         "external_publish_target": _nonempty(payload.get("external_publish_target")),
         "context_refs": [str(item) for item in (payload.get("context_refs") or [])],
         "required_output_paths": [str(item).strip() for item in (payload.get("required_output_paths") or []) if str(item).strip()],
+        "startup_required_output_paths": [
+            str(item).strip() for item in (payload.get("startup_required_output_paths") or []) if str(item).strip()
+        ],
         "result_sink_ref": _nonempty(payload.get("result_sink_ref")),
     }
     validate_repo_object("LoopFirstImplementerBootstrapRequest.schema.json", normalized)
@@ -771,6 +785,28 @@ def _default_workspace_live_artifact_relpath(workspace_mirror_relpath: str) -> s
     if publish_path.suffix:
         return str(Path(".tmp_primary_artifact") / publish_path.name)
     return ".tmp_primary_artifact"
+
+
+def _default_startup_required_output_paths(*, workflow_scope: str, artifact_scope: str, terminal_authority_scope: str) -> list[str]:
+    normalized_workflow = normalize_machine_choice(workflow_scope, WORKFLOW_SCOPE_SPEC)
+    normalized_artifact_scope = normalize_machine_choice(artifact_scope, ARTIFACT_SCOPE_SPEC)
+    normalized_terminal_scope = normalize_machine_choice(
+        terminal_authority_scope,
+        TERMINAL_AUTHORITY_SCOPE_SPEC,
+    )
+    if (
+        normalized_workflow == "whole_paper_formalization"
+        and normalized_artifact_scope == "task"
+        and normalized_terminal_scope == "whole_paper"
+    ):
+        return [
+            "README.md",
+            "WHOLE_PAPER_STATUS.json",
+            "extraction/source_structure.json",
+            "extraction/theorem_inventory.json",
+            "analysis/internal_dependency_graph.json",
+        ]
+    return []
 
 
 def _render_task_scoped_evaluator_final_effects_text(*, artifact_payload: dict[str, Any], workspace_mirror_ref: str) -> str:
@@ -943,6 +979,7 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
             artifact_scope=request["artifact_scope"],
             terminal_authority_scope=request["terminal_authority_scope"],
             required_output_paths=request["required_output_paths"],
+            startup_required_output_paths=request["startup_required_output_paths"],
             workspace_root=workspace_root,
             result_sink_ref=result_sink_ref,
             authority=authority,
@@ -964,6 +1001,7 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
         child_node.artifact_scope = request["artifact_scope"]
         child_node.terminal_authority_scope = request["terminal_authority_scope"]
         child_node.required_output_paths = list(request["required_output_paths"])
+        child_node.startup_required_output_paths = list(request["startup_required_output_paths"])
         kernel_state.register_node(child_node)
         persist_kernel_state(state_root, kernel_state, authority=authority)
         validate_repo_object("LoopSystemNodeSpec.schema.json", child_node.to_dict())
@@ -1023,6 +1061,7 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
         workspace_live_artifact_relpath=workspace_live_artifact_relpath,
         external_publish_target=request["external_publish_target"],
         required_output_paths=request["required_output_paths"],
+        startup_required_output_paths=request["startup_required_output_paths"],
         context_refs=request["context_refs"],
         result_sink_ref=result_sink_ref,
         workspace_result_sink_relpath=workspace_result_sink_relpath,
@@ -1133,6 +1172,11 @@ def bootstrap_first_implementer_from_endpoint(*, authority: KernelMutationAuthor
         ),
         "external_publish_target": external_publish_target,
         "context_refs": context_refs,
+        "startup_required_output_paths": _default_startup_required_output_paths(
+            workflow_scope=workflow_scope,
+            artifact_scope="task",
+            terminal_authority_scope="whole_paper" if workflow_scope == "whole_paper_formalization" else "local",
+        ),
         "result_sink_ref": _nonempty(payload.get("result_sink_ref")),
     }
     return bootstrap_first_implementer_node(authority=authority, **request)

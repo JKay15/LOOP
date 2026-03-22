@@ -56,6 +56,7 @@ class NodeSpec:
     artifact_scope: str = ARTIFACT_SCOPE_SPEC.default_value
     terminal_authority_scope: str = TERMINAL_AUTHORITY_SCOPE_SPEC.default_value
     required_output_paths: list[str] = field(default_factory=list)
+    startup_required_output_paths: list[str] = field(default_factory=list)
     workspace_root: str = ""
     codex_home: str = ""
     depends_on_node_ids: list[str] = field(default_factory=list)
@@ -102,6 +103,9 @@ class NodeSpec:
                 TERMINAL_AUTHORITY_SCOPE_SPEC,
             ),
             required_output_paths=[str(item) for item in (data.get("required_output_paths") or []) if str(item).strip()],
+            startup_required_output_paths=[
+                str(item) for item in (data.get("startup_required_output_paths") or []) if str(item).strip()
+            ],
             workspace_root=str(data.get("workspace_root") or ""),
             codex_home=str(data.get("codex_home") or ""),
             depends_on_node_ids=[str(item) for item in (data.get("depends_on_node_ids") or [])],

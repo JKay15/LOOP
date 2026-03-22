@@ -96,6 +96,12 @@
         "type": "string"
       }
     },
+    "startup_required_output_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "result_sink_ref": {
       "type": "string"
     }
