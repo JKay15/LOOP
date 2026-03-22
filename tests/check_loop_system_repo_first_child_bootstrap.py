@@ -593,8 +593,27 @@ def main() -> int:
             whole_paper_project_name = "test-first-child-bootstrap-whole-paper"
             whole_paper_workspace_root = ROOT / "workspace" / whole_paper_project_name
             whole_paper_state_root = ROOT / ".loop" / whole_paper_project_name
+            whole_paper_source_ref = temp_root / "whole_paper_source" / "main.tex"
             shutil.rmtree(whole_paper_workspace_root, ignore_errors=True)
             shutil.rmtree(whole_paper_state_root, ignore_errors=True)
+            whole_paper_source_ref.parent.mkdir(parents=True, exist_ok=True)
+            whole_paper_source_ref.write_text(
+                "\n".join(
+                    [
+                        "\\title{Whole Paper Fixture}",
+                        "\\section{Intro}",
+                        "\\begin{definition}\\label{def:calib}",
+                        "Calibration is a property.",
+                        "\\end{definition}",
+                        "\\section{Main Result}",
+                        "\\begin{theorem}\\label{thm:main}",
+                        "Assume Definition~\\ref{def:calib}.",
+                        "\\end{theorem}",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
             whole_paper_endpoint_artifact = temp_root / "WholePaperEndpointArtifact.json"
             whole_paper_endpoint_artifact.write_text(
@@ -608,7 +627,7 @@ def main() -> int:
                         "status": "CLARIFIED",
                         "original_user_prompt": (
                             "Run a whole-paper faithful complete formalization benchmark for "
-                            "/Users/xiongjiangkai/xjk_papers/leanatlas/.cache/leanatlas/tmp/arxiv_2602_11505v2/source/main.tex."
+                            f"{whole_paper_source_ref.resolve()}."
                         ),
                         "confirmed_requirements": [],
                         "denied_requirements": [],
@@ -688,9 +707,34 @@ def main() -> int:
                 return _fail("whole-paper endpoint bootstrap must emit a machine-readable startup_required_output_paths contract")
             if list(whole_paper_handoff_payload.get("startup_required_output_paths") or []) != expected_whole_paper_startup_outputs:
                 return _fail("whole-paper frozen handoff must preserve the startup_required_output_paths contract")
+            whole_paper_live_root = Path(str(whole_paper_bootstrap.get("workspace_live_artifact_ref") or "")).resolve()
+            expected_live_files = [
+                whole_paper_live_root / "README.md",
+                whole_paper_live_root / "WHOLE_PAPER_STATUS.json",
+                whole_paper_live_root / "extraction" / "source_structure.json",
+                whole_paper_live_root / "extraction" / "theorem_inventory.json",
+                whole_paper_live_root / "analysis" / "internal_dependency_graph.json",
+            ]
+            if not all(path.exists() for path in expected_live_files):
+                return _fail("whole-paper endpoint bootstrap must materialize the deterministic startup extraction batch in the live artifact root")
+            source_structure_payload = json.loads((whole_paper_live_root / "extraction" / "source_structure.json").read_text(encoding="utf-8"))
+            theorem_inventory_payload = json.loads((whole_paper_live_root / "extraction" / "theorem_inventory.json").read_text(encoding="utf-8"))
+            dependency_graph_payload = json.loads((whole_paper_live_root / "analysis" / "internal_dependency_graph.json").read_text(encoding="utf-8"))
+            status_payload = json.loads((whole_paper_live_root / "WHOLE_PAPER_STATUS.json").read_text(encoding="utf-8"))
+            if str(source_structure_payload.get("source_tex_ref") or "") != str(whole_paper_source_ref.resolve()):
+                return _fail("whole-paper startup extraction batch must record the exact source TeX ref it parsed")
+            if int(source_structure_payload.get("section_count") or 0) < 2:
+                return _fail("whole-paper startup extraction batch must parse section structure from the source TeX")
+            if int(theorem_inventory_payload.get("theorem_like_count") or 0) < 2:
+                return _fail("whole-paper startup extraction batch must parse theorem-like environments from the source TeX")
+            if not list(dependency_graph_payload.get("edges") or []):
+                return _fail("whole-paper startup extraction batch must emit at least one internal dependency edge when the source TeX contains refs")
+            if not bool(status_payload.get("startup_batch_materialized")):
+                return _fail("whole-paper startup status file must record that the deterministic startup batch was materialized")
 
             expected_whole_paper_refs = {
                 str(whole_paper_endpoint_artifact.resolve()),
+                str(whole_paper_source_ref.resolve()),
                 str(whole_paper_template_ref),
                 str(whole_paper_acceptance_ref),
                 str(whole_paper_doc_pack_ref),

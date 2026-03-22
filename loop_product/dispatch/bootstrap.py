@@ -42,6 +42,29 @@ def _nonempty(value: Any) -> str:
 
 _ABSOLUTE_PATH_RE = re.compile(r"/[A-Za-z0-9._~%+=:@,/-]+")
 _RELATIVE_PATH_RE = re.compile(r"(?:\.\./|\./)?[A-Za-z0-9._-]+(?:/[A-Za-z0-9._~%+=:@,-]+)+")
+_TITLE_RE = re.compile(r"\\title\{([^}]*)\}")
+_SECTION_RE = re.compile(r"\\(section|subsection|subsubsection)\*?\{([^}]*)\}")
+_BEGIN_ENV_RE = re.compile(r"\\begin\{([A-Za-z*]+)\}")
+_END_ENV_RE = re.compile(r"\\end\{([A-Za-z*]+)\}")
+_LABEL_RE = re.compile(r"\\label\{([^}]*)\}")
+_REF_RE = re.compile(r"\\(?:ref|eqref|autoref|cref|Cref)\{([^}]*)\}")
+_CITE_RE = re.compile(r"\\cite[a-zA-Z*]*\{([^}]*)\}")
+_THEOREM_LIKE_ENV_NAMES = frozenset(
+    {
+        "theorem",
+        "lemma",
+        "proposition",
+        "corollary",
+        "definition",
+        "assumption",
+        "remark",
+        "example",
+        "claim",
+        "fact",
+        "observation",
+        "conjecture",
+    }
+)
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -809,6 +832,179 @@ def _default_startup_required_output_paths(*, workflow_scope: str, artifact_scop
     return []
 
 
+def _first_existing_source_tex_ref(context_refs: list[str]) -> Path | None:
+    for raw in context_refs:
+        candidate = Path(str(raw or "")).expanduser()
+        if candidate.suffix.lower() != ".tex":
+            continue
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def _split_latex_csv(raw: str) -> list[str]:
+    return [item.strip() for item in str(raw or "").split(",") if item.strip()]
+
+
+def _parse_whole_paper_source_tex(source_tex_ref: Path) -> dict[str, Any]:
+    text = source_tex_ref.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    title_match = _TITLE_RE.search(text)
+    title = str(title_match.group(1)).strip() if title_match else source_tex_ref.stem
+
+    sections: list[dict[str, Any]] = []
+    theorem_items: list[dict[str, Any]] = []
+    current_item: dict[str, Any] | None = None
+
+    for line_no, line in enumerate(lines, start=1):
+        for match in _SECTION_RE.finditer(line):
+            command = str(match.group(1) or "").strip()
+            sections.append(
+                {
+                    "level": command,
+                    "title": str(match.group(2) or "").strip(),
+                    "line_start": line_no,
+                }
+            )
+
+        if current_item is None:
+            begin_match = _BEGIN_ENV_RE.search(line)
+            if begin_match:
+                env_name = str(begin_match.group(1) or "").strip()
+                if env_name in _THEOREM_LIKE_ENV_NAMES:
+                    current_item = {
+                        "env_name": env_name,
+                        "line_start": line_no,
+                        "line_end": line_no,
+                        "statement_lines": [line],
+                        "labels": [],
+                        "internal_refs": [],
+                        "citations": [],
+                    }
+        else:
+            current_item["line_end"] = line_no
+            current_item["statement_lines"].append(line)
+
+        if current_item is not None:
+            for label_match in _LABEL_RE.finditer(line):
+                label = str(label_match.group(1) or "").strip()
+                if label and label not in current_item["labels"]:
+                    current_item["labels"].append(label)
+            for ref_match in _REF_RE.finditer(line):
+                label = str(ref_match.group(1) or "").strip()
+                if label and label not in current_item["internal_refs"]:
+                    current_item["internal_refs"].append(label)
+            for cite_match in _CITE_RE.finditer(line):
+                for cite_key in _split_latex_csv(str(cite_match.group(1) or "")):
+                    if cite_key not in current_item["citations"]:
+                        current_item["citations"].append(cite_key)
+
+            end_match = _END_ENV_RE.search(line)
+            if end_match and str(end_match.group(1) or "").strip() == str(current_item["env_name"]):
+                labels = list(current_item["labels"])
+                node_id = labels[0] if labels else f"{current_item['env_name']}:{current_item['line_start']}"
+                theorem_items.append(
+                    {
+                        "node_id": node_id,
+                        "env_name": current_item["env_name"],
+                        "label": labels[0] if labels else "",
+                        "line_start": int(current_item["line_start"]),
+                        "line_end": int(current_item["line_end"]),
+                        "statement_tex": "\n".join(current_item["statement_lines"]).strip(),
+                        "internal_refs": list(current_item["internal_refs"]),
+                        "citations": list(current_item["citations"]),
+                    }
+                )
+                current_item = None
+
+    nodes = [
+        {
+            "node_id": item["node_id"],
+            "env_name": item["env_name"],
+            "label": item["label"],
+            "line_start": item["line_start"],
+            "line_end": item["line_end"],
+        }
+        for item in theorem_items
+    ]
+    edges = []
+    seen_edges: set[tuple[str, str]] = set()
+    for item in theorem_items:
+        for ref in list(item["internal_refs"]):
+            edge = (str(item["node_id"]), str(ref))
+            if edge in seen_edges:
+                continue
+            seen_edges.add(edge)
+            edges.append(
+                {
+                    "from_node_id": str(item["node_id"]),
+                    "to_ref": str(ref),
+                }
+            )
+    citation_count = sum(len(list(item["citations"])) for item in theorem_items)
+    return {
+        "title": title,
+        "sections": sections,
+        "theorem_items": theorem_items,
+        "nodes": nodes,
+        "edges": edges,
+        "citation_count": citation_count,
+    }
+
+
+def _materialize_whole_paper_startup_batch(*, live_root: Path, source_tex_ref: Path) -> None:
+    parsed = _parse_whole_paper_source_tex(source_tex_ref)
+    live_root.mkdir(parents=True, exist_ok=True)
+
+    source_structure_payload = {
+        "source_tex_ref": str(source_tex_ref.resolve()),
+        "title": str(parsed["title"]),
+        "section_count": len(list(parsed["sections"])),
+        "sections": list(parsed["sections"]),
+    }
+    theorem_inventory_payload = {
+        "source_tex_ref": str(source_tex_ref.resolve()),
+        "theorem_like_count": len(list(parsed["theorem_items"])),
+        "items": list(parsed["theorem_items"]),
+    }
+    dependency_graph_payload = {
+        "source_tex_ref": str(source_tex_ref.resolve()),
+        "node_count": len(list(parsed["nodes"])),
+        "edge_count": len(list(parsed["edges"])),
+        "nodes": list(parsed["nodes"]),
+        "edges": list(parsed["edges"]),
+    }
+    status_payload = {
+        "workflow_scope": "whole_paper_formalization",
+        "status": "IN_PROGRESS",
+        "startup_batch_materialized": True,
+        "source_tex_ref": str(source_tex_ref.resolve()),
+        "section_count": int(source_structure_payload["section_count"]),
+        "theorem_like_count": int(theorem_inventory_payload["theorem_like_count"]),
+        "internal_dependency_edge_count": int(dependency_graph_payload["edge_count"]),
+        "citation_count": int(parsed["citation_count"]),
+    }
+    readme_text = "\n".join(
+        [
+            "# Whole-Paper Startup Extraction Batch",
+            "",
+            f"- source_tex_ref: `{source_tex_ref.resolve()}`",
+            f"- section_count: `{source_structure_payload['section_count']}`",
+            f"- theorem_like_count: `{theorem_inventory_payload['theorem_like_count']}`",
+            f"- internal_dependency_edge_count: `{dependency_graph_payload['edge_count']}`",
+            f"- citation_count: `{parsed['citation_count']}`",
+            "",
+            "This batch was materialized deterministically from the frozen source TeX before implementer-owned split/formalization work begins.",
+        ]
+    )
+
+    _write_text(live_root / "README.md", readme_text)
+    _write_json(live_root / "WHOLE_PAPER_STATUS.json", status_payload)
+    _write_json(live_root / "extraction" / "source_structure.json", source_structure_payload)
+    _write_json(live_root / "extraction" / "theorem_inventory.json", theorem_inventory_payload)
+    _write_json(live_root / "analysis" / "internal_dependency_graph.json", dependency_graph_payload)
+
+
 def _render_task_scoped_evaluator_final_effects_text(*, artifact_payload: dict[str, Any], workspace_mirror_ref: str) -> str:
     requirement_artifact = dict(artifact_payload.get("requirement_artifact") or {})
     final_effect = _nonempty(requirement_artifact.get("final_effect"))
@@ -1179,4 +1375,17 @@ def bootstrap_first_implementer_from_endpoint(*, authority: KernelMutationAuthor
         ),
         "result_sink_ref": _nonempty(payload.get("result_sink_ref")),
     }
-    return bootstrap_first_implementer_node(authority=authority, **request)
+    result_payload = bootstrap_first_implementer_node(authority=authority, **request)
+    if (
+        workflow_scope == "whole_paper_formalization"
+        and normalize_machine_choice(request["artifact_scope"], ARTIFACT_SCOPE_SPEC) == "task"
+        and normalize_machine_choice(request["terminal_authority_scope"], TERMINAL_AUTHORITY_SCOPE_SPEC) == "whole_paper"
+    ):
+        source_tex_ref = _first_existing_source_tex_ref(context_refs)
+        if source_tex_ref is not None:
+            live_root = Path(str(result_payload.get("workspace_live_artifact_ref") or "")).expanduser().resolve()
+            _materialize_whole_paper_startup_batch(
+                live_root=live_root,
+                source_tex_ref=source_tex_ref,
+            )
+    return result_payload
