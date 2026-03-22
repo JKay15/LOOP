@@ -8,6 +8,13 @@ import json
 from pathlib import Path
 from typing import Any
 
+from loop_product.control_intent import (
+    ARTIFACT_SCOPE_SPEC,
+    TERMINAL_AUTHORITY_SCOPE_SPEC,
+    WORKFLOW_SCOPE_SPEC,
+    normalize_activation_condition,
+    normalize_machine_choice,
+)
 from loop_product.kernel.state import load_kernel_state
 from loop_product.kernel.submit import submit_topology_mutation
 from loop_product.protocols.node import NodeSpec
@@ -35,18 +42,28 @@ def _normalize_target_nodes(raw: Any) -> list[dict[str, Any]]:
         normalized_item = {
             "node_id": node_id,
             "goal_slice": goal_slice,
+            "workflow_scope": normalize_machine_choice(item.get("workflow_scope"), WORKFLOW_SCOPE_SPEC),
+            "artifact_scope": normalize_machine_choice(
+                item.get("artifact_scope") if item.get("artifact_scope") not in (None, "") else "slice",
+                ARTIFACT_SCOPE_SPEC,
+            ),
+            "terminal_authority_scope": normalize_machine_choice(
+                item.get("terminal_authority_scope") if item.get("terminal_authority_scope") not in (None, "") else "local",
+                TERMINAL_AUTHORITY_SCOPE_SPEC,
+            ),
         }
         depends_on = [str(entry).strip() for entry in list(item.get("depends_on_node_ids") or []) if str(entry).strip()]
         if depends_on:
             normalized_item["depends_on_node_ids"] = depends_on
-        activation_condition = str(item.get("activation_condition") or "").strip()
+        activation_condition_raw = str(item.get("activation_condition") or "").strip()
+        activation_condition = normalize_activation_condition(activation_condition_raw)
         activation_rationale = str(item.get("activation_rationale") or "").strip()
-        if activation_condition:
-            if _supported_activation_condition(activation_condition):
+        if activation_condition_raw:
+            if _supported_activation_condition(activation_condition_raw):
                 normalized_item["activation_condition"] = activation_condition
             else:
                 if not activation_rationale:
-                    activation_rationale = activation_condition
+                    activation_rationale = activation_condition_raw
                 if not depends_on:
                     raise ValueError(
                         "proposal.target_nodes[{idx}].activation_condition must use supported "

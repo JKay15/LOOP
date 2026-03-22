@@ -11,7 +11,10 @@
     "endpoint_artifact_ref",
     "workspace_mirror_relpath",
     "external_publish_target",
-    "context_refs"
+    "context_refs",
+    "workflow_scope",
+    "artifact_scope",
+    "terminal_authority_scope"
   ],
   "properties": {
     "mode": {
@@ -35,6 +38,27 @@
     "endpoint_artifact_ref": {
       "type": "string",
       "minLength": 1
+    },
+    "workflow_scope": {
+      "type": "string",
+      "enum": [
+        "generic",
+        "whole_paper_formalization"
+      ]
+    },
+    "artifact_scope": {
+      "type": "string",
+      "enum": [
+        "task",
+        "slice"
+      ]
+    },
+    "terminal_authority_scope": {
+      "type": "string",
+      "enum": [
+        "local",
+        "whole_paper"
+      ]
     },
     "workspace_root": {
       "type": "string"

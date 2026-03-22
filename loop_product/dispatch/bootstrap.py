@@ -7,6 +7,12 @@ import re
 from pathlib import Path
 from typing import Any
 
+from loop_product.control_intent import (
+    ARTIFACT_SCOPE_SPEC,
+    TERMINAL_AUTHORITY_SCOPE_SPEC,
+    WORKFLOW_SCOPE_SPEC,
+    normalize_machine_choice,
+)
 from loop_product.dispatch.child_dispatch import materialize_child
 from loop_product.dispatch.launch_policy import build_codex_cli_child_launch
 from loop_product.kernel.authority import KernelMutationAuthority
@@ -127,27 +133,12 @@ def _path_is_within(path: Path, root: Path) -> bool:
         return False
 
 
-def _looks_like_whole_paper_benchmark(*texts: str) -> bool:
-    haystack = "\n".join(str(item or "") for item in texts).lower()
-    markers = (
-        "whole-paper",
-        "whole paper",
-        "faithful complete formalization",
-        "final integration / final evaluation",
-        "extraction agent",
-        "proof-relevant appendix",
-        "整篇论文",
-    )
-    return any(marker in haystack for marker in markers)
-
-
 def _curate_endpoint_context_refs(
     *,
     refs: list[str],
-    root_goal: str,
-    child_goal_slice: str,
+    workflow_scope: str,
 ) -> list[str]:
-    if not _looks_like_whole_paper_benchmark(root_goal, child_goal_slice):
+    if normalize_machine_choice(workflow_scope, WORKFLOW_SCOPE_SPEC) != "whole_paper_formalization":
         return _dedupe_refs(refs)
 
     repo_root = product_repo_root().resolve()
@@ -262,6 +253,9 @@ def _build_handoff_payload(
     endpoint_artifact_ref: str,
     root_goal: str,
     child_goal_slice: str,
+    workflow_scope: str,
+    artifact_scope: str,
+    terminal_authority_scope: str,
     workspace_root: Path,
     workspace_mirror_relpath: str,
     workspace_live_artifact_relpath: str,
@@ -295,12 +289,20 @@ def _build_handoff_payload(
         "endpoint_artifact_ref": endpoint_artifact_ref,
         "root_goal": root_goal,
         "child_goal_slice": child_goal_slice,
+        "goal_slice": child_goal_slice,
+        "workflow_scope": normalize_machine_choice(workflow_scope, WORKFLOW_SCOPE_SPEC),
+        "artifact_scope": normalize_machine_choice(artifact_scope, ARTIFACT_SCOPE_SPEC),
+        "terminal_authority_scope": normalize_machine_choice(
+            terminal_authority_scope,
+            TERMINAL_AUTHORITY_SCOPE_SPEC,
+        ),
         "workspace_mirror_relpath": workspace_mirror_relpath,
         "workspace_mirror_ref": workspace_mirror_ref,
         "workspace_live_artifact_relpath": workspace_live_artifact_relpath,
         "workspace_live_artifact_ref": workspace_live_artifact_ref,
         "external_publish_target": external_publish_target,
         "required_output_paths": [str(item).strip() for item in list(required_output_paths or []) if str(item).strip()],
+        "required_outputs": [str(item).strip() for item in list(required_output_paths or []) if str(item).strip()],
         "context_refs": list(context_refs),
         "result_sink_ref": result_sink_ref,
         "workspace_result_sink_relpath": workspace_result_sink_relpath,
@@ -606,6 +608,9 @@ def _fresh_result_payload(
         "mode": mode,
         "reuse_decision": reuse_decision,
         "node_id": node.node_id,
+        "workflow_scope": str(node.workflow_scope),
+        "artifact_scope": str(node.artifact_scope),
+        "terminal_authority_scope": str(node.terminal_authority_scope),
         "workspace_root": str(workspace_root.resolve()),
         "state_root": str(state_root.resolve()),
         "node_ref": str((state_root / "state" / f"{node.node_id}.json").resolve()),
@@ -631,6 +636,12 @@ def _normalize_bootstrap_request(payload: dict[str, Any]) -> dict[str, Any]:
         "task_slug": _nonempty(payload.get("task_slug")),
         "root_goal": _nonempty(payload.get("root_goal")),
         "child_goal_slice": _nonempty(payload.get("child_goal_slice")),
+        "workflow_scope": normalize_machine_choice(payload.get("workflow_scope"), WORKFLOW_SCOPE_SPEC),
+        "artifact_scope": normalize_machine_choice(payload.get("artifact_scope"), ARTIFACT_SCOPE_SPEC),
+        "terminal_authority_scope": normalize_machine_choice(
+            payload.get("terminal_authority_scope"),
+            TERMINAL_AUTHORITY_SCOPE_SPEC,
+        ),
         "endpoint_artifact_ref": _nonempty(payload.get("endpoint_artifact_ref")),
         "workspace_root": _nonempty(payload.get("workspace_root")),
         "state_root": _nonempty(payload.get("state_root")),
@@ -684,6 +695,11 @@ def _render_goal_from_endpoint_artifact(artifact_payload: dict[str, Any]) -> tup
         lines.extend(["", "Non-goals:"])
         lines.extend(f"- {item}" for item in non_goals)
     return root_goal, "\n".join(lines)
+
+
+def _workflow_scope_from_endpoint_artifact(artifact_payload: dict[str, Any]) -> str:
+    requirement_artifact = dict(artifact_payload.get("requirement_artifact") or {})
+    return normalize_machine_choice(requirement_artifact.get("workflow_scope"), WORKFLOW_SCOPE_SPEC)
 
 
 def _default_task_slug(*, artifact_payload: dict[str, Any], artifact_path: Path, external_publish_target: str) -> str:
@@ -844,29 +860,8 @@ def _render_slice_scoped_evaluator_manual(
     return "\n".join(lines)
 
 
-def _child_goal_requests_whole_paper_closeout(node: NodeSpec) -> bool:
-    text = f"{node.node_id} {node.goal_slice}".lower()
-    markers = (
-        "final integration",
-        "final evaluation",
-        "final outcome",
-        "whole-paper closeout",
-        "whole paper closeout",
-        "whole-paper terminal",
-        "whole paper terminal",
-        "whole-paper final integration",
-        "whole paper final integration",
-        "whole-paper final outcome",
-        "whole paper final outcome",
-    )
-    return any(marker in text for marker in markers)
-
-
 def _use_whole_paper_evaluator_surface(node: NodeSpec) -> bool:
-    parent = str(node.parent_node_id or "").strip()
-    if parent in {"", "root-kernel"}:
-        return True
-    return _child_goal_requests_whole_paper_closeout(node)
+    return normalize_machine_choice(node.artifact_scope, ARTIFACT_SCOPE_SPEC) != "slice"
 
 
 def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **payload: Any) -> dict[str, Any]:
@@ -899,6 +894,9 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
             execution_policy=implementer_execution_policy(),
             reasoning_profile=implementer_reasoning_profile(),
             budget_profile=implementer_budget_profile(),
+            workflow_scope=request["workflow_scope"],
+            artifact_scope=request["artifact_scope"],
+            terminal_authority_scope=request["terminal_authority_scope"],
             required_output_paths=request["required_output_paths"],
             workspace_root=workspace_root,
             result_sink_ref=result_sink_ref,
@@ -917,6 +915,14 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
         child_node = NodeSpec.from_dict(json.loads(node_path.read_text(encoding="utf-8")))
         if Path(str(child_node.workspace_root)).resolve() != workspace_root.resolve():
             raise ValueError("continue_exact workspace_root does not match the persisted node snapshot")
+        child_node.workflow_scope = request["workflow_scope"]
+        child_node.artifact_scope = request["artifact_scope"]
+        child_node.terminal_authority_scope = request["terminal_authority_scope"]
+        child_node.required_output_paths = list(request["required_output_paths"])
+        kernel_state.register_node(child_node)
+        persist_kernel_state(state_root, kernel_state, authority=authority)
+        validate_repo_object("LoopSystemNodeSpec.schema.json", child_node.to_dict())
+        node_path.write_text(json.dumps(child_node.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
         result_sink_ref = request["result_sink_ref"] or child_node.result_sink_ref
     else:
         raise ValueError(f"unsupported bootstrap mode: {mode!r}")
@@ -959,6 +965,9 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
         endpoint_artifact_ref=request["endpoint_artifact_ref"],
         root_goal=request["root_goal"],
         child_goal_slice=request["child_goal_slice"],
+        workflow_scope=request["workflow_scope"],
+        artifact_scope=request["artifact_scope"],
+        terminal_authority_scope=request["terminal_authority_scope"],
         workspace_root=workspace_root,
         workspace_mirror_relpath=request["workspace_mirror_relpath"],
         workspace_live_artifact_relpath=workspace_live_artifact_relpath,
@@ -1037,6 +1046,7 @@ def bootstrap_first_implementer_from_endpoint(*, authority: KernelMutationAuthor
     workspace_mirror_relpath = _nonempty(payload.get("workspace_mirror_relpath"))
     artifact_path, artifact_payload = _load_endpoint_artifact_payload(endpoint_artifact_ref)
     root_goal, child_goal_slice = _render_goal_from_endpoint_artifact(artifact_payload)
+    workflow_scope = _workflow_scope_from_endpoint_artifact(artifact_payload)
     context_refs = _derive_endpoint_context_refs(
         artifact_path=artifact_path,
         artifact_payload=artifact_payload,
@@ -1044,8 +1054,7 @@ def bootstrap_first_implementer_from_endpoint(*, authority: KernelMutationAuthor
     )
     context_refs = _curate_endpoint_context_refs(
         refs=context_refs,
-        root_goal=root_goal,
-        child_goal_slice=child_goal_slice,
+        workflow_scope=workflow_scope,
     )
     task_slug = _nonempty(payload.get("task_slug")) or _default_task_slug(
         artifact_payload=artifact_payload,
@@ -1057,6 +1066,9 @@ def bootstrap_first_implementer_from_endpoint(*, authority: KernelMutationAuthor
         "task_slug": task_slug,
         "root_goal": root_goal,
         "child_goal_slice": child_goal_slice,
+        "workflow_scope": workflow_scope,
+        "artifact_scope": "task",
+        "terminal_authority_scope": "whole_paper" if workflow_scope == "whole_paper_formalization" else "local",
         "endpoint_artifact_ref": str(artifact_path),
         "workspace_root": _nonempty(payload.get("workspace_root")),
         "state_root": _nonempty(payload.get("state_root")),

@@ -54,6 +54,7 @@ def main() -> int:
                     "turn_count": 1,
                     "requirement_artifact": {
                         "task_type": "formalization",
+                        "workflow_scope": "generic",
                         "sufficient": True,
                         "user_request_summary": "Deliver one local Lean formalization artifact.",
                         "final_effect": "Deliver one local Lean formalization artifact.",

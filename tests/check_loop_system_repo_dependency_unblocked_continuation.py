@@ -32,6 +32,7 @@ def _write_minimal_endpoint_artifact(path: Path) -> None:
         "requirement_artifact": {
             "artifact_ready_for_persistence": True,
             "final_effect": "continue the exact blocked integration node after dependency results are ready",
+            "workflow_scope": "whole_paper_formalization",
             "hard_constraints": ["use committed kernel-reviewed continuation only"],
             "non_goals": ["do not invent replacement node ids"],
             "observable_success_criteria": ["same-node continuation relaunch occurs"],

@@ -41,6 +41,13 @@
         "final_effect": {
           "type": "string"
         },
+        "workflow_scope": {
+          "enum": [
+            "generic",
+            "whole_paper_formalization"
+          ],
+          "type": "string"
+        },
         "hard_constraints": {
           "items": {
             "minLength": 1,
@@ -100,6 +107,7 @@
       "required": [
         "artifact_ready_for_persistence",
         "final_effect",
+        "workflow_scope",
         "hard_constraints",
         "non_goals",
         "observable_success_criteria",

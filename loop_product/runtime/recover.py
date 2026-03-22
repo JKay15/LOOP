@@ -420,6 +420,11 @@ def _same_node_continue_exact_request(*, state_root: Path, source_record: Mappin
         "round_id": round_id,
         "root_goal": root_goal,
         "child_goal_slice": goal_slice,
+        "workflow_scope": str(source_record.get("workflow_scope") or handoff.get("workflow_scope") or "generic"),
+        "artifact_scope": str(source_record.get("artifact_scope") or handoff.get("artifact_scope") or "task"),
+        "terminal_authority_scope": str(
+            source_record.get("terminal_authority_scope") or handoff.get("terminal_authority_scope") or "local"
+        ),
         "endpoint_artifact_ref": endpoint_artifact_ref,
         "workspace_mirror_relpath": str(handoff.get("workspace_mirror_relpath") or "deliverables/primary_artifact"),
         "external_publish_target": str(handoff.get("external_publish_target") or ""),

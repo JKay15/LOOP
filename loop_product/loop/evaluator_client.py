@@ -17,6 +17,12 @@ from loop_product.artifact_hygiene import (
     artifact_fingerprint,
     iter_runtime_heavy_tree_paths,
 )
+from loop_product.control_intent import (
+    ARTIFACT_SCOPE_SPEC,
+    TERMINAL_AUTHORITY_SCOPE_SPEC,
+    WORKFLOW_SCOPE_SPEC,
+    normalize_machine_choice,
+)
 from loop_product.evaluator.agent_execution_policy import validate_evaluator_agent_execution, validate_repo_shipped_role_agent_cmd
 from loop_product.kernel.state import authoritative_node_dependency_ready, load_kernel_state
 from loop_product.kernel.submit import submit_control_envelope
@@ -99,19 +105,6 @@ _WHOLE_PAPER_TERMINAL_CLASSIFICATIONS = {
     "paper defect exposed",
     "external dependency blocked",
 }
-_WHOLE_PAPER_CLOSEOUT_MARKERS = (
-    "final integration",
-    "final evaluation",
-    "final outcome",
-    "whole-paper closeout",
-    "whole paper closeout",
-    "whole-paper terminal",
-    "whole paper terminal",
-    "whole-paper final integration",
-    "whole paper final integration",
-    "whole-paper final outcome",
-    "whole paper final outcome",
-)
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -126,32 +119,26 @@ def _load_optional_json(path: Path) -> dict[str, Any]:
 
 
 def _is_whole_paper_benchmark_submission(submission: EvaluatorNodeSubmission) -> bool:
-    final_effects_ref = str(submission.final_effects_text_ref or "").strip()
-    if not final_effects_ref:
-        return False
-    try:
-        text = Path(final_effects_ref).expanduser().resolve().read_text(encoding="utf-8")
-    except OSError:
-        return False
-    normalized = text.lower()
-    return all(token in normalized for token in _WHOLE_PAPER_TERMINAL_CLASSIFICATIONS)
-
-
-def _submission_target_requests_whole_paper_closeout(submission: EvaluatorNodeSubmission) -> bool:
-    text = f"{submission.target_node_id} {submission.goal_slice}".lower()
-    return any(marker in text for marker in _WHOLE_PAPER_CLOSEOUT_MARKERS)
+    return normalize_machine_choice(submission.workflow_scope, WORKFLOW_SCOPE_SPEC) == "whole_paper_formalization"
 
 
 def _submission_may_use_whole_paper_surface(submission: EvaluatorNodeSubmission, *, state_root: Path | None = None) -> bool:
+    if normalize_machine_choice(submission.artifact_scope, ARTIFACT_SCOPE_SPEC) == "slice":
+        return False
+    if normalize_machine_choice(submission.terminal_authority_scope, TERMINAL_AUTHORITY_SCOPE_SPEC) != "whole_paper":
+        return False
     parent = str(submission.parent_node_id or "").strip()
-    if parent in {"", "root-kernel"}:
+    if parent == "":
         return True
-    if state_root is not None:
-        kernel_state = load_kernel_state(state_root)
-        parent_payload = dict(kernel_state.nodes.get(parent) or {})
-        if str(parent_payload.get("node_kind") or "").strip() == "kernel":
-            return True
-    return _submission_target_requests_whole_paper_closeout(submission)
+    if state_root is None:
+        return parent == "root-kernel"
+    kernel_state = load_kernel_state(state_root)
+    parent_payload = dict(kernel_state.nodes.get(parent) or {})
+    if not parent_payload:
+        return parent == "root-kernel"
+    if str(parent_payload.get("node_kind") or "").strip() == "kernel" and not str(parent_payload.get("parent_node_id") or "").strip():
+        return True
+    return normalize_machine_choice(parent_payload.get("terminal_authority_scope"), TERMINAL_AUTHORITY_SCOPE_SPEC) == "whole_paper"
 
 
 def _whole_paper_terminal_status_path(artifact_root: Path) -> Path:
@@ -651,6 +638,9 @@ def build_evaluator_submission_for_frozen_task(
         round_id=target_node.round_id,
         lineage_ref=target_node.lineage_ref,
         goal_slice=target_node.goal_slice,
+        workflow_scope=target_node.workflow_scope,
+        artifact_scope=target_node.artifact_scope,
+        terminal_authority_scope=target_node.terminal_authority_scope,
         workspace_root=str(normalized_workspace_root),
         output_root=str(normalized_output_root),
         implementation_package_ref=normalized_impl_ref,

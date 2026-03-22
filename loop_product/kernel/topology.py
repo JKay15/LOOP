@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from loop_product.control_intent import normalize_activation_condition
 from loop_product.dispatch.bootstrap import bootstrap_first_implementer_node
 from loop_product.dispatch.child_dispatch import materialize_child
 from loop_product.dispatch.launch_runtime import launch_child_from_result_ref
@@ -87,6 +88,11 @@ def _child_bootstrap_request_from_source_handoff(
         "round_id": round_id,
         "root_goal": root_goal,
         "child_goal_slice": goal_slice,
+        "workflow_scope": str(child_record.get("workflow_scope") or handoff.get("workflow_scope") or "generic"),
+        "artifact_scope": str(child_record.get("artifact_scope") or handoff.get("artifact_scope") or "task"),
+        "terminal_authority_scope": str(
+            child_record.get("terminal_authority_scope") or handoff.get("terminal_authority_scope") or "local"
+        ),
         "endpoint_artifact_ref": endpoint_artifact_ref,
         "workspace_mirror_relpath": workspace_mirror_relpath,
         "workspace_live_artifact_relpath": workspace_live_artifact_relpath,
@@ -123,30 +129,7 @@ def _mark_split_child_launch_failure(
 
 
 def _activation_condition_blocks_immediate_parallel_launch(activation_condition: str) -> bool:
-    text = str(activation_condition or "").strip()
-    if not text:
-        return False
-    normalized = text.lower()
-    immediate_prefixes = (
-        "may start immediately",
-        "start immediately",
-        "may launch immediately",
-        "launch immediately",
-        "can start immediately",
-        "can launch immediately",
-    )
-    if normalized.startswith(immediate_prefixes):
-        return False
-    if normalized.startswith("after:"):
-        return True
-    blocking_markers = (
-        "only after",
-        "until ",
-        "wait until",
-        "wait for",
-        "blocked until",
-    )
-    return any(marker in normalized for marker in blocking_markers)
+    return bool(normalize_activation_condition(activation_condition))
 
 
 def _bootstrap_and_launch_parallel_children(
@@ -355,11 +338,14 @@ def apply_accepted_topology_mutation(
             node_kind=str(target.get("node_kind") or "implementer"),
             generation=int(target.get("generation") or int(source_record.get("generation") or 0) + 1),
             allowed_actions=list(target.get("allowed_actions") or []),
+            workflow_scope=str(target.get("workflow_scope") or source_record.get("workflow_scope") or "generic"),
+            artifact_scope=str(target.get("artifact_scope") or "slice"),
+            terminal_authority_scope=str(target.get("terminal_authority_scope") or "local"),
             required_output_paths=list(target.get("required_output_paths") or []),
             workspace_root=str(target.get("workspace_root") or ""),
             codex_home=str(target.get("codex_home") or ""),
             depends_on_node_ids=list(target.get("depends_on_node_ids") or []),
-            activation_condition=str(target.get("activation_condition") or ""),
+            activation_condition=normalize_activation_condition(target.get("activation_condition")),
             activation_rationale=str(target.get("activation_rationale") or ""),
             result_sink_ref=str(target.get("result_sink_ref") or ""),
             lineage_ref=str(

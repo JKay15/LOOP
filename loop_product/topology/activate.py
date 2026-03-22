@@ -6,6 +6,7 @@ from typing import Any
 
 from pathlib import Path
 
+from loop_product.control_intent import normalize_activation_condition
 from loop_product.kernel.state import (
     ACTIVE_NODE_STATUSES,
     KernelState,
@@ -49,7 +50,7 @@ def _dependency_ready_for_activation(
 
 
 def _condition_satisfied(kernel_state: KernelState, condition: str, *, state_root: Path | None = None) -> tuple[bool, str]:
-    normalized = str(condition or "").strip()
+    normalized = normalize_activation_condition(condition)
     if not normalized:
         return True, ""
     if not normalized.startswith("after:"):
@@ -94,7 +95,7 @@ def review_activate_request(
     source = dict(kernel_state.nodes.get(mutation.source_node_id) or {})
     source_status = str(source.get("status") or "")
     depends_on = [str(item).strip() for item in (source.get("depends_on_node_ids") or []) if str(item).strip()]
-    activation_condition = str(source.get("activation_condition") or "").strip()
+    activation_condition = normalize_activation_condition(source.get("activation_condition"))
     dependency_statuses = {
         node_id: str(dict(kernel_state.nodes.get(node_id) or {}).get("status") or "")
         for node_id in depends_on

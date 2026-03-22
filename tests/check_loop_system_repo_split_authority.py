@@ -53,6 +53,7 @@ def _write_minimal_endpoint_artifact(path: Path) -> None:
         "requirement_artifact": {
             "artifact_ready_for_persistence": True,
             "final_effect": "faithfully formalize the whole paper with no internal gaps",
+            "workflow_scope": "whole_paper_formalization",
             "hard_constraints": ["do not distort the paper"],
             "non_goals": ["do not optimize for split count itself"],
             "observable_success_criteria": ["whole-paper faithful terminal result is explicit"],

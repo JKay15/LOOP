@@ -103,6 +103,12 @@ def main() -> int:
         return _fail("node protocol must serialize runtime_state with default attachment_state=UNOBSERVED")
     if root_node_record.get("depends_on_node_ids") != []:
         return _fail("ordinary node protocol must serialize default depends_on_node_ids=[]")
+    if root_node_record.get("workflow_scope") != "generic":
+        return _fail("ordinary node protocol must serialize default workflow_scope=generic")
+    if root_node_record.get("artifact_scope") != "task":
+        return _fail("ordinary node protocol must serialize default artifact_scope=task")
+    if root_node_record.get("terminal_authority_scope") != "local":
+        return _fail("ordinary node protocol must serialize default terminal_authority_scope=local")
     if root_node_record.get("activation_condition") != "":
         return _fail("ordinary node protocol must serialize default activation_condition=''")
     if root_node_record.get("activation_rationale") != "":

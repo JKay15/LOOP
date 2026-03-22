@@ -6,6 +6,13 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
+from loop_product.control_intent import (
+    ARTIFACT_SCOPE_SPEC,
+    TERMINAL_AUTHORITY_SCOPE_SPEC,
+    WORKFLOW_SCOPE_SPEC,
+    normalize_machine_choice,
+)
+
 
 class EvaluatorVerdict(str, Enum):
     """Fail-closed evaluator verdicts."""
@@ -64,6 +71,9 @@ class EvaluatorNodeSubmission:
     output_root: str
     implementation_package_ref: str
     product_manual_ref: str
+    workflow_scope: str = WORKFLOW_SCOPE_SPEC.default_value
+    artifact_scope: str = ARTIFACT_SCOPE_SPEC.default_value
+    terminal_authority_scope: str = TERMINAL_AUTHORITY_SCOPE_SPEC.default_value
     artifact_publication_receipt_ref: str = ""
     required_output_paths: list[str] = field(default_factory=list)
     final_effects_text_ref: str = ""
@@ -75,6 +85,12 @@ class EvaluatorNodeSubmission:
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
+        data["workflow_scope"] = normalize_machine_choice(self.workflow_scope, WORKFLOW_SCOPE_SPEC)
+        data["artifact_scope"] = normalize_machine_choice(self.artifact_scope, ARTIFACT_SCOPE_SPEC)
+        data["terminal_authority_scope"] = normalize_machine_choice(
+            self.terminal_authority_scope,
+            TERMINAL_AUTHORITY_SCOPE_SPEC,
+        )
         for key in (
             "artifact_publication_receipt_ref",
             "required_output_paths",
@@ -99,6 +115,12 @@ class EvaluatorNodeSubmission:
             round_id=str(data["round_id"]),
             lineage_ref=str(data["lineage_ref"]),
             goal_slice=str(data["goal_slice"]),
+            workflow_scope=normalize_machine_choice(data.get("workflow_scope"), WORKFLOW_SCOPE_SPEC),
+            artifact_scope=normalize_machine_choice(data.get("artifact_scope"), ARTIFACT_SCOPE_SPEC),
+            terminal_authority_scope=normalize_machine_choice(
+                data.get("terminal_authority_scope"),
+                TERMINAL_AUTHORITY_SCOPE_SPEC,
+            ),
             workspace_root=str(data["workspace_root"]),
             output_root=str(data["output_root"]),
             implementation_package_ref=str(data["implementation_package_ref"]),

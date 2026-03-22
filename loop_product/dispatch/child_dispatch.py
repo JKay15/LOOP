@@ -6,6 +6,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+from loop_product.control_intent import (
+    ARTIFACT_SCOPE_SPEC,
+    TERMINAL_AUTHORITY_SCOPE_SPEC,
+    WORKFLOW_SCOPE_SPEC,
+    normalize_machine_choice,
+)
 from loop_product.kernel.authority import KernelMutationAuthority, require_kernel_authority
 from loop_product.kernel.state import KernelState, persist_kernel_state
 from loop_product.protocols.node import NodeSpec, NodeStatus
@@ -45,6 +51,9 @@ def materialize_child(
     node_kind: str = "implementer",
     generation: int | None = None,
     allowed_actions: list[str] | None = None,
+    workflow_scope: str = WORKFLOW_SCOPE_SPEC.default_value,
+    artifact_scope: str = ARTIFACT_SCOPE_SPEC.default_value,
+    terminal_authority_scope: str = TERMINAL_AUTHORITY_SCOPE_SPEC.default_value,
     required_output_paths: list[str] | None = None,
     workspace_root: str | Path | None = None,
     codex_home: str | Path | None = None,
@@ -83,6 +92,12 @@ def materialize_child(
         reasoning_profile=dict(reasoning_profile),
         budget_profile=dict(budget_profile),
         allowed_actions=resolved_allowed_actions,
+        workflow_scope=normalize_machine_choice(workflow_scope, WORKFLOW_SCOPE_SPEC),
+        artifact_scope=normalize_machine_choice(artifact_scope, ARTIFACT_SCOPE_SPEC),
+        terminal_authority_scope=normalize_machine_choice(
+            terminal_authority_scope,
+            TERMINAL_AUTHORITY_SCOPE_SPEC,
+        ),
         required_output_paths=resolved_required_output_paths,
         workspace_root=str(resolved_workspace_root),
         codex_home="",
@@ -106,6 +121,9 @@ def materialize_child(
         "reasoning_profile": dict(node_record["reasoning_profile"]),
         "budget_profile": dict(node_record["budget_profile"]),
         "allowed_actions": list(node.allowed_actions),
+        "workflow_scope": str(node.workflow_scope),
+        "artifact_scope": str(node.artifact_scope),
+        "terminal_authority_scope": str(node.terminal_authority_scope),
         "required_output_paths": list(node.required_output_paths),
         "workspace_root": str(node.workspace_root),
         "codex_home": str(node.codex_home),

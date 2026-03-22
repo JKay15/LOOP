@@ -68,6 +68,7 @@ def main() -> int:
                     "turn_count": 1,
                     "requirement_artifact": {
                         "task_type": "design",
+                        "workflow_scope": "generic",
                         "sufficient": True,
                         "user_request_summary": "Deliver one local birthday poster with offline music playback.",
                         "final_effect": "Deliver one local birthday poster with offline music playback.",

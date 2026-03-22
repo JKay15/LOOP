@@ -12,6 +12,9 @@
     "round_id",
     "lineage_ref",
     "goal_slice",
+    "workflow_scope",
+    "artifact_scope",
+    "terminal_authority_scope",
     "workspace_root",
     "output_root",
     "implementation_package_ref",
@@ -53,6 +56,27 @@
     "goal_slice": {
       "type": "string",
       "minLength": 1
+    },
+    "workflow_scope": {
+      "type": "string",
+      "enum": [
+        "generic",
+        "whole_paper_formalization"
+      ]
+    },
+    "artifact_scope": {
+      "type": "string",
+      "enum": [
+        "task",
+        "slice"
+      ]
+    },
+    "terminal_authority_scope": {
+      "type": "string",
+      "enum": [
+        "local",
+        "whole_paper"
+      ]
     },
     "workspace_root": {
       "type": "string",

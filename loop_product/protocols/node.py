@@ -6,6 +6,13 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
+from loop_product.control_intent import (
+    ARTIFACT_SCOPE_SPEC,
+    TERMINAL_AUTHORITY_SCOPE_SPEC,
+    WORKFLOW_SCOPE_SPEC,
+    normalize_machine_choice,
+)
+
 
 DEFAULT_AGENT_PROVIDER = "codex_cli"
 DEFAULT_SANDBOX_MODE = "danger-full-access"
@@ -45,6 +52,9 @@ class NodeSpec:
     reasoning_profile: dict[str, Any]
     budget_profile: dict[str, Any]
     allowed_actions: list[str] = field(default_factory=list)
+    workflow_scope: str = WORKFLOW_SCOPE_SPEC.default_value
+    artifact_scope: str = ARTIFACT_SCOPE_SPEC.default_value
+    terminal_authority_scope: str = TERMINAL_AUTHORITY_SCOPE_SPEC.default_value
     required_output_paths: list[str] = field(default_factory=list)
     workspace_root: str = ""
     codex_home: str = ""
@@ -61,6 +71,12 @@ class NodeSpec:
         data = asdict(self)
         data["execution_policy"] = normalize_execution_policy(self.execution_policy, node_kind=self.node_kind)
         data["reasoning_profile"] = normalize_reasoning_profile(self.reasoning_profile, node_kind=self.node_kind)
+        data["workflow_scope"] = normalize_machine_choice(self.workflow_scope, WORKFLOW_SCOPE_SPEC)
+        data["artifact_scope"] = normalize_machine_choice(self.artifact_scope, ARTIFACT_SCOPE_SPEC)
+        data["terminal_authority_scope"] = normalize_machine_choice(
+            self.terminal_authority_scope,
+            TERMINAL_AUTHORITY_SCOPE_SPEC,
+        )
         data["runtime_state"] = normalize_runtime_state(self.runtime_state)
         data["status"] = self.status.value
         return data
@@ -79,6 +95,12 @@ class NodeSpec:
             reasoning_profile=normalize_reasoning_profile(dict(data.get("reasoning_profile") or {}), node_kind=node_kind),
             budget_profile=dict(data.get("budget_profile") or {}),
             allowed_actions=list(data.get("allowed_actions") or []),
+            workflow_scope=normalize_machine_choice(data.get("workflow_scope"), WORKFLOW_SCOPE_SPEC),
+            artifact_scope=normalize_machine_choice(data.get("artifact_scope"), ARTIFACT_SCOPE_SPEC),
+            terminal_authority_scope=normalize_machine_choice(
+                data.get("terminal_authority_scope"),
+                TERMINAL_AUTHORITY_SCOPE_SPEC,
+            ),
             required_output_paths=[str(item) for item in (data.get("required_output_paths") or []) if str(item).strip()],
             workspace_root=str(data.get("workspace_root") or ""),
             codex_home=str(data.get("codex_home") or ""),

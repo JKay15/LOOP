@@ -100,6 +100,10 @@ def _refresh_continue_exact_bundle(*, state_root: Path, node: NodeSpec, workspac
         "task_slug": str(kernel_state.task_id or state_root.name or node.node_id),
         "root_goal": _nonempty(handoff_payload.get("root_goal")) or str(kernel_state.root_goal or node.goal_slice),
         "child_goal_slice": _nonempty(handoff_payload.get("child_goal_slice")) or str(node.goal_slice or ""),
+        "workflow_scope": _nonempty(handoff_payload.get("workflow_scope")) or str(node.workflow_scope or "generic"),
+        "artifact_scope": _nonempty(handoff_payload.get("artifact_scope")) or str(node.artifact_scope or "task"),
+        "terminal_authority_scope": _nonempty(handoff_payload.get("terminal_authority_scope"))
+        or str(node.terminal_authority_scope or "local"),
         "endpoint_artifact_ref": _nonempty(handoff_payload.get("endpoint_artifact_ref")),
         "workspace_root": str(workspace_root.resolve()),
         "state_root": str(state_root.resolve()),

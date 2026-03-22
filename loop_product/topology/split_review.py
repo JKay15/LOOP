@@ -5,6 +5,14 @@ from __future__ import annotations
 from collections.abc import Sequence as SequenceABC
 from typing import Any, Mapping, Sequence
 
+from loop_product.control_intent import (
+    ARTIFACT_SCOPE_SPEC,
+    TERMINAL_AUTHORITY_SCOPE_SPEC,
+    WORKFLOW_SCOPE_SPEC,
+    is_machine_activation_condition,
+    normalize_activation_condition,
+    normalize_machine_choice,
+)
 from loop_product.kernel.state import ACTIVE_NODE_STATUSES, KernelState
 from loop_product.protocols.node import NodeSpec, normalize_execution_policy, normalize_reasoning_profile
 from loop_product.protocols.topology import TopologyMutation
@@ -37,6 +45,7 @@ def _normalized_split_targets(
         source_generation=source_node.generation,
         source_round_id=source_node.round_id,
         source_node_kind=source_node.node_kind,
+        source_workflow_scope=source_node.workflow_scope,
         source_execution_policy=source_node.execution_policy,
         source_reasoning_profile=source_node.reasoning_profile,
         source_budget_profile=source_node.budget_profile,
@@ -59,21 +68,7 @@ def _target_requires_planned_activation(*, split_mode: str, target_payload: Mapp
 
 def _supported_activation_condition(value: Any) -> bool:
     normalized = str(value or "").strip()
-    if not normalized:
-        return True
-    if not normalized.startswith("after:"):
-        return False
-    parts = normalized.split(":")
-    if len(parts) != 3:
-        return False
-    _, dependency_node_id, requirement = parts
-    dependency_node_id = str(dependency_node_id or "").strip()
-    requirement = str(requirement or "").strip().lower()
-    if not dependency_node_id:
-        return False
-    if requirement in {"terminal", "completed", "failed"}:
-        return True
-    return requirement.startswith("split_accepted_and_") and requirement.endswith("_released")
+    return not normalized or is_machine_activation_condition(normalized)
 
 
 def _normalize_target_payloads(
@@ -82,6 +77,7 @@ def _normalize_target_payloads(
     source_generation: int,
     source_round_id: str,
     source_node_kind: str,
+    source_workflow_scope: str,
     source_execution_policy: Mapping[str, Any],
     source_reasoning_profile: Mapping[str, Any],
     source_budget_profile: Mapping[str, Any],
@@ -104,6 +100,9 @@ def _normalize_target_payloads(
         reasoning_profile_raw = target.get("reasoning_profile") or {}
         budget_profile_raw = target.get("budget_profile") or {}
         allowed_actions_raw = target.get("allowed_actions")
+        workflow_scope_raw = target.get("workflow_scope")
+        artifact_scope_raw = target.get("artifact_scope")
+        terminal_authority_scope_raw = target.get("terminal_authority_scope")
         depends_on_raw = target.get("depends_on_node_ids")
         required_output_paths_raw = target.get("required_output_paths")
         explicit_generation = target.get("generation")
@@ -133,11 +132,10 @@ def _normalize_target_payloads(
         else:
             errors.append(f"target {node_id or index} depends_on_node_ids must be a list of strings")
             continue
-        activation_condition = activation_condition_raw
-        if activation_condition and not _supported_activation_condition(activation_condition):
+        activation_condition = normalize_activation_condition(activation_condition_raw)
+        if activation_condition_raw and not activation_condition:
             if not activation_rationale:
-                activation_rationale = activation_condition
-            activation_condition = ""
+                activation_rationale = activation_condition_raw
             if validate_activation_condition and split_mode != "deferred" and not resolved_depends_on:
                 errors.append(
                     f"target {node_id or index} activation_condition must use supported after:<node_id>:<requirement> syntax "
@@ -189,6 +187,18 @@ def _normalize_target_payloads(
                     **dict(budget_profile_raw),
                 },
                 "allowed_actions": resolved_allowed_actions,
+                "workflow_scope": normalize_machine_choice(
+                    workflow_scope_raw if workflow_scope_raw not in {None, ""} else source_workflow_scope,
+                    WORKFLOW_SCOPE_SPEC,
+                ),
+                "artifact_scope": normalize_machine_choice(
+                    artifact_scope_raw if artifact_scope_raw not in {None, ""} else "slice",
+                    ARTIFACT_SCOPE_SPEC,
+                ),
+                "terminal_authority_scope": normalize_machine_choice(
+                    terminal_authority_scope_raw if terminal_authority_scope_raw not in {None, ""} else "local",
+                    TERMINAL_AUTHORITY_SCOPE_SPEC,
+                ),
                 "required_output_paths": resolved_required_output_paths,
                 "workspace_root": str(target.get("workspace_root") or ""),
                 "codex_home": str(target.get("codex_home") or ""),
@@ -323,6 +333,7 @@ def review_split_request(kernel_state: KernelState, mutation: TopologyMutation) 
         source_generation=source_generation,
         source_round_id=str(source.get("round_id") or "R-unknown"),
         source_node_kind=str(source.get("node_kind") or "implementer"),
+        source_workflow_scope=str(source.get("workflow_scope") or "generic"),
         source_execution_policy=dict(source.get("execution_policy") or {}),
         source_reasoning_profile=dict(source.get("reasoning_profile") or {}),
         source_budget_profile=dict(source.get("budget_profile") or {}),

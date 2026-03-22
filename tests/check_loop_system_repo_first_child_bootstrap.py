@@ -121,6 +121,7 @@ def main() -> int:
                         "turn_count": 1,
                         "requirement_artifact": {
                             "task_type": "design",
+                            "workflow_scope": "generic",
                             "sufficient": True,
                             "user_request_summary": "Deliver a local birthday poster for Gon with offline music playback.",
                             "final_effect": "Deliver a local birthday poster for Gon with offline music playback.",
@@ -150,6 +151,9 @@ def main() -> int:
                 "task_slug": "gon birthday poster",
                 "root_goal": "deliver the gon birthday poster task through one materialized implementer node",
                 "child_goal_slice": "implement the frozen Gon birthday poster and run evaluator before reporting",
+                "workflow_scope": "generic",
+                "artifact_scope": "task",
+                "terminal_authority_scope": "local",
                 "endpoint_artifact_ref": str(endpoint_artifact.resolve()),
                 "workspace_root": str(workspace_root.resolve()),
                 "state_root": str(state_root.resolve()),
@@ -374,7 +378,9 @@ def main() -> int:
             split_node_id = f"{str(result.get('node_id') or '')}__slice"
             split_goal_slice = (
                 "faithfully formalize only the bounded utility appendix slice "
-                "without mutating the whole-paper coverage ledger owned by the source node"
+                "without mutating the whole-paper coverage ledger owned by the source node, "
+                "and produce source-backed closure evidence that lets final integration classify "
+                "the appendix dependency as closed or blocked"
             )
             kernel_state = load_kernel_state(state_root)
             split_node = materialize_child(
@@ -403,6 +409,9 @@ def main() -> int:
                 "task_slug": "gon birthday poster",
                 "root_goal": "deliver the gon birthday poster task through one materialized implementer node",
                 "child_goal_slice": split_goal_slice,
+                "workflow_scope": "generic",
+                "artifact_scope": "slice",
+                "terminal_authority_scope": "local",
                 "endpoint_artifact_ref": str(endpoint_artifact.resolve()),
                 "workspace_root": str(split_workspace_root.resolve()),
                 "state_root": str(state_root.resolve()),
@@ -422,6 +431,14 @@ def main() -> int:
             split_child_prompt = Path(str(split_bootstrap.get("child_prompt_ref") or ""))
             if not split_child_prompt.exists():
                 return _fail("split child bootstrap must materialize a child prompt")
+            if str(split_handoff.get("goal_slice") or "") != split_goal_slice:
+                return _fail("split child frozen handoff must persist canonical goal_slice alongside child_goal_slice")
+            if list(split_handoff.get("required_outputs") or []) != ["README.md", "TRACEABILITY.md", "WHOLE_PAPER_STATUS.json"]:
+                return _fail("split child frozen handoff must persist canonical required_outputs alongside required_output_paths")
+            if str(split_handoff.get("artifact_scope") or "") != "slice":
+                return _fail("split child frozen handoff must persist explicit artifact_scope=slice instead of inferring scope from prose")
+            if str(split_handoff.get("terminal_authority_scope") or "") != "local":
+                return _fail("split child frozen handoff must persist explicit terminal_authority_scope=local instead of guessing whole-paper authority from prose")
             split_bundle_root = (state_root / "artifacts" / "bootstrap" / split_node.node_id).resolve()
             split_submission_ref = str((split_bundle_root / "EvaluatorNodeSubmission.json").resolve())
             split_final_effects_ref = str((split_bundle_root / "EvaluatorFinalEffects.md").resolve())
@@ -432,6 +449,10 @@ def main() -> int:
             split_submission_payload = json.loads(Path(split_submission_ref).read_text(encoding="utf-8"))
             if str(split_submission_payload.get("goal_slice") or "") != split_goal_slice:
                 return _fail("split child evaluator submission must preserve the narrowed slice goal")
+            if str(split_submission_payload.get("artifact_scope") or "") != "slice":
+                return _fail("split child evaluator submission must carry explicit artifact_scope=slice")
+            if str(split_submission_payload.get("terminal_authority_scope") or "") != "local":
+                return _fail("split child evaluator submission must carry explicit terminal_authority_scope=local")
             split_manual_ref = str(split_submission_payload.get("product_manual_ref") or "")
             if not split_manual_ref:
                 return _fail("split child evaluator submission must persist a product_manual_ref")
@@ -569,6 +590,7 @@ def main() -> int:
                         "turn_count": 1,
                         "requirement_artifact": {
                             "task_type": "research",
+                            "workflow_scope": "whole_paper_formalization",
                             "sufficient": True,
                             "user_request_summary": "Whole-paper faithful complete formalization benchmark for arxiv_2602_11505v2.",
                             "final_effect": (
@@ -621,6 +643,14 @@ def main() -> int:
             whole_paper_handoff_json = Path(str(whole_paper_bootstrap.get("handoff_json_ref") or ""))
             whole_paper_handoff_payload = json.loads(whole_paper_handoff_json.read_text(encoding="utf-8"))
             whole_paper_handoff_context_refs = {str(item) for item in list(whole_paper_handoff_payload.get("context_refs") or [])}
+            if str(whole_paper_bootstrap.get("workflow_scope") or "") != "whole_paper_formalization":
+                return _fail("whole-paper endpoint bootstrap must surface explicit workflow_scope instead of relying on prose markers")
+            if str(whole_paper_handoff_payload.get("workflow_scope") or "") != "whole_paper_formalization":
+                return _fail("whole-paper frozen handoff must preserve explicit workflow_scope")
+            if str(whole_paper_handoff_payload.get("artifact_scope") or "") != "task":
+                return _fail("whole-paper source handoff must preserve explicit artifact_scope=task")
+            if str(whole_paper_handoff_payload.get("terminal_authority_scope") or "") != "whole_paper":
+                return _fail("whole-paper source handoff must preserve explicit terminal_authority_scope=whole_paper")
 
             expected_whole_paper_refs = {
                 str(whole_paper_endpoint_artifact.resolve()),

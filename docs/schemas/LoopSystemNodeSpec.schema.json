@@ -14,6 +14,9 @@
     "reasoning_profile",
     "budget_profile",
     "allowed_actions",
+    "workflow_scope",
+    "artifact_scope",
+    "terminal_authority_scope",
     "workspace_root",
     "codex_home",
     "depends_on_node_ids",
@@ -105,6 +108,27 @@
       "items": {
         "type": "string"
       }
+    },
+    "workflow_scope": {
+      "type": "string",
+      "enum": [
+        "generic",
+        "whole_paper_formalization"
+      ]
+    },
+    "artifact_scope": {
+      "type": "string",
+      "enum": [
+        "task",
+        "slice"
+      ]
+    },
+    "terminal_authority_scope": {
+      "type": "string",
+      "enum": [
+        "local",
+        "whole_paper"
+      ]
     },
     "required_output_paths": {
       "type": "array",

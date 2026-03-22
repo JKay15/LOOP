@@ -5,6 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from loop_product.control_intent import (
+    ARTIFACT_SCOPE_SPEC,
+    TERMINAL_AUTHORITY_SCOPE_SPEC,
+    WORKFLOW_SCOPE_SPEC,
+    normalize_machine_choice,
+)
 from loop_product.kernel.state import ACTIVE_NODE_STATUSES, query_kernel_state
 from loop_product.protocols.schema import validate_repo_object
 
@@ -25,6 +31,12 @@ def query_authority_view(state_root: Path) -> dict[str, Any]:
             "parent_node_id": node.get("parent_node_id"),
             "node_kind": str(node.get("node_kind") or ""),
             "goal_slice": str(node.get("goal_slice") or ""),
+            "workflow_scope": normalize_machine_choice(node.get("workflow_scope"), WORKFLOW_SCOPE_SPEC),
+            "artifact_scope": normalize_machine_choice(node.get("artifact_scope"), ARTIFACT_SCOPE_SPEC),
+            "terminal_authority_scope": normalize_machine_choice(
+                node.get("terminal_authority_scope"),
+                TERMINAL_AUTHORITY_SCOPE_SPEC,
+            ),
             "generation": int(node.get("generation") or 0),
             "round_id": str(node.get("round_id") or ""),
             "status": str(node.get("status") or ""),

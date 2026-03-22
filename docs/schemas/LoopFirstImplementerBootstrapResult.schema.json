@@ -7,6 +7,9 @@
     "mode",
     "reuse_decision",
     "node_id",
+    "workflow_scope",
+    "artifact_scope",
+    "terminal_authority_scope",
     "workspace_root",
     "state_root",
     "node_ref",
@@ -42,6 +45,27 @@
     "node_id": {
       "type": "string",
       "minLength": 1
+    },
+    "workflow_scope": {
+      "type": "string",
+      "enum": [
+        "generic",
+        "whole_paper_formalization"
+      ]
+    },
+    "artifact_scope": {
+      "type": "string",
+      "enum": [
+        "task",
+        "slice"
+      ]
+    },
+    "terminal_authority_scope": {
+      "type": "string",
+      "enum": [
+        "local",
+        "whole_paper"
+      ]
     },
     "workspace_root": {
       "type": "string",
