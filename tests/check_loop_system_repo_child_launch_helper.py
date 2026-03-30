@@ -56,6 +56,11 @@ def _run_helper(
 
 
 def main() -> int:
+    from loop_product.ai_launch import _tmux_env
+    from loop_product.kernel.authority import kernel_internal_authority
+    from loop_product.kernel.state import KernelState, ensure_runtime_tree, persist_kernel_state
+    from loop_product.protocols.node import NodeSpec, NodeStatus
+
     script = ROOT / "scripts" / "launch_child_from_result.sh"
     request_schema_path = ROOT / "docs" / "schemas" / "LoopChildLaunchRequest.schema.json"
     result_schema_path = ROOT / "docs" / "schemas" / "LoopChildLaunchResult.schema.json"
@@ -67,13 +72,75 @@ def main() -> int:
     request_schema = json.loads(request_schema_path.read_text(encoding="utf-8"))
     result_schema = json.loads(result_schema_path.read_text(encoding="utf-8"))
 
+    tmux_env = _tmux_env(
+        {
+            "CODEX_HOME": "/tmp/loop-child-codex-home",
+            "CODEX_THREAD_ID": "stale-thread",
+            "HTTP_PROXY": "http://127.0.0.1:7890",
+        }
+    )
+    if tmux_env.get("CODEX_HOME") != "/tmp/loop-child-codex-home":
+        return _fail("tmux bridge env must preserve an explicit child CODEX_HOME override")
+    if "CODEX_THREAD_ID" in tmux_env:
+        return _fail("tmux bridge env must still scrub parent CODEX_THREAD_ID")
+
     workspace_root = ROOT / "workspace" / "test-child-launch-helper"
     state_root = ROOT / ".loop" / "test-child-launch-helper"
     try:
         shutil.rmtree(workspace_root, ignore_errors=True)
         shutil.rmtree(state_root, ignore_errors=True)
         workspace_root.mkdir(parents=True, exist_ok=True)
+        ensure_runtime_tree(state_root)
         (state_root / "artifacts" / "bootstrap").mkdir(parents=True, exist_ok=True)
+
+        kernel_state = KernelState(
+            task_id="wave-system-child-launch-helper",
+            root_goal="validate committed child launch helper semantics",
+            root_node_id="root-kernel",
+        )
+        kernel_state.register_node(
+            NodeSpec(
+                node_id="root-kernel",
+                node_kind="kernel",
+                goal_slice="supervise committed child launch helper validation",
+                parent_node_id=None,
+                generation=0,
+                round_id="R0",
+                execution_policy={"mode": "kernel"},
+                reasoning_profile={"thinking_budget": "medium", "role": "kernel"},
+                budget_profile={"max_rounds": 1},
+                allowed_actions=["dispatch", "submit", "audit"],
+                delegation_ref="",
+                result_sink_ref="artifacts/kernel.json",
+                lineage_ref="root-kernel",
+                status=NodeStatus.ACTIVE,
+            )
+        )
+        def _register_test_child(node_id: str) -> None:
+            kernel_state.register_node(
+                NodeSpec(
+                    node_id=node_id,
+                    node_kind="implementer",
+                    goal_slice=f"validate committed child launch helper behavior for {node_id}",
+                    parent_node_id="root-kernel",
+                    generation=1,
+                    round_id="R1",
+                    execution_policy={"sandbox_mode": "workspace-write", "retry_policy": "bounded"},
+                    reasoning_profile={"thinking_budget": "medium", "role": "implementer"},
+                    budget_profile={"max_rounds": 2},
+                    allowed_actions=["implement", "evaluate", "report"],
+                    delegation_ref=f"state/delegations/{node_id}.json",
+                    result_sink_ref=f"artifacts/{node_id}/result.json",
+                    lineage_ref=f"root-kernel->{node_id}",
+                    status=NodeStatus.ACTIVE,
+                )
+            )
+
+        _register_test_child("test-child-launch-helper")
+        _register_test_child("test-child-launch-helper-live")
+        _register_test_child("test-child-launch-helper-deferred")
+        _register_test_child("test-child-launch-helper-host-zombie")
+        persist_kernel_state(state_root, kernel_state, authority=kernel_internal_authority())
 
         prompt_path = workspace_root / "CHILD_PROMPT.md"
         prompt_text = "PROMPT_PAYLOAD_FROM_CHILD_LAUNCH_HELPER\n"
@@ -109,7 +176,7 @@ def main() -> int:
         fake_result_path = state_root / "artifacts" / "bootstrap" / "FirstImplementerBootstrapResult.json"
         fake_result_path.write_text(json.dumps(deterministic_result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-        proc = _run_helper(script=script, result_ref=fake_result_path, wrapper_path=wrapper_path)
+        proc = _run_helper(script=script, result_ref=fake_result_path, wrapper_path=wrapper_path, startup_probe_ms=150)
         if proc.returncode != 0:
             detail = proc.stderr.strip() or proc.stdout.strip()
             return _fail(f"committed child launch helper wrapper must succeed: {detail}")
@@ -118,7 +185,10 @@ def main() -> int:
         Draft202012Validator(result_schema).validate(result)
 
         if str(result.get("launch_decision") or "") != "exited":
-            return _fail("short deterministic child launch should exit during startup probe")
+            return _fail(
+                "short deterministic child launch should exit during startup probe, "
+                f"got {str(result.get('launch_decision') or '')!r}"
+            )
         if int(result.get("startup_health_timeout_ms") or -1) != 250:
             return _fail("child launch result must preserve the startup health timeout used for classification")
         if str(result.get("source_result_ref") or "") != str(fake_result_path.resolve()):
@@ -167,9 +237,11 @@ def main() -> int:
                             (
                                 "printf 'THREAD=%s\\n' \"${CODEX_THREAD_ID-}\"; "
                                 "printf 'SANDBOX=%s\\n' \"${CODEX_SANDBOX_NETWORK_DISABLED-}\"; "
+                                "printf 'TMUX=%s\\n' \"${TMUX-}\"; "
                                 "printf 'OTEL_SDK=%s\\n' \"${OTEL_SDK_DISABLED-}\"; "
                                 "printf 'OTEL_TRACES=%s\\n' \"${OTEL_TRACES_EXPORTER-}\"; "
-                                "printf 'HTTP_PROXY=%s\\n' \"${http_proxy-}\""
+                                "printf 'HTTP_PROXY=%s\\n' \"${http_proxy-}\"; "
+                                "printf 'CODEX_HOME=%s\\n' \"${CODEX_HOME-}\""
                             ),
                         ],
                         "env": {},
@@ -188,6 +260,7 @@ def main() -> int:
         os.environ["CODEX_SANDBOX_NETWORK_DISABLED"] = "1"
         os.environ["OTEL_SDK_DISABLED"] = "false"
         os.environ["OTEL_TRACES_EXPORTER"] = "otlp"
+        os.environ["TMUX"] = "/tmp/stale-child-launch-tmux"
         os.environ["http_proxy"] = "http://127.0.0.1:7890"
         try:
             sanitized_env_proc = _run_helper(script=script, result_ref=sanitized_env_result_path, wrapper_path=wrapper_path)
@@ -196,6 +269,7 @@ def main() -> int:
             os.environ.pop("CODEX_SANDBOX_NETWORK_DISABLED", None)
             os.environ.pop("OTEL_SDK_DISABLED", None)
             os.environ.pop("OTEL_TRACES_EXPORTER", None)
+            os.environ.pop("TMUX", None)
             os.environ.pop("http_proxy", None)
         if sanitized_env_proc.returncode != 0:
             detail = sanitized_env_proc.stderr.strip() or sanitized_env_proc.stdout.strip()
@@ -210,12 +284,26 @@ def main() -> int:
             return _fail("child launch helper must scrub parent CODEX_THREAD_ID from direct Codex child env")
         if "SANDBOX=\n" not in sanitized_env_stdout:
             return _fail("child launch helper must scrub parent CODEX_SANDBOX_NETWORK_DISABLED from direct Codex child env")
+        if "TMUX=\n" not in sanitized_env_stdout:
+            return _fail("child launch helper must scrub parent TMUX session env from direct Codex child env")
         if "OTEL_SDK=true\n" not in sanitized_env_stdout:
             return _fail("child launch helper must force-disable OTEL SDK in direct Codex child env")
         if "OTEL_TRACES=none\n" not in sanitized_env_stdout:
             return _fail("child launch helper must disable OTEL trace exporter in direct Codex child env")
         if "HTTP_PROXY=http://127.0.0.1:7890\n" not in sanitized_env_stdout:
             return _fail("child launch helper must preserve parent proxy env needed for Codex transport")
+        codex_home_lines = [
+            line for line in sanitized_env_stdout.splitlines() if line.startswith("CODEX_HOME=")
+        ]
+        if len(codex_home_lines) != 1:
+            return _fail("child launch helper must report exactly one CODEX_HOME line")
+        observed_codex_home = str(codex_home_lines[0].split("=", 1)[1] or "").strip()
+        if not observed_codex_home:
+            return _fail("child launch helper must provide a runtime-owned CODEX_HOME for child launches")
+        if Path(observed_codex_home).resolve() == (Path.home() / ".codex").resolve():
+            return _fail("child launch helper must not reuse the host default CODEX_HOME for child runtime state")
+        if not Path(observed_codex_home).exists():
+            return _fail("child launch helper must materialize the isolated child CODEX_HOME before launch")
 
         retry_counter = workspace_root / "retry.counter"
         retry_result_path = state_root / "artifacts" / "bootstrap" / "RetryImplementerBootstrapResult.json"
@@ -425,6 +513,17 @@ def main() -> int:
         attempt_dirs = sorted((state_root / "artifacts" / "launches" / live_node_id).glob("attempt_*"))
         if len(attempt_dirs) != 2:
             return _fail("reused live child launch must only persist one original attempt and one reuse result envelope")
+        reused_again_proc = _run_helper(script=script, result_ref=live_result_path, wrapper_path=wrapper_path, startup_probe_ms=50, startup_health_timeout_ms=250)
+        if reused_again_proc.returncode != 0:
+            detail = reused_again_proc.stderr.strip() or reused_again_proc.stdout.strip()
+            return _fail(f"repeating live child relaunch must stay idempotent: {detail}")
+        reused_again_result = json.loads(reused_again_proc.stdout)
+        Draft202012Validator(result_schema).validate(reused_again_result)
+        if Path(str(reused_again_result.get("launch_result_ref") or "")).resolve() != Path(str(reused_result.get("launch_result_ref") or "")).resolve():
+            return _fail("repeating live child relaunch must reuse the latest existing alias instead of minting another attempt")
+        attempt_dirs = sorted((state_root / "artifacts" / "launches" / live_node_id).glob("attempt_*"))
+        if len(attempt_dirs) != 2:
+            return _fail("idempotent live child relaunch must not create a third attempt alias for the same live pid")
 
         from loop_product import ai_launch as ai_launch_module
         from loop_product import host_child_launch as host_child_launch_module
@@ -575,6 +674,8 @@ def main() -> int:
             bridge_stdout = workspace_root / "bridge-check.stdout.txt"
             bridge_stderr = workspace_root / "bridge-check.stderr.txt"
             bridge_exit_code = workspace_root / "bridge-check.exit_code.txt"
+            os.environ["CODEX_THREAD_ID"] = "test-thread"
+            os.environ["CODEX_SANDBOX_NETWORK_DISABLED"] = "1"
             ai_launch_module._write_tmux_wrapper_script(
                 script_path=wrapper_script,
                 cwd=workspace_root,
@@ -588,7 +689,8 @@ def main() -> int:
             wrapper_text = wrapper_script.read_text(encoding="utf-8")
             if f"> {bridge_stdout.as_posix()}" in wrapper_text or f"2> {bridge_stderr.as_posix()}" in wrapper_text:
                 return _fail("tmux Codex launch wrapper must not redirect stdout/stderr straight into regular files")
-            os.environ["CODEX_THREAD_ID"] = "test-thread"
+            if "unset CODEX_THREAD_ID" not in wrapper_text or "unset CODEX_SANDBOX_NETWORK_DISABLED" not in wrapper_text:
+                return _fail("tmux Codex launch wrapper must explicitly scrub inherited parent CODEX_* session env vars")
             bridged = ai_launch_module.start_ai_launch(
                 cmd=["codex", "exec", "-C", str(workspace_root.resolve()), "-"],
                 cwd=workspace_root,
@@ -620,6 +722,55 @@ def main() -> int:
             ai_launch_module._start_tmux_launch = original_start_tmux_launch
             os.environ.pop("CODEX_THREAD_ID", None)
 
+        original_resolve_tmux_target_session = ai_launch_module._resolve_tmux_target_session
+        original_tmux_subprocess_run = ai_launch_module.subprocess.run
+        try:
+            tmux_commands: list[list[str]] = []
+
+            def _fake_tmux_run(
+                cmd: list[str],
+                text: bool = True,
+                capture_output: bool = True,
+                check: bool = False,
+            ) -> subprocess.CompletedProcess[str]:
+                del text, capture_output, check
+                tmux_commands.append([str(item) for item in cmd])
+                if cmd[:2] == ["tmux", "new-window"]:
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        1,
+                        stdout="",
+                        stderr="no server running on /private/tmp/tmux-501/default",
+                    )
+                if cmd[:2] == ["tmux", "new-session"]:
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        stdout="loop-product-ai 1 %11 43210\n",
+                        stderr="",
+                    )
+                if cmd[:2] == ["tmux", "pipe-pane"]:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            ai_launch_module._resolve_tmux_target_session = lambda: "loop-product-ai"
+            ai_launch_module.subprocess.run = _fake_tmux_run
+            auto_tmux_handle = ai_launch_module._start_tmux_launch(
+                cmd=["codex", "exec", "-C", str(workspace_root.resolve()), "-"],
+                cwd=workspace_root,
+                log_dir=workspace_root / ".artifacts" / "bridge-auto-session",
+                label="bridge-auto-session",
+                env={},
+                stdin_path=prompt_path,
+            )
+            if auto_tmux_handle.mode != "tmux" or auto_tmux_handle.tmux_session_name != "loop-product-ai":
+                return _fail("tmux bridge must bootstrap a dedicated session when no tmux server is running")
+            if [entry[:2] for entry in tmux_commands[:3]] != [["tmux", "new-window"], ["tmux", "new-session"], ["tmux", "pipe-pane"]]:
+                return _fail("tmux bridge must retry through new-session before attaching pane capture when no server exists")
+        finally:
+            ai_launch_module._resolve_tmux_target_session = original_resolve_tmux_target_session
+            ai_launch_module.subprocess.run = original_tmux_subprocess_run
+
         captured: dict[str, object] = {}
         original_observe_startup_health = launch_runtime_module._observe_startup_health
         original_start_ai_launch = launch_runtime_module.start_ai_launch
@@ -635,13 +786,14 @@ def main() -> int:
                 stdin_path: object | None = None,
                 start_new_session: bool = True,
             ) -> object:
-                del cmd, cwd, label, env, stdin_path
+                del cmd, cwd, label, stdin_path
                 log_dir.mkdir(parents=True, exist_ok=True)
                 stdout_path = log_dir / "fake.stdout.txt"
                 stderr_path = log_dir / "fake.stderr.txt"
                 stdout_path.write_text("", encoding="utf-8")
                 stderr_path.write_text("", encoding="utf-8")
                 captured["start_new_session"] = start_new_session
+                captured["env"] = dict(env or {})
                 return ai_launch_module.AiLaunchHandle(
                     mode="direct",
                     cmd=["codex", "exec", "-"],
@@ -669,10 +821,139 @@ def main() -> int:
                 return _fail("child launch helper unit path must preserve a healthy started child")
             if captured.get("start_new_session") is not False:
                 return _fail("committed child launch helper must launch Codex children without start_new_session detaching")
+
+            sticky_transport_request_dir = state_root / "artifacts" / "launches" / "transport-seed" / "attempt_001"
+            sticky_transport_request_dir.mkdir(parents=True, exist_ok=True)
+            sticky_transport_request = sticky_transport_request_dir / "ChildLaunchRequest.json"
+            sticky_transport_request.write_text(
+                json.dumps(
+                    {
+                        "node_id": "transport-seed",
+                        "workspace_root": str(workspace_root.resolve()),
+                        "state_root": str(state_root.resolve()),
+                        "startup_probe_ms": 0,
+                        "startup_health_timeout_ms": 250,
+                        "startup_retry_limit": 0,
+                        "launch_spec": {
+                            "argv": ["codex", "exec", "-"],
+                            "env": {
+                                "HTTP_PROXY": "http://127.0.0.1:7890",
+                                "http_proxy": "http://127.0.0.1:7890",
+                                "ALL_PROXY": "socks5://127.0.0.1:7890",
+                                "all_proxy": "socks5://127.0.0.1:7890",
+                                "NO_PROXY": "localhost,127.0.0.1",
+                                "no_proxy": "localhost,127.0.0.1",
+                            },
+                            "cwd": str(workspace_root.resolve()),
+                            "stdin_path": str(prompt_path.resolve()),
+                        },
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            deferred_result_path = state_root / "artifacts" / "bootstrap" / "DeferredChildBootstrapResult.json"
+            deferred_result_path.write_text(
+                json.dumps(
+                    {
+                        "node_id": "test-child-launch-helper-deferred",
+                        "workspace_root": str(workspace_root.resolve()),
+                        "state_root": str(state_root.resolve()),
+                        "launch_spec": {
+                            "argv": ["/bin/sh", "-lc", "printf READY"],
+                            "env": {},
+                            "cwd": str(workspace_root.resolve()),
+                            "stdin_path": str(prompt_path.resolve()),
+                        },
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            original_proxy_env = {key: os.environ.get(key) for key in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy")}
+            try:
+                for key in original_proxy_env:
+                    os.environ.pop(key, None)
+                captured.clear()
+                deferred_launch = launch_runtime_module.launch_child_from_result_ref(
+                    result_ref=deferred_result_path,
+                    startup_probe_ms=0,
+                )
+            finally:
+                for key, value in original_proxy_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+            if str(deferred_launch.get("launch_decision") or "") != "started":
+                return _fail("deferred child launch with sticky transport env should still start cleanly")
+            sticky_launch_env = dict(captured.get("env") or {})
+            if sticky_launch_env.get("HTTP_PROXY") != "http://127.0.0.1:7890" or sticky_launch_env.get("http_proxy") != "http://127.0.0.1:7890":
+                return _fail("launch helper must reuse runtime-root HTTP proxy env when deferred child launch_spec env is empty")
+            if sticky_launch_env.get("ALL_PROXY") != "socks5://127.0.0.1:7890" or sticky_launch_env.get("all_proxy") != "socks5://127.0.0.1:7890":
+                return _fail("launch helper must reuse runtime-root ALL_PROXY env when deferred child launch_spec env is empty")
+            deferred_request_ref = Path(str(deferred_launch.get("launch_request_ref") or ""))
+            deferred_request_payload = json.loads(deferred_request_ref.read_text(encoding="utf-8"))
+            deferred_request_env = dict((deferred_request_payload.get("launch_spec") or {}).get("env") or {})
+            if deferred_request_env.get("HTTP_PROXY") != "http://127.0.0.1:7890" or deferred_request_env.get("http_proxy") != "http://127.0.0.1:7890":
+                return _fail("persisted deferred child launch request must carry sticky runtime-root HTTP proxy env")
+            if deferred_request_env.get("ALL_PROXY") != "socks5://127.0.0.1:7890" or deferred_request_env.get("all_proxy") != "socks5://127.0.0.1:7890":
+                return _fail("persisted deferred child launch request must carry sticky runtime-root ALL_PROXY env")
         finally:
             launch_runtime_module.start_ai_launch = original_start_ai_launch
             launch_runtime_module._observe_startup_health = original_observe_startup_health
             launch_runtime_module.detach_ai_launch_handle = original_detach_ai_launch_handle
+
+        from loop_product.runtime import launch_surface as launch_surface_module
+        import loop_product.child_supervision_sidecar as sidecar_module
+
+        launch_surface_supervision_calls: list[str] = []
+        original_launch_surface_dispatch = launch_surface_module.dispatch_launch_child_from_result_ref
+        original_launch_surface_ensure = sidecar_module.ensure_child_supervision_running
+        try:
+            def _fake_launch_surface_dispatch(**_kwargs: object) -> dict[str, object]:
+                return {
+                    "launch_decision": "started",
+                    "launch_result_ref": str((state_root / "artifacts" / "launches" / "unit-started" / "attempt_001" / "ChildLaunchResult.json").resolve()),
+                }
+
+            def _fake_launch_surface_ensure(*, launch_result_ref: str) -> dict[str, object]:
+                launch_surface_supervision_calls.append(str(launch_result_ref))
+                return {"launch_result_ref": str(launch_result_ref), "pid": 12345}
+
+            launch_surface_module.dispatch_launch_child_from_result_ref = _fake_launch_surface_dispatch
+            sidecar_module.ensure_child_supervision_running = _fake_launch_surface_ensure
+            started_surface_result = launch_surface_module.launch_child_from_result_ref(result_ref=fake_result_path, startup_probe_ms=25)
+            if str(started_surface_result.get("launch_decision") or "") != "started":
+                return _fail("unified launch surface must preserve started launch payloads")
+            expected_started_launch_ref = str((state_root / "artifacts" / "launches" / "unit-started" / "attempt_001" / "ChildLaunchResult.json").resolve())
+            if launch_surface_supervision_calls != [expected_started_launch_ref]:
+                return _fail("unified launch surface must attach committed supervision for started children")
+
+            launch_surface_supervision_calls.clear()
+
+            def _fake_launch_surface_dispatch_exited(**_kwargs: object) -> dict[str, object]:
+                return {
+                    "launch_decision": "exited",
+                    "launch_result_ref": str((state_root / "artifacts" / "launches" / "unit-exited" / "attempt_001" / "ChildLaunchResult.json").resolve()),
+                }
+
+            launch_surface_module.dispatch_launch_child_from_result_ref = _fake_launch_surface_dispatch_exited
+            exited_surface_result = launch_surface_module.launch_child_from_result_ref(result_ref=fake_result_path, startup_probe_ms=25)
+            if str(exited_surface_result.get("launch_decision") or "") != "exited":
+                return _fail("unified launch surface must preserve exited launch payloads")
+            if launch_surface_supervision_calls:
+                return _fail("unified launch surface must not attach committed supervision for already-exited startup results")
+        finally:
+            launch_surface_module.dispatch_launch_child_from_result_ref = original_launch_surface_dispatch
+            sidecar_module.ensure_child_supervision_running = original_launch_surface_ensure
+
         terminate_result_ref = state_root / "artifacts" / "bootstrap" / "TerminateLaunchResult.json"
         terminate_result_ref.write_text(
             json.dumps(
@@ -691,13 +972,22 @@ def main() -> int:
         )
         terminated_pids: list[int] = []
         original_terminate_pid = launch_runtime_module._terminate_pid
+        original_pid_descendants = getattr(launch_runtime_module, "_pid_descendants", None)
+        original_launch_identity_matches = launch_runtime_module._launch_result_process_identity_matches
         try:
+            launch_runtime_module._pid_descendants = lambda pid: [int(pid) + 1, int(pid) + 2]
             launch_runtime_module._terminate_pid = lambda pid, grace_s=5.0: terminated_pids.append(int(pid))
+            launch_runtime_module._launch_result_process_identity_matches = lambda launch_result: True
             launch_runtime_module.terminate_runtime_owned_launch_result_ref(result_ref=terminate_result_ref)
         finally:
             launch_runtime_module._terminate_pid = original_terminate_pid
-        if terminated_pids != [424242]:
-            return _fail("runtime-owned launch terminator must terminate the recorded pid without crashing")
+            launch_runtime_module._launch_result_process_identity_matches = original_launch_identity_matches
+            if original_pid_descendants is None:
+                delattr(launch_runtime_module, "_pid_descendants")
+            else:
+                launch_runtime_module._pid_descendants = original_pid_descendants
+        if terminated_pids != [424243, 424244, 424242]:
+            return _fail("runtime-owned launch terminator must reap descendant pids before the recorded pid")
         try:
             os.kill(live_pid, signal.SIGTERM)
         except ProcessLookupError:

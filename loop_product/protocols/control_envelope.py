@@ -32,6 +32,22 @@ def infer_payload_type(envelope_type: str) -> str:
         "reap_request",
     }:
         return "topology_mutation"
+    if normalized in {
+        "repo_tree_cleanup_request",
+        "heavy_object_authority_gap_audit_request",
+        "heavy_object_authority_gap_repo_remediation_request",
+        "heavy_object_discovery_request",
+        "heavy_object_registration_request",
+        "heavy_object_observation_request",
+        "heavy_object_reference_request",
+        "heavy_object_reference_release_request",
+        "heavy_object_pin_request",
+        "heavy_object_pin_release_request",
+        "heavy_object_supersession_request",
+        "heavy_object_gc_eligibility_request",
+        "heavy_object_reclamation_request",
+    }:
+        return "local_control_decision"
     if normalized in {"child_dispatch_status", "child_heartbeat"}:
         return "dispatch_status"
     if normalized in {"local_control_decision", "local_control"}:

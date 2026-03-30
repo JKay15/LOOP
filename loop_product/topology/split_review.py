@@ -9,12 +9,20 @@ from loop_product.control_intent import (
     ARTIFACT_SCOPE_SPEC,
     TERMINAL_AUTHORITY_SCOPE_SPEC,
     WORKFLOW_SCOPE_SPEC,
+    default_progress_checkpoints,
+    default_startup_required_output_paths,
+    inherit_machine_choice,
     is_machine_activation_condition,
     normalize_activation_condition,
     normalize_machine_choice,
 )
 from loop_product.kernel.state import ACTIVE_NODE_STATUSES, KernelState
-from loop_product.protocols.node import NodeSpec, normalize_execution_policy, normalize_reasoning_profile
+from loop_product.protocols.node import (
+    NodeSpec,
+    normalize_execution_policy,
+    normalize_progress_checkpoints,
+    normalize_reasoning_profile,
+)
 from loop_product.protocols.topology import TopologyMutation
 from loop_product.topology.budget import normalized_complexity_budget
 
@@ -106,6 +114,7 @@ def _normalize_target_payloads(
         depends_on_raw = target.get("depends_on_node_ids")
         required_output_paths_raw = target.get("required_output_paths")
         startup_required_output_paths_raw = target.get("startup_required_output_paths")
+        progress_checkpoints_raw = target.get("progress_checkpoints")
         explicit_generation = target.get("generation")
         activation_condition_raw = str(target.get("activation_condition") or "").strip()
         activation_rationale = str(target.get("activation_rationale") or "").strip()
@@ -145,6 +154,20 @@ def _normalize_target_payloads(
                 continue
         if split_mode == "deferred" and not activation_condition:
             activation_condition = f"after:{source_node_id}:terminal"
+        resolved_workflow_scope = inherit_machine_choice(
+            workflow_scope_raw,
+            WORKFLOW_SCOPE_SPEC,
+            inherited_value=source_workflow_scope,
+            sticky_inherited_values=("whole_paper_formalization",),
+        )
+        resolved_artifact_scope = normalize_machine_choice(
+            artifact_scope_raw if artifact_scope_raw not in {None, ""} else "slice",
+            ARTIFACT_SCOPE_SPEC,
+        )
+        resolved_terminal_authority_scope = normalize_machine_choice(
+            terminal_authority_scope_raw if terminal_authority_scope_raw not in {None, ""} else "local",
+            TERMINAL_AUTHORITY_SCOPE_SPEC,
+        )
         if required_output_paths_raw in (None, ""):
             resolved_required_output_paths: list[str] = []
         elif isinstance(required_output_paths_raw, SequenceABC) and not isinstance(required_output_paths_raw, (str, bytes)):
@@ -153,15 +176,47 @@ def _normalize_target_payloads(
             errors.append(f"target {node_id or index} required_output_paths must be a list of strings")
             continue
         if startup_required_output_paths_raw in (None, ""):
-            resolved_startup_required_output_paths: list[str] = []
+            resolved_startup_required_output_paths = default_startup_required_output_paths(
+                workflow_scope=resolved_workflow_scope,
+                artifact_scope=resolved_artifact_scope,
+                terminal_authority_scope=resolved_terminal_authority_scope,
+            )
         elif isinstance(startup_required_output_paths_raw, SequenceABC) and not isinstance(
             startup_required_output_paths_raw, (str, bytes)
         ):
             resolved_startup_required_output_paths = [
                 str(item).strip() for item in startup_required_output_paths_raw if str(item).strip()
             ]
+            if not resolved_startup_required_output_paths:
+                resolved_startup_required_output_paths = default_startup_required_output_paths(
+                    workflow_scope=resolved_workflow_scope,
+                    artifact_scope=resolved_artifact_scope,
+                    terminal_authority_scope=resolved_terminal_authority_scope,
+                )
         else:
             errors.append(f"target {node_id or index} startup_required_output_paths must be a list of strings")
+            continue
+        if progress_checkpoints_raw in (None, ""):
+            resolved_progress_checkpoints = default_progress_checkpoints(
+                workflow_scope=resolved_workflow_scope,
+                artifact_scope=resolved_artifact_scope,
+                terminal_authority_scope=resolved_terminal_authority_scope,
+            )
+        elif isinstance(progress_checkpoints_raw, SequenceABC) and not isinstance(progress_checkpoints_raw, (str, bytes)):
+            resolved_progress_checkpoints = normalize_progress_checkpoints(progress_checkpoints_raw)
+            if resolved_progress_checkpoints and len(resolved_progress_checkpoints) != len(list(progress_checkpoints_raw)):
+                errors.append(
+                    f"target {node_id or index} progress_checkpoints must be a list of machine-readable checkpoint objects"
+                )
+                continue
+            if not resolved_progress_checkpoints:
+                resolved_progress_checkpoints = default_progress_checkpoints(
+                    workflow_scope=resolved_workflow_scope,
+                    artifact_scope=resolved_artifact_scope,
+                    terminal_authority_scope=resolved_terminal_authority_scope,
+                )
+        else:
+            errors.append(f"target {node_id or index} progress_checkpoints must be a list of checkpoint objects")
             continue
         if explicit_generation not in {None, ""}:
             try:
@@ -199,20 +254,12 @@ def _normalize_target_payloads(
                     **dict(budget_profile_raw),
                 },
                 "allowed_actions": resolved_allowed_actions,
-                "workflow_scope": normalize_machine_choice(
-                    workflow_scope_raw if workflow_scope_raw not in {None, ""} else source_workflow_scope,
-                    WORKFLOW_SCOPE_SPEC,
-                ),
-                "artifact_scope": normalize_machine_choice(
-                    artifact_scope_raw if artifact_scope_raw not in {None, ""} else "slice",
-                    ARTIFACT_SCOPE_SPEC,
-                ),
-                "terminal_authority_scope": normalize_machine_choice(
-                    terminal_authority_scope_raw if terminal_authority_scope_raw not in {None, ""} else "local",
-                    TERMINAL_AUTHORITY_SCOPE_SPEC,
-                ),
+                "workflow_scope": resolved_workflow_scope,
+                "artifact_scope": resolved_artifact_scope,
+                "terminal_authority_scope": resolved_terminal_authority_scope,
                 "required_output_paths": resolved_required_output_paths,
                 "startup_required_output_paths": resolved_startup_required_output_paths,
+                "progress_checkpoints": resolved_progress_checkpoints,
                 "workspace_root": str(target.get("workspace_root") or ""),
                 "codex_home": str(target.get("codex_home") or ""),
                 "depends_on_node_ids": resolved_depends_on,

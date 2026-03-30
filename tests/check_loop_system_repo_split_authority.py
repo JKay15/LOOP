@@ -183,6 +183,37 @@ def _persist_base_state(state_root: Path, *, max_active_nodes: int | None = None
     _write_source_handoff(state_root=state_root, workspace_root=source_workspace_root, source_node=source_node)
 
 
+def _upgrade_source_to_whole_paper_contract(state_root: Path) -> tuple[list[str], list[dict[str, object]]]:
+    from loop_product.control_intent import default_progress_checkpoints, default_startup_required_output_paths
+    from loop_product.kernel.authority import kernel_internal_authority
+    from loop_product.kernel.state import load_kernel_state, persist_kernel_state
+
+    expected_startup = default_startup_required_output_paths(
+        workflow_scope="whole_paper_formalization",
+        artifact_scope="task",
+        terminal_authority_scope="whole_paper",
+    )
+    expected_progress = default_progress_checkpoints(
+        workflow_scope="whole_paper_formalization",
+        artifact_scope="task",
+        terminal_authority_scope="whole_paper",
+    )
+    kernel_state = load_kernel_state(state_root)
+    source_record = dict(kernel_state.nodes.get("child-implementer-001") or {})
+    source_record["workflow_scope"] = "whole_paper_formalization"
+    source_record["artifact_scope"] = "task"
+    source_record["terminal_authority_scope"] = "whole_paper"
+    source_record["startup_required_output_paths"] = list(expected_startup)
+    source_record["progress_checkpoints"] = list(expected_progress)
+    kernel_state.nodes["child-implementer-001"] = source_record
+    persist_kernel_state(state_root, kernel_state, authority=kernel_internal_authority())
+    (state_root / "state" / "child-implementer-001.json").write_text(
+        json.dumps(source_record, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return list(expected_startup), [dict(item) for item in expected_progress]
+
+
 def _accepted_split_case() -> int:
     import loop_product.kernel.topology as topology_module
 
@@ -671,6 +702,14 @@ def _split_required_outputs_persist_case() -> int:
             "README.md",
             "formalization/appendix_claim_inventory.json",
         ]
+        progress_checkpoints = [
+            {
+                "checkpoint_id": "appendix_execution_decision",
+                "description": "record the appendix execution decision before extended helper archaeology",
+                "required_any_of": ["analysis/EXECUTION_DECISION.json"],
+                "window_s": 300.0,
+            }
+        ]
         mutation = build_split_request(
             source_node=source_node,
             target_nodes=[
@@ -679,6 +718,7 @@ def _split_required_outputs_persist_case() -> int:
                     "goal_slice": "formalize appendix support claims and close named external dependencies",
                     "required_output_paths": required_output_paths,
                     "startup_required_output_paths": startup_required_output_paths,
+                    "progress_checkpoints": progress_checkpoints,
                 },
                 {
                     "node_id": "child-followup-001",
@@ -711,12 +751,16 @@ def _split_required_outputs_persist_case() -> int:
                 return _fail(
                     "accepted split child node state must preserve startup_required_output_paths from the reviewed target payload"
                 )
+            if appendix_state.get("progress_checkpoints") != progress_checkpoints:
+                return _fail("accepted split child node state must preserve progress_checkpoints from the reviewed target payload")
             if appendix_delegation.get("required_output_paths") != required_output_paths:
                 return _fail("accepted split child delegation must preserve required_output_paths from the reviewed target payload")
             if appendix_delegation.get("startup_required_output_paths") != startup_required_output_paths:
                 return _fail(
                     "accepted split child delegation must preserve startup_required_output_paths from the reviewed target payload"
                 )
+            if appendix_delegation.get("progress_checkpoints") != progress_checkpoints:
+                return _fail("accepted split child delegation must preserve progress_checkpoints from the reviewed target payload")
             if len(bootstrap_calls) != 1 or len(launch_calls) != 1:
                 return _fail("only the dependency-free required-output child should bootstrap immediately in this case")
             if len(supervision_calls) != 1:
@@ -725,10 +769,12 @@ def _split_required_outputs_persist_case() -> int:
                 return _fail("split child bootstrap request must surface required_output_paths for frozen handoff generation")
             if bootstrap_calls[0].get("startup_required_output_paths") != startup_required_output_paths:
                 return _fail("split child bootstrap request must surface startup_required_output_paths for frozen handoff generation")
+            if bootstrap_calls[0].get("progress_checkpoints") != progress_checkpoints:
+                return _fail("split child bootstrap request must surface progress_checkpoints for frozen handoff generation")
             bootstrap_workspace_root = Path(str(bootstrap_calls[0].get("workspace_root") or "")).expanduser().resolve()
             bootstrap_live_relpath = str(bootstrap_calls[0].get("workspace_live_artifact_relpath") or "")
             bootstrap_live_root = (bootstrap_workspace_root / bootstrap_live_relpath).resolve()
-            from loop_product.runtime_paths import node_live_artifact_root
+            from loop_product.runtime_paths import node_live_artifact_root, shared_cache_helper_ref
 
             expected_live_root = node_live_artifact_root(
                 state_root=state_root,
@@ -739,13 +785,152 @@ def _split_required_outputs_persist_case() -> int:
                 return _fail("split child bootstrap request must move live artifact root into runtime-owned scratch outside the workspace")
             if expected_live_root.is_relative_to(bootstrap_workspace_root):
                 return _fail("split child live artifact root must not remain under the child workspace root")
-            expected_helper = (ROOT / "scripts" / "ensure_workspace_lake_packages.sh").resolve()
+            expected_helper = shared_cache_helper_ref()
             context_refs = {str(item) for item in list(bootstrap_calls[0].get("context_refs") or [])}
             if str(expected_helper) not in context_refs:
                 return _fail("split child bootstrap request must inject the committed shared-cache helper into frozen context refs")
             node_graph = {item["node_id"]: item for item in authority["node_graph"]}
             if node_graph.get("child-followup-001", {}).get("status") != "PLANNED":
                 return _fail("dependency-bound follower child must remain PLANNED in required-output persistence case")
+        finally:
+            if original_bootstrap is not None:
+                topology_module.bootstrap_first_implementer_node = original_bootstrap
+            else:
+                delattr(topology_module, "bootstrap_first_implementer_node")
+            if original_launch is not None:
+                topology_module.launch_child_from_result_ref = original_launch
+            else:
+                delattr(topology_module, "launch_child_from_result_ref")
+            if original_supervision is not None:
+                topology_module.ensure_child_supervision_running = original_supervision
+            else:
+                delattr(topology_module, "ensure_child_supervision_running")
+
+    return 0
+
+
+def _whole_paper_split_child_contract_inheritance_case() -> int:
+    import loop_product.kernel.topology as topology_module
+
+    from loop_product.control_intent import default_progress_checkpoints, default_startup_required_output_paths
+    from loop_product.kernel.submit import submit_topology_mutation
+    from loop_product.protocols.control_envelope import EnvelopeStatus
+    from loop_product.topology.split_review import build_split_request
+
+    with tempfile.TemporaryDirectory(prefix="loop_system_split_whole_paper_child_contract_") as td:
+        state_root = Path(td) / ".loop"
+        _persist_base_state(state_root)
+        source_startup, source_progress = _upgrade_source_to_whole_paper_contract(state_root)
+        expected_slice_startup = default_startup_required_output_paths(
+            workflow_scope="whole_paper_formalization",
+            artifact_scope="slice",
+            terminal_authority_scope="local",
+        )
+        expected_slice_progress = default_progress_checkpoints(
+            workflow_scope="whole_paper_formalization",
+            artifact_scope="slice",
+            terminal_authority_scope="local",
+        )
+        source_node = _base_source_node()
+        source_node.workflow_scope = "whole_paper_formalization"
+        source_node.artifact_scope = "task"
+        source_node.terminal_authority_scope = "whole_paper"
+        source_node.startup_required_output_paths = list(source_startup)
+        source_node.progress_checkpoints = [dict(item) for item in source_progress]
+        bootstrap_calls: list[dict[str, object]] = []
+        launch_calls: list[dict[str, object]] = []
+        supervision_calls: list[dict[str, object]] = []
+        original_bootstrap = getattr(topology_module, "bootstrap_first_implementer_node", None)
+        original_launch = getattr(topology_module, "launch_child_from_result_ref", None)
+        original_supervision = getattr(topology_module, "ensure_child_supervision_running", None)
+
+        def _fake_bootstrap(**kwargs):
+            bootstrap_calls.append(dict(kwargs))
+            bootstrap_ref = state_root / "artifacts" / "bootstrap" / f"{kwargs['node_id']}__bootstrap.json"
+            bootstrap_ref.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "bootstrap_result_ref": str(bootstrap_ref.resolve()),
+                "node_id": kwargs["node_id"],
+                "state_root": str(state_root.resolve()),
+                "workspace_root": str(kwargs["workspace_root"]),
+            }
+            bootstrap_ref.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            return payload
+
+        def _fake_launch_child_from_result_ref(**kwargs):
+            launch_calls.append(dict(kwargs))
+            bootstrap_ref = Path(str(kwargs.get("result_ref") or "")).resolve()
+            launch_result_ref = bootstrap_ref.parent / "ChildLaunchResult.json"
+            return {
+                "launch_decision": "test-only",
+                "source_result_ref": str(bootstrap_ref),
+                "launch_result_ref": str(launch_result_ref.resolve()),
+            }
+
+        def _fake_ensure_child_supervision_running(**kwargs):
+            supervision_calls.append(dict(kwargs))
+            return {
+                "launch_result_ref": str(Path(str(kwargs.get("launch_result_ref") or "")).resolve()),
+                "status": "test-only",
+            }
+
+        topology_module.bootstrap_first_implementer_node = _fake_bootstrap
+        topology_module.launch_child_from_result_ref = _fake_launch_child_from_result_ref
+        topology_module.ensure_child_supervision_running = _fake_ensure_child_supervision_running
+        mutation = build_split_request(
+            source_node=source_node,
+            target_nodes=[
+                {
+                    "node_id": "child-whole-paper-slice-001",
+                    "goal_slice": "formalize one whole-paper slice without allowing workflow downgrades",
+                    "workflow_scope": "generic",
+                    "artifact_scope": "slice",
+                    "terminal_authority_scope": "local",
+                    "startup_required_output_paths": [],
+                    "progress_checkpoints": [],
+                },
+                {
+                    "node_id": "child-followup-001",
+                    "goal_slice": "follow after the first slice reaches a durable checkpoint",
+                    "depends_on_node_ids": ["child-whole-paper-slice-001"],
+                },
+            ],
+            split_mode="parallel",
+            reason="whole-paper split child contract must inherit deterministic slice startup and progress defaults",
+        )
+        try:
+            envelope = submit_topology_mutation(
+                state_root,
+                mutation,
+                round_id=source_node.round_id,
+                generation=source_node.generation,
+            )
+            if envelope.status is not EnvelopeStatus.ACCEPTED:
+                return _fail("whole-paper split child contract inheritance case must be accepted")
+            child_state = json.loads((state_root / "state" / "child-whole-paper-slice-001.json").read_text(encoding="utf-8"))
+            child_delegation = json.loads(
+                (state_root / "state" / "delegations" / "child-whole-paper-slice-001.json").read_text(encoding="utf-8")
+            )
+            if child_state.get("workflow_scope") != "whole_paper_formalization":
+                return _fail("whole-paper split child node state must inherit whole-paper workflow_scope instead of accepting generic downgrade")
+            if child_delegation.get("workflow_scope") != "whole_paper_formalization":
+                return _fail("whole-paper split child delegation must inherit whole-paper workflow_scope instead of accepting generic downgrade")
+            if child_state.get("startup_required_output_paths") != expected_slice_startup:
+                return _fail("whole-paper split child node state must restore deterministic slice startup_required_output_paths when payload leaves them empty")
+            if child_delegation.get("startup_required_output_paths") != expected_slice_startup:
+                return _fail("whole-paper split child delegation must restore deterministic slice startup_required_output_paths when payload leaves them empty")
+            if child_state.get("progress_checkpoints") != expected_slice_progress:
+                return _fail("whole-paper split child node state must restore deterministic slice progress_checkpoints when payload leaves them empty")
+            if child_delegation.get("progress_checkpoints") != expected_slice_progress:
+                return _fail("whole-paper split child delegation must restore deterministic slice progress_checkpoints when payload leaves them empty")
+            if len(bootstrap_calls) != 1 or len(launch_calls) != 1 or len(supervision_calls) != 1:
+                return _fail("whole-paper split child inheritance case must immediately bootstrap exactly one dependency-free child")
+            if bootstrap_calls[0].get("workflow_scope") != "whole_paper_formalization":
+                return _fail("whole-paper split child bootstrap request must keep the inherited whole-paper workflow_scope")
+            if bootstrap_calls[0].get("startup_required_output_paths") != expected_slice_startup:
+                return _fail("whole-paper split child bootstrap request must surface default slice startup outputs when payload provides an empty list")
+            if bootstrap_calls[0].get("progress_checkpoints") != expected_slice_progress:
+                return _fail("whole-paper split child bootstrap request must surface default slice checkpoints when payload provides an empty list")
         finally:
             if original_bootstrap is not None:
                 topology_module.bootstrap_first_implementer_node = original_bootstrap
@@ -1074,6 +1259,54 @@ def _authoritative_child_result_sync_case() -> int:
     return 0
 
 
+def _publication_rejects_materialized_live_runtime_heavy_trees_case() -> int:
+    from loop_product.dispatch.publication import publish_workspace_artifact_snapshot
+    from loop_product.runtime_paths import node_live_artifact_root
+
+    with tempfile.TemporaryDirectory(prefix="loop_system_live_root_publication_gate_") as td:
+        state_root = Path(td) / ".loop"
+        workspace_root = Path(td) / "workspace" / "live-root-publication-gate"
+        live_root = node_live_artifact_root(
+            state_root=state_root,
+            node_id="child-live-root-publication-gate-001",
+            workspace_mirror_relpath="deliverables/primary_artifact",
+        )
+        publish_root = workspace_root / "deliverables" / "primary_artifact"
+        publication_receipt_ref = (
+            state_root
+            / "artifacts"
+            / "publication"
+            / "child-live-root-publication-gate-001"
+            / "WorkspaceArtifactPublicationReceipt.json"
+        )
+        live_root.mkdir(parents=True, exist_ok=True)
+        (live_root / "README.md").write_text("# live-root publication gate\n", encoding="utf-8")
+        heavy_root = live_root / ".lake" / "packages" / "mathlib" / ".git"
+        heavy_root.mkdir(parents=True, exist_ok=True)
+        (heavy_root / "config").write_text("[core]\n\trepositoryformatversion = 0\n", encoding="utf-8")
+        try:
+            publish_workspace_artifact_snapshot(
+                node_id="child-live-root-publication-gate-001",
+                live_artifact_ref=live_root,
+                publish_artifact_ref=publish_root,
+                publication_receipt_ref=publication_receipt_ref,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            if "materialized runtime-owned heavy trees" not in message:
+                return _fail("publication preflight must explain that live-root runtime heavy trees are fail-closed")
+            if ".lake" not in message:
+                return _fail("publication preflight must report the offending live-root heavy tree path")
+        else:
+            return _fail("publication preflight must reject live roots containing materialized runtime heavy trees")
+        if publish_root.exists():
+            return _fail("publication preflight rejection must not materialize a publish root")
+        if publication_receipt_ref.exists():
+            return _fail("publication preflight rejection must not write a publication receipt")
+
+    return 0
+
+
 def _source_split_continuation_sync_case() -> int:
     from loop_product.dispatch.publication import publish_workspace_artifact_snapshot
     from loop_product.kernel.authority import kernel_internal_authority
@@ -1150,6 +1383,423 @@ def _source_split_continuation_sync_case() -> int:
         runtime_state = dict(source_state.get("runtime_state") or {})
         if runtime_state.get("attachment_state") != "TERMINAL":
             return _fail("source split-continuation result must mark the source runtime attachment as TERMINAL")
+
+    return 0
+
+
+def _source_split_continuation_publication_surface_case() -> int:
+    from loop_product.dispatch.publication import publish_workspace_artifact_snapshot
+    from loop_product.runtime_paths import node_live_artifact_root
+
+    td = Path(tempfile.mkdtemp(prefix="loop_system_split_continue_publication_surface_"))
+    try:
+        state_root = td / ".loop"
+        _persist_base_state(state_root)
+        source_workspace_root = state_root.parent / "workspace" / "child-implementer-001"
+        live_root = node_live_artifact_root(
+            state_root=state_root,
+            node_id="child-implementer-001",
+            workspace_mirror_relpath="deliverables/primary_artifact",
+        )
+        live_root.mkdir(parents=True, exist_ok=True)
+        (live_root / "README.md").write_text("# Whole-Paper Slice Startup Bundle\n", encoding="utf-8")
+        (live_root / "TRACEABILITY.md").write_text("# Slice Startup Traceability\n", encoding="utf-8")
+        (live_root / "SLICE_STATUS.json").write_text(
+            json.dumps(
+                {
+                    "artifact_scope": "slice",
+                    "goal_slice": "release remaining work into accepted child lanes",
+                    "node_id": "child-implementer-001",
+                    "round_id": "R1",
+                    "slice_startup_batch_materialized": True,
+                    "source_tex_ref": "/tmp/source.tex",
+                    "status": "IN_PROGRESS",
+                    "terminal_authority_scope": "local",
+                    "workflow_scope": "whole_paper_formalization",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (live_root / "analysis").mkdir(parents=True, exist_ok=True)
+        (live_root / "analysis" / "SLICE_BOUNDARY.json").write_text(
+            json.dumps(
+                {
+                    "artifact_scope": "slice",
+                    "goal_slice": "release remaining work into accepted child lanes",
+                    "node_id": "child-implementer-001",
+                    "notes": [
+                        "This deterministic startup bundle is slice-scoped.",
+                        "The child still owes substantive formalization or dependency-closure progress after startup.",
+                    ],
+                    "source_tex_ref": "/tmp/source.tex",
+                    "terminal_authority_scope": "local",
+                    "workflow_scope": "whole_paper_formalization",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (live_root / "WHOLE_PAPER_STATUS.json").write_text(
+            json.dumps(
+                {
+                    "accepted_child_node_ids": ["child-linear-001", "child-linear-002"],
+                    "artifact_scope": "slice",
+                    "goal_slice": "release remaining work into accepted child lanes",
+                    "node_id": "child-implementer-001",
+                    "released_remaining_work": [
+                        {
+                            "goal_slice": "probability lane",
+                            "node_id": "child-linear-001",
+                        },
+                        {
+                            "goal_slice": "faithfulness lane",
+                            "node_id": "child-linear-002",
+                        },
+                    ],
+                    "round_id": "R1",
+                    "source_tex_ref": "/tmp/source.tex",
+                    "status": "TERMINAL",
+                    "summary": "Local deterministic core settled; remaining work released into accepted child lanes.",
+                    "terminal_authority_scope": "local",
+                    "terminal_classification": "SPLIT_ACCEPTED_CONTINUE_IMPLEMENTATION",
+                    "whole_paper_terminal_authority": False,
+                    "workflow_scope": "whole_paper_formalization",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        publish_root = source_workspace_root / "deliverables" / "primary_artifact"
+        publish_workspace_artifact_snapshot(
+            node_id="child-implementer-001",
+            live_artifact_ref=live_root,
+            publish_artifact_ref=publish_root,
+            publication_receipt_ref=state_root
+            / "artifacts"
+            / "publication"
+            / "child-implementer-001"
+            / "WorkspaceArtifactPublicationReceipt.json",
+        )
+        published_readme = (publish_root / "README.md").read_text(encoding="utf-8").lower()
+        if "split-continuation" not in published_readme or "accepted child lanes" not in published_readme:
+            return _fail("split continuation publication must harmonize README.md to terminal-local split-continuation truth")
+        published_traceability = (publish_root / "TRACEABILITY.md").read_text(encoding="utf-8").lower()
+        if "split-continuation" not in published_traceability or "child-linear-001" not in published_traceability:
+            return _fail("split continuation publication must harmonize TRACEABILITY.md with released child lane evidence")
+        published_slice_status = json.loads((publish_root / "SLICE_STATUS.json").read_text(encoding="utf-8"))
+        if str(published_slice_status.get("status") or "") != "TERMINAL":
+            return _fail("split continuation publication must harmonize SLICE_STATUS.json to terminal state")
+        if str(published_slice_status.get("slice_terminal_classification") or "") != "SPLIT_ACCEPTED_CONTINUE_IMPLEMENTATION":
+            return _fail("split continuation publication must persist slice_terminal_classification in SLICE_STATUS.json")
+        published_boundary = json.loads((publish_root / "analysis" / "SLICE_BOUNDARY.json").read_text(encoding="utf-8"))
+        notes = [str(item) for item in list(published_boundary.get("notes") or [])]
+        if not any("split continuation" in item.lower() for item in notes):
+            return _fail("split continuation publication must rewrite SLICE_BOUNDARY notes away from startup-bundle wording")
+        published_whole_paper_status = json.loads((publish_root / "WHOLE_PAPER_STATUS.json").read_text(encoding="utf-8"))
+        if str(published_whole_paper_status.get("terminal_classification") or "") != "SPLIT_ACCEPTED_CONTINUE_IMPLEMENTATION":
+            return _fail("split continuation publication must preserve the local whole-paper terminal classification evidence")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+    return 0
+
+
+def _source_split_continuation_result_sink_repair_case() -> int:
+    from loop_product.dispatch.publication import publish_workspace_artifact_snapshot
+    from loop_product.runtime.lifecycle import backfill_authoritative_terminal_results
+    from loop_product.runtime_paths import node_live_artifact_root
+
+    td = Path(tempfile.mkdtemp(prefix="loop_system_split_continue_result_sink_repair_"))
+    try:
+        state_root = td / ".loop"
+        _persist_base_state(state_root)
+        source_workspace_root = state_root.parent / "workspace" / "child-implementer-001"
+        live_root = node_live_artifact_root(
+            state_root=state_root,
+            node_id="child-implementer-001",
+            workspace_mirror_relpath="deliverables/primary_artifact",
+        )
+        live_root.mkdir(parents=True, exist_ok=True)
+        (live_root / "README.md").write_text("# Whole-Paper Slice Startup Bundle\n", encoding="utf-8")
+        (live_root / "TRACEABILITY.md").write_text("# Slice Startup Traceability\n", encoding="utf-8")
+        (live_root / "SLICE_STATUS.json").write_text(
+            json.dumps(
+                {
+                    "artifact_scope": "slice",
+                    "goal_slice": "release remaining work into accepted child lanes",
+                    "node_id": "child-implementer-001",
+                    "round_id": "R1",
+                    "slice_startup_batch_materialized": True,
+                    "source_tex_ref": "/tmp/source.tex",
+                    "status": "IN_PROGRESS",
+                    "terminal_authority_scope": "local",
+                    "workflow_scope": "whole_paper_formalization",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (live_root / "analysis").mkdir(parents=True, exist_ok=True)
+        (live_root / "analysis" / "SLICE_BOUNDARY.json").write_text(
+            json.dumps(
+                {
+                    "artifact_scope": "slice",
+                    "goal_slice": "release remaining work into accepted child lanes",
+                    "node_id": "child-implementer-001",
+                    "notes": [
+                        "This deterministic startup bundle is slice-scoped.",
+                        "The child still owes substantive formalization or dependency-closure progress after startup.",
+                    ],
+                    "source_tex_ref": "/tmp/source.tex",
+                    "terminal_authority_scope": "local",
+                    "workflow_scope": "whole_paper_formalization",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (live_root / "WHOLE_PAPER_STATUS.json").write_text(
+            json.dumps(
+                {
+                    "accepted_child_node_ids": ["child-linear-001", "child-linear-002"],
+                    "artifact_scope": "slice",
+                    "goal_slice": "release remaining work into accepted child lanes",
+                    "node_id": "child-implementer-001",
+                    "released_remaining_work": [
+                        {
+                            "goal_slice": "probability lane",
+                            "node_id": "child-linear-001",
+                        },
+                        {
+                            "goal_slice": "faithfulness lane",
+                            "node_id": "child-linear-002",
+                        },
+                    ],
+                    "round_id": "R1",
+                    "source_tex_ref": "/tmp/source.tex",
+                    "status": "TERMINAL",
+                    "summary": "Local deterministic core settled; remaining work released into accepted child lanes.",
+                    "terminal_authority_scope": "local",
+                    "terminal_classification": "SPLIT_ACCEPTED_CONTINUE_IMPLEMENTATION",
+                    "whole_paper_terminal_authority": False,
+                    "workflow_scope": "whole_paper_formalization",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        publish_root = source_workspace_root / "deliverables" / "primary_artifact"
+        publication_receipt_ref = (
+            state_root / "artifacts" / "publication" / "child-implementer-001" / "WorkspaceArtifactPublicationReceipt.json"
+        )
+        publish_workspace_artifact_snapshot(
+            node_id="child-implementer-001",
+            live_artifact_ref=live_root,
+            publish_artifact_ref=publish_root,
+            publication_receipt_ref=publication_receipt_ref,
+        )
+
+        kernel_result_ref = state_root / "artifacts" / "child-implementer-001" / "result.json"
+        workspace_result_ref = source_workspace_root / "artifacts" / "child-implementer-001" / "result.json"
+        for result_ref in (kernel_result_ref, workspace_result_ref):
+            result_ref.parent.mkdir(parents=True, exist_ok=True)
+            result_ref.write_text(
+                json.dumps(
+                    {
+                        "schema": "loop_product.implementer_result",
+                        "schema_version": "0.1.0",
+                        "node_id": "child-implementer-001",
+                        "parent_node_id": "root-kernel",
+                        "lineage_ref": "root-kernel->child-implementer-001",
+                        "round_id": "R1",
+                        "workspace_root": str(source_workspace_root.resolve()),
+                        "status": "IN_PROGRESS",
+                        "outcome": "SPLIT_ACCEPTED_CONTINUE_IMPLEMENTATION",
+                        "result_kind": "implementer_result",
+                        "result_ref": str(kernel_result_ref.resolve()),
+                        "workspace_result_sink_ref": str(workspace_result_ref.resolve()),
+                        "kernel_result_sink_ref": str(kernel_result_ref.resolve()),
+                        "workspace_mirror_ref": str(publish_root.resolve()),
+                        "delivered_artifact_ref": str(publish_root.resolve()),
+                        "publish_ready_artifact_refs": [str(publish_root.resolve())],
+                        "publication_receipt_ref": str(publication_receipt_ref.resolve()),
+                        "whole_paper_status_ref": "deliverables/primary_artifact/WHOLE_PAPER_STATUS.json",
+                        "summary": "Local deterministic core settled; remaining work released into accepted child lanes.",
+                        "split_state": {
+                            "accepted": True,
+                            "accepted_target_nodes": ["child-linear-001", "child-linear-002"],
+                            "mode": "parallel",
+                            "proposed": True,
+                        },
+                        "terminal_authority_scope": "local",
+                        "workflow_scope": "whole_paper_formalization",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+        repaired = backfill_authoritative_terminal_results(
+            state_root=state_root,
+            node_ids=["child-implementer-001"],
+            continue_deferred=False,
+        )
+        if "child-implementer-001" not in repaired:
+            return _fail("split continuation result sink repair must rewrite the stale authoritative source result")
+
+        for result_ref in (kernel_result_ref, workspace_result_ref):
+            payload = json.loads(result_ref.read_text(encoding="utf-8"))
+            if str(payload.get("status") or "") != "COMPLETED":
+                return _fail("split continuation result sink repair must terminalize stale IN_PROGRESS implementer results")
+            if str(payload.get("outcome") or "") != "SPLIT_ACCEPTED_CONTINUE_IMPLEMENTATION":
+                return _fail("split continuation result sink repair must preserve the split-continuation outcome")
+
+        source_state = json.loads((state_root / "state" / "child-implementer-001.json").read_text(encoding="utf-8"))
+        kernel_state_payload = json.loads((state_root / "state" / "kernel_state.json").read_text(encoding="utf-8"))
+        kernel_node = dict(dict(kernel_state_payload.get("nodes") or {}).get("child-implementer-001") or {})
+        for surface in (source_state, kernel_node):
+            if str(surface.get("status") or "") != "BLOCKED":
+                return _fail("split continuation result sink repair must keep source node lifecycle BLOCKED after terminalizing the result sink")
+            if str(surface.get("authoritative_result_status") or "") != "COMPLETED":
+                return _fail("split continuation result sink repair must project authoritative_result_status=COMPLETED")
+            if str(surface.get("authoritative_result_outcome") or "") != "SPLIT_ACCEPTED_CONTINUE_IMPLEMENTATION":
+                return _fail("split continuation result sink repair must project authoritative split-continuation outcome")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+    return 0
+
+
+def _source_slice_local_completion_publication_surface_case() -> int:
+    from loop_product.dispatch.publication import publish_workspace_artifact_snapshot
+    from loop_product.runtime_paths import node_live_artifact_root
+
+    td = Path(tempfile.mkdtemp(prefix="loop_system_slice_local_completion_publication_surface_"))
+    try:
+        state_root = td / ".loop"
+        _persist_base_state(state_root)
+        source_workspace_root = state_root.parent / "workspace" / "child-implementer-001"
+        live_root = node_live_artifact_root(
+            state_root=state_root,
+            node_id="child-implementer-001",
+            workspace_mirror_relpath="deliverables/primary_artifact",
+        )
+        live_root.mkdir(parents=True, exist_ok=True)
+        (live_root / "README.md").write_text("# Whole-Paper Slice Startup Bundle\n", encoding="utf-8")
+        (live_root / "TRACEABILITY.md").write_text("# Slice Startup Traceability\n", encoding="utf-8")
+        (live_root / "SLICE_STATUS.json").write_text(
+            json.dumps(
+                {
+                    "artifact_scope": "slice",
+                    "goal_slice": "close the probabilistic appendix slice faithfully",
+                    "node_id": "child-implementer-001",
+                    "round_id": "R1",
+                    "slice_startup_batch_materialized": True,
+                    "source_tex_ref": "/tmp/source.tex",
+                    "status": "IN_PROGRESS",
+                    "terminal_authority_scope": "local",
+                    "workflow_scope": "whole_paper_formalization",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (live_root / "analysis").mkdir(parents=True, exist_ok=True)
+        (live_root / "analysis" / "SLICE_BOUNDARY.json").write_text(
+            json.dumps(
+                {
+                    "artifact_scope": "slice",
+                    "goal_slice": "close the probabilistic appendix slice faithfully",
+                    "node_id": "child-implementer-001",
+                    "notes": [
+                        "This deterministic startup bundle is slice-scoped.",
+                        "The child still owes substantive formalization or dependency-closure progress after startup.",
+                    ],
+                    "source_tex_ref": "/tmp/source.tex",
+                    "terminal_authority_scope": "local",
+                    "workflow_scope": "whole_paper_formalization",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (live_root / "WHOLE_PAPER_STATUS.json").write_text(
+            json.dumps(
+                {
+                    "artifact_scope": "slice",
+                    "classification": "slice_local_formalization_complete",
+                    "goal_slice": "close the probabilistic appendix slice faithfully",
+                    "last_verified_utc": "2026-03-27T13:07:23Z",
+                    "node_id": "child-implementer-001",
+                    "round_id": "R1",
+                    "source_tex_ref": "/tmp/source.tex",
+                    "split_status": "requested_rejected_generation_budget_historical",
+                    "status": "LOCAL_SLICE_COMPLETE_PENDING_PARENT_INTEGRATION",
+                    "summary": "This slice-local artifact fully closes the probabilistic appendix lane while leaving whole-paper closeout parent-owned.",
+                    "terminal_authority_scope": "local",
+                    "verification": {
+                        "axiom_checked_theorems": ["thm_probabilistic_closing"],
+                        "lake_build": "success",
+                    },
+                    "whole_paper_terminal_classification": "NOT_OWNED_BY_SLICE",
+                    "workflow_scope": "whole_paper_formalization",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        publish_root = source_workspace_root / "deliverables" / "primary_artifact"
+        publish_workspace_artifact_snapshot(
+            node_id="child-implementer-001",
+            live_artifact_ref=live_root,
+            publish_artifact_ref=publish_root,
+            publication_receipt_ref=state_root
+            / "artifacts"
+            / "publication"
+            / "child-implementer-001"
+            / "WorkspaceArtifactPublicationReceipt.json",
+        )
+        published_readme = (publish_root / "README.md").read_text(encoding="utf-8").lower()
+        if "slice local completion" not in published_readme or "parent-owned" not in published_readme:
+            return _fail("slice-local completion publication must harmonize README.md away from startup-bundle wording")
+        published_traceability = (publish_root / "TRACEABILITY.md").read_text(encoding="utf-8").lower()
+        if "slice local completion" not in published_traceability or "not_owned_by_slice" not in published_traceability:
+            return _fail("slice-local completion publication must harmonize TRACEABILITY.md with local-completion truth")
+        published_slice_status = json.loads((publish_root / "SLICE_STATUS.json").read_text(encoding="utf-8"))
+        if str(published_slice_status.get("status") or "") != "LOCAL_SLICE_COMPLETE_PENDING_PARENT_INTEGRATION":
+            return _fail("slice-local completion publication must harmonize SLICE_STATUS.json to the local completion status")
+        if str(published_slice_status.get("slice_completion_classification") or "") != "slice_local_formalization_complete":
+            return _fail("slice-local completion publication must persist slice completion classification in SLICE_STATUS.json")
+        published_boundary = json.loads((publish_root / "analysis" / "SLICE_BOUNDARY.json").read_text(encoding="utf-8"))
+        notes = [str(item) for item in list(published_boundary.get("notes") or [])]
+        if not any("parent-owned" in item.lower() for item in notes):
+            return _fail("slice-local completion publication must rewrite SLICE_BOUNDARY notes away from startup-bundle wording")
+        published_whole_paper_status = json.loads((publish_root / "WHOLE_PAPER_STATUS.json").read_text(encoding="utf-8"))
+        if str(published_whole_paper_status.get("classification") or "") != "slice_local_formalization_complete":
+            return _fail("slice-local completion publication must preserve the whole-paper status classification evidence")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
 
     return 0
 
@@ -1270,6 +1920,59 @@ def _inflight_evaluator_authority_gate_case() -> int:
     return 0
 
 
+def _split_child_workspace_is_run_scoped_case() -> int:
+    from loop_product.dispatch.child_dispatch import materialize_child
+    from loop_product.kernel.authority import kernel_internal_authority
+    from loop_product.kernel.state import load_kernel_state
+    from loop_product.runtime_paths import default_child_workspace_root
+
+    with tempfile.TemporaryDirectory(prefix="loop_system_split_child_workspace_scope_") as td:
+        state_root_a = Path(td) / ".loop" / "runtime_a"
+        state_root_b = Path(td) / ".loop" / "runtime_b"
+        _persist_base_state(state_root_a)
+        _persist_base_state(state_root_b)
+        kernel_a = load_kernel_state(state_root_a)
+        kernel_b = load_kernel_state(state_root_b)
+        parent = _base_source_node()
+        kernel_a.register_node(parent)
+        kernel_b.register_node(parent)
+        authority = kernel_internal_authority()
+        child_a = materialize_child(
+            state_root=state_root_a,
+            kernel_state=kernel_a,
+            parent_node_id=parent.node_id,
+            node_id="external_dependency_closure",
+            goal_slice="close external dependencies",
+            round_id="R1",
+            execution_policy={"sandbox_mode": "workspace-write"},
+            reasoning_profile={"thinking_budget": "xhigh"},
+            budget_profile={"max_rounds": 3},
+            authority=authority,
+        )
+        child_b = materialize_child(
+            state_root=state_root_b,
+            kernel_state=kernel_b,
+            parent_node_id=parent.node_id,
+            node_id="external_dependency_closure",
+            goal_slice="close external dependencies",
+            round_id="R1",
+            execution_policy={"sandbox_mode": "workspace-write"},
+            reasoning_profile={"thinking_budget": "xhigh"},
+            budget_profile={"max_rounds": 3},
+            authority=authority,
+        )
+        expected_a = default_child_workspace_root(state_root=state_root_a, node_id="external_dependency_closure")
+        expected_b = default_child_workspace_root(state_root=state_root_b, node_id="external_dependency_closure")
+        if Path(child_a.workspace_root).resolve() != expected_a.resolve():
+            return _fail("split child without explicit workspace_root must default to a run-scoped workspace path")
+        if Path(child_b.workspace_root).resolve() != expected_b.resolve():
+            return _fail("run-scoped child workspace default must derive from the current state_root")
+        if Path(child_a.workspace_root).resolve() == Path(child_b.workspace_root).resolve():
+            return _fail("same split child node_id across different runtime roots must not share one workspace directory")
+
+    return 0
+
+
 def main() -> int:
     try:
         rc = _accepted_split_case()
@@ -1284,13 +1987,31 @@ def main() -> int:
         rc = _split_required_outputs_persist_case()
         if rc:
             return rc
+        rc = _whole_paper_split_child_contract_inheritance_case()
+        if rc:
+            return rc
         rc = _authoritative_child_result_sync_case()
+        if rc:
+            return rc
+        rc = _publication_rejects_materialized_live_runtime_heavy_trees_case()
         if rc:
             return rc
         rc = _source_split_continuation_sync_case()
         if rc:
             return rc
+        rc = _source_split_continuation_publication_surface_case()
+        if rc:
+            return rc
+        rc = _source_split_continuation_result_sink_repair_case()
+        if rc:
+            return rc
+        rc = _source_slice_local_completion_publication_surface_case()
+        if rc:
+            return rc
         rc = _inflight_evaluator_authority_gate_case()
+        if rc:
+            return rc
+        rc = _split_child_workspace_is_run_scoped_case()
         if rc:
             return rc
         rc = _rejected_split_case()

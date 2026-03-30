@@ -23,14 +23,16 @@ from loop_product.control_intent import (
     WORKFLOW_SCOPE_SPEC,
     normalize_machine_choice,
 )
+from loop_product.dispatch.publication import repair_publication_receipt_surface
 from loop_product.evaluator.agent_execution_policy import validate_evaluator_agent_execution, validate_repo_shipped_role_agent_cmd
-from loop_product.kernel.state import authoritative_node_dependency_ready, load_kernel_state
+from loop_product.kernel.state import authoritative_node_dependency_ready, load_kernel_state, query_kernel_state_object
 from loop_product.kernel.submit import submit_control_envelope
 from loop_product.protocols.control_envelope import ControlEnvelope, EnvelopeStatus
 from loop_product.protocols.control_objects import NodeTerminalOutcome, NodeTerminalResult
 from loop_product.protocols.evaluator import EvaluatorNodeSubmission, EvaluatorResult, EvaluatorVerdict
 from loop_product.protocols.node import NodeSpec
 from loop_product.protocols.schema import validate_repo_object
+from loop_product.state_io import write_json_read_only
 from loop_product.runtime_paths import (
     node_machine_handoff_ref,
     product_contract_path,
@@ -93,24 +95,48 @@ _SMOKE_FINAL_EFFECTS_TEMPLATE = """# LOOP System Smoke Final Effects
 
 - For smoke round {round_index}, the reviewer-visible verdict must be `{expected_verdict}` so the child loop can prove bounded retry handling end-to-end.
 """
+_REVIEWER_VERDICT_TOKEN = r"(?P<verdict>PASS|FAIL|STRUCTURED_EXCEPTION|BUG|STUCK|ERROR|INCONCLUSIVE|UNKNOWN)"
 _REVIEWER_VERDICT_RE = re.compile(
-    r"VERDICT\s*:\s*(PASS|FAIL|STRUCTURED_EXCEPTION|BUG|STUCK|ERROR|INCONCLUSIVE|UNKNOWN)\b",
+    rf"(?:OVERALL\s+)?VERDICT\s*:\s*`?\s*{_REVIEWER_VERDICT_TOKEN}\s*`?",
     re.IGNORECASE,
 )
 _LEADING_REVIEWER_VERDICT_RE = re.compile(
-    r"^(?:VERDICT\s*:\s*)?(PASS|FAIL|STRUCTURED_EXCEPTION|BUG|STUCK|ERROR|INCONCLUSIVE|UNKNOWN)\b",
+    rf"^(?:(?:OVERALL\s+)?VERDICT\s*:\s*)?`?\s*{_REVIEWER_VERDICT_TOKEN}\s*`?(?:[\s.:;,!?)]+|$)",
     re.IGNORECASE,
 )
 _WHOLE_PAPER_TERMINAL_CLASSIFICATIONS = {
-    "whole-paper faithful complete formalization",
-    "paper defect exposed",
-    "external dependency blocked",
+    "FULLY_FAITHFUL_COMPLETE",
+    "PAPER_DEFECT_EXPOSED",
+    "EXTERNAL_DEPENDENCY_BLOCKED",
+}
+_WHOLE_PAPER_TERMINAL_CLASSIFICATION_ALIASES = {
+    "whole-paper faithful complete formalization": "FULLY_FAITHFUL_COMPLETE",
+    "paper defect exposed": "PAPER_DEFECT_EXPOSED",
+    "external dependency blocked": "EXTERNAL_DEPENDENCY_BLOCKED",
 }
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_json_read_only(path, payload)
+
+
+class _RetryableEvaluatorPreflightError(RuntimeError):
+    """Preflight fault that should preserve retryable repair semantics."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        issue_kind: str,
+        evidence_refs: Sequence[str] = (),
+        self_attribution: str = "",
+        self_repair: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.issue_kind = str(issue_kind or "").strip()
+        self.evidence_refs = [str(item).strip() for item in evidence_refs if str(item).strip()]
+        self.self_attribution = str(self_attribution or "").strip()
+        self.self_repair = str(self_repair or "").strip()
 
 
 def _load_optional_json(path: Path) -> dict[str, Any]:
@@ -119,24 +145,120 @@ def _load_optional_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _resolve_workspace_local_status_ref(payload: Mapping[str, Any]) -> Path | None:
+    raw_ref = str(payload.get("whole_paper_status_ref") or "").strip()
+    workspace_root = str(payload.get("workspace_root") or "").strip()
+    workspace_mirror_ref = str(payload.get("workspace_mirror_ref") or payload.get("delivered_artifact_ref") or "").strip()
+
+    candidates: list[Path] = []
+    if raw_ref:
+        raw_path = Path(raw_ref).expanduser()
+        if raw_path.is_absolute():
+            candidates.append(raw_path.resolve())
+        else:
+            if workspace_root:
+                candidates.append((Path(workspace_root).expanduser().resolve() / raw_path).resolve())
+            if workspace_mirror_ref:
+                candidates.append((Path(workspace_mirror_ref).expanduser().resolve() / raw_path.name).resolve())
+    elif workspace_mirror_ref:
+        candidates.append((Path(workspace_mirror_ref).expanduser().resolve() / "WHOLE_PAPER_STATUS.json").resolve())
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _load_local_terminal_slice_status(payload: Mapping[str, Any]) -> dict[str, Any]:
+    status_ref = _resolve_workspace_local_status_ref(payload)
+    if status_ref is None:
+        return {}
+    status_payload = _load_optional_json(status_ref)
+    if not status_payload:
+        return {}
+    if str(status_payload.get("artifact_scope") or "").strip() != "slice":
+        return {}
+    terminal_authority_scope = str(status_payload.get("terminal_authority_scope") or "").strip()
+    if terminal_authority_scope != "local":
+        return {}
+    terminal_classification = str(status_payload.get("terminal_classification") or "").strip()
+    if str(status_payload.get("status") or "").strip().upper() == "TERMINAL" and terminal_classification == "SPLIT_ACCEPTED_CONTINUE_IMPLEMENTATION":
+        return {
+            "kind": "split_continuation",
+            "status_ref": str(status_ref),
+            "summary": str(status_payload.get("summary") or "").strip(),
+        }
+    return {}
+
+
 def _is_whole_paper_benchmark_submission(submission: EvaluatorNodeSubmission) -> bool:
-    return normalize_machine_choice(submission.workflow_scope, WORKFLOW_SCOPE_SPEC) == "whole_paper_formalization"
+    if normalize_machine_choice(submission.workflow_scope, WORKFLOW_SCOPE_SPEC) != "whole_paper_formalization":
+        return False
+    terminal_scope = normalize_machine_choice(submission.terminal_authority_scope, TERMINAL_AUTHORITY_SCOPE_SPEC)
+    artifact_scope = normalize_machine_choice(submission.artifact_scope, ARTIFACT_SCOPE_SPEC)
+    if artifact_scope == "slice" and terminal_scope != "whole_paper":
+        return False
+    return True
 
 
 def _submission_may_use_whole_paper_surface(submission: EvaluatorNodeSubmission, *, state_root: Path | None = None) -> bool:
-    if normalize_machine_choice(submission.artifact_scope, ARTIFACT_SCOPE_SPEC) == "slice":
+    effective_parent = str(submission.parent_node_id or "").strip()
+    effective_artifact_scope = normalize_machine_choice(submission.artifact_scope, ARTIFACT_SCOPE_SPEC)
+    effective_terminal_scope = normalize_machine_choice(submission.terminal_authority_scope, TERMINAL_AUTHORITY_SCOPE_SPEC)
+
+    kernel_state = None
+    target_payload: dict[str, Any] = {}
+    if state_root is not None:
+        kernel_state = query_kernel_state_object(state_root, continue_deferred=False)
+        target_payload = dict(kernel_state.nodes.get(submission.target_node_id) or {})
+        raw_target_artifact_scope = target_payload.get("artifact_scope")
+        raw_target_terminal_scope = target_payload.get("terminal_authority_scope")
+        raw_target_parent = target_payload.get("parent_node_id")
+        target_artifact_scope = normalize_machine_choice(raw_target_artifact_scope, ARTIFACT_SCOPE_SPEC)
+        target_terminal_scope = normalize_machine_choice(
+            raw_target_terminal_scope,
+            TERMINAL_AUTHORITY_SCOPE_SPEC,
+        )
+        if str(raw_target_artifact_scope or "").strip() and target_artifact_scope:
+            effective_artifact_scope = target_artifact_scope
+        if str(raw_target_terminal_scope or "").strip() and target_terminal_scope:
+            effective_terminal_scope = target_terminal_scope
+        if str(raw_target_parent or "").strip():
+            effective_parent = str(raw_target_parent).strip()
+
+    closeout_haystack = " ".join(
+        [
+            str(submission.target_node_id or ""),
+            str(submission.evaluator_node_id or ""),
+            str(submission.goal_slice or ""),
+            str(submission.lineage_ref or ""),
+        ]
+    ).lower()
+    looks_like_dedicated_whole_paper_closeout = any(
+        token in closeout_haystack
+        for token in (
+            "final-integration",
+            "final_integration",
+            "whole-paper-final",
+            "whole_paper_final",
+            "closeout",
+        )
+    )
+
+    if effective_terminal_scope != "whole_paper":
         return False
-    if normalize_machine_choice(submission.terminal_authority_scope, TERMINAL_AUTHORITY_SCOPE_SPEC) != "whole_paper":
+    if effective_artifact_scope == "slice" and not looks_like_dedicated_whole_paper_closeout:
         return False
-    parent = str(submission.parent_node_id or "").strip()
-    if parent == "":
+    if effective_parent == "":
         return True
+    if looks_like_dedicated_whole_paper_closeout:
+        return True
+
     if state_root is None:
-        return parent == "root-kernel"
-    kernel_state = load_kernel_state(state_root)
-    parent_payload = dict(kernel_state.nodes.get(parent) or {})
+        return effective_parent == "root-kernel" or looks_like_dedicated_whole_paper_closeout
+    parent_payload = dict(kernel_state.nodes.get(effective_parent) or {}) if kernel_state is not None else {}
     if not parent_payload:
-        return parent == "root-kernel"
+        return effective_parent == "root-kernel" or looks_like_dedicated_whole_paper_closeout
     if str(parent_payload.get("node_kind") or "").strip() == "kernel" and not str(parent_payload.get("parent_node_id") or "").strip():
         return True
     return normalize_machine_choice(parent_payload.get("terminal_authority_scope"), TERMINAL_AUTHORITY_SCOPE_SPEC) == "whole_paper"
@@ -144,6 +266,16 @@ def _submission_may_use_whole_paper_surface(submission: EvaluatorNodeSubmission,
 
 def _whole_paper_terminal_status_path(artifact_root: Path) -> Path:
     return artifact_root / "WHOLE_PAPER_STATUS.json"
+
+
+def _normalize_whole_paper_terminal_classification(raw: object) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    upper_value = value.upper()
+    if upper_value in _WHOLE_PAPER_TERMINAL_CLASSIFICATIONS:
+        return upper_value
+    return _WHOLE_PAPER_TERMINAL_CLASSIFICATION_ALIASES.get(value.lower(), "")
 
 
 def _required_output_paths_from_partition_plan(*, artifact_root: Path, target_node_id: str) -> list[str]:
@@ -212,28 +344,77 @@ def _enforce_publication_receipt_preflight(submission: EvaluatorNodeSubmission) 
         raise ValueError(f"evaluator preflight requires a runtime-owned publication receipt before launch: {receipt_path}")
     payload = json.loads(receipt_path.read_text(encoding="utf-8"))
     validate_repo_object("LoopWorkspaceArtifactPublicationReceipt.schema.json", payload)
+    repair_report = repair_publication_receipt_surface(
+        publication_receipt_ref=receipt_path,
+        publish_artifact_ref=artifact_root,
+    )
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    validate_repo_object("LoopWorkspaceArtifactPublicationReceipt.schema.json", payload)
     receipt_publish_ref = str(payload.get("publish_artifact_ref") or "").strip()
+    live_artifact_ref = str(payload.get("live_artifact_ref") or "").strip()
+    evidence_refs = [str(receipt_path), str(artifact_root)]
+    if live_artifact_ref:
+        evidence_refs.append(str(Path(live_artifact_ref).expanduser().resolve()))
+    if not repair_report.get("repairable"):
+        repair_summary = str(repair_report.get("repair_summary") or "").strip()
+        repair_reason = str(repair_report.get("repair_reason") or "publication_surface").strip()
+        raise _RetryableEvaluatorPreflightError(
+            repair_summary or "publication receipt surface is inconsistent and requires republish or artifact recovery",
+            issue_kind="publication_surface",
+            evidence_refs=evidence_refs,
+            self_attribution=f"evaluator_{repair_reason}",
+            self_repair=(
+                "repair the runtime-owned publication surface so the receipt, published mirror, and live artifact "
+                "agree, then rerun the evaluator"
+            ),
+        )
     if not receipt_publish_ref or Path(receipt_publish_ref).expanduser().resolve() != artifact_root:
-        raise ValueError("evaluator publication receipt does not match the current published artifact root")
+        raise _RetryableEvaluatorPreflightError(
+            "evaluator publication receipt does not match the current published artifact root",
+            issue_kind="publication_surface",
+            evidence_refs=evidence_refs,
+            self_attribution="evaluator_publication_receipt_publish_root_mismatch",
+            self_repair="rebuild the published mirror from the live artifact and refresh the publication receipt before rerunning evaluator",
+        )
     if artifact_root.exists() and artifact_root.is_dir():
         heavy = [str(item) for item in iter_runtime_heavy_tree_paths(artifact_root)]
         if heavy:
-            raise ValueError(
-                "evaluator preflight requires the published artifact root to stay free of runtime-owned heavy trees; "
-                f"republish before evaluator launch: {', '.join(heavy)}"
+            raise _RetryableEvaluatorPreflightError(
+                "evaluator preflight requires the published artifact root to stay free of runtime-owned heavy trees",
+                issue_kind="publication_surface",
+                evidence_refs=[*evidence_refs, *heavy],
+                self_attribution="evaluator_publish_root_contains_runtime_heavy_trees",
+                self_repair="rebuild the published mirror from the live artifact before rerunning evaluator",
             )
     publish_fingerprint = artifact_fingerprint(artifact_root, ignore_runtime_heavy=False)
     if str(payload.get("publish_artifact_fingerprint") or "").strip() != str(publish_fingerprint["fingerprint"]):
-        raise ValueError("evaluator preflight rejected a stale publication receipt for the published artifact root")
-    live_artifact_ref = str(payload.get("live_artifact_ref") or "").strip()
+        raise _RetryableEvaluatorPreflightError(
+            "evaluator preflight rejected a stale publication receipt for the published artifact root",
+            issue_kind="publication_surface",
+            evidence_refs=evidence_refs,
+            self_attribution="evaluator_publish_root_drifted_after_publication",
+            self_repair="republish the live artifact so the publication receipt matches the current published mirror",
+        )
     if not live_artifact_ref:
         raise ValueError("evaluator publication receipt must include live_artifact_ref")
     live_path = Path(live_artifact_ref).expanduser().resolve()
     if not live_path.exists():
-        raise ValueError(f"evaluator publication receipt points at a missing live artifact root: {live_path}")
+        raise _RetryableEvaluatorPreflightError(
+            f"evaluator publication receipt points at a missing live artifact root: {live_path}",
+            issue_kind="publication_surface",
+            evidence_refs=evidence_refs,
+            self_attribution="evaluator_missing_live_artifact_root",
+            self_repair="restore or rematerialize the live artifact root, then republish before rerunning evaluator",
+        )
     live_fingerprint = artifact_fingerprint(live_path, ignore_runtime_heavy=True)
     if str(payload.get("live_artifact_fingerprint") or "").strip() != str(live_fingerprint["fingerprint"]):
-        raise ValueError("evaluator preflight rejected a stale publication receipt because the live artifact changed")
+        raise _RetryableEvaluatorPreflightError(
+            "evaluator preflight rejected a stale publication receipt because the live artifact changed",
+            issue_kind="publication_surface",
+            evidence_refs=evidence_refs,
+            self_attribution="evaluator_live_artifact_changed_without_republication",
+            self_repair="republish the live artifact so the receipt matches the current live surface before rerunning evaluator",
+        )
 
 
 def _enforce_directory_artifact_hygiene_preflight(submission: EvaluatorNodeSubmission) -> None:
@@ -304,7 +485,9 @@ def _enforce_whole_paper_preflight(submission: EvaluatorNodeSubmission) -> None:
     if not isinstance(payload, dict):
         raise ValueError("whole-paper evaluator preflight requires WHOLE_PAPER_STATUS.json to contain a JSON object")
     status = str(payload.get("status") or "").strip().upper()
-    classification = str(payload.get("terminal_classification") or "").strip()
+    classification = _normalize_whole_paper_terminal_classification(
+        payload.get("whole_paper_terminal_classification") or payload.get("terminal_classification")
+    )
     if status != "TERMINAL":
         raise ValueError(
             "whole-paper evaluator preflight requires WHOLE_PAPER_STATUS.json to record a TERMINAL whole-paper state "
@@ -315,7 +498,7 @@ def _enforce_whole_paper_preflight(submission: EvaluatorNodeSubmission) -> None:
             "whole-paper evaluator preflight requires WHOLE_PAPER_STATUS.json to use one of the allowed terminal "
             f"classifications: {sorted(_WHOLE_PAPER_TERMINAL_CLASSIFICATIONS)}"
         )
-    kernel_state = load_kernel_state(state_root)
+    kernel_state = query_kernel_state_object(state_root, continue_deferred=False)
     target_payload = dict(kernel_state.nodes.get(submission.target_node_id) or {})
     depends_on = [str(item).strip() for item in list(target_payload.get("depends_on_node_ids") or []) if str(item).strip()]
     if not depends_on:
@@ -367,11 +550,95 @@ def _merge_terminal_implementer_result(*, existing: dict[str, Any], canonical: d
         "publish_ready_artifact_refs",
         "external_publish_target",
         "external_publication_owner",
+        "summary",
+        "completed_at_utc",
+        "terminal_reviewer_excerpt",
     }
     for key, value in canonical.items():
         if key in forced_keys or key not in merged or merged[key] in ("", None, [], {}):
             merged[key] = value
     return merged
+
+
+def canonicalize_authoritative_implementer_result_payload(*, existing: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize a previously materialized implementer_result from its nested evaluator_result."""
+
+    payload = dict(existing)
+    if str(payload.get("schema") or "") != "loop_product.implementer_result":
+        return payload
+    evaluator_result_data = dict(payload.get("evaluator_result") or {})
+    if not evaluator_result_data:
+        local_terminal_status = _load_local_terminal_slice_status(payload)
+        if str(local_terminal_status.get("kind") or "") == "split_continuation":
+            delivered_artifact_ref = str(
+                payload.get("delivered_artifact_ref")
+                or payload.get("workspace_mirror_ref")
+                or ""
+            ).strip()
+            canonical: dict[str, Any] = {
+                "status": "COMPLETED",
+                "outcome": "SPLIT_ACCEPTED_CONTINUE_IMPLEMENTATION",
+            }
+            summary = str(payload.get("summary") or local_terminal_status.get("summary") or "").strip()
+            if summary:
+                canonical["summary"] = summary
+            if delivered_artifact_ref:
+                canonical["delivered_artifact_ref"] = delivered_artifact_ref
+                canonical["workspace_mirror_ref"] = str(payload.get("workspace_mirror_ref") or delivered_artifact_ref)
+                canonical["publish_ready_artifact_refs"] = [delivered_artifact_ref]
+            completed_at_utc = str(payload.get("completed_at_utc") or payload.get("recorded_at_utc") or "").strip()
+            if completed_at_utc:
+                canonical["completed_at_utc"] = completed_at_utc
+            return _merge_terminal_implementer_result(existing=payload, canonical=canonical)
+        return payload
+    try:
+        evaluator_result = EvaluatorResult.from_dict(evaluator_result_data)
+    except Exception:
+        return payload
+
+    runtime_refs = dict(payload.get("runtime_refs") or {})
+    request_ref = str(runtime_refs.get("request_ref") or payload.get("request_ref") or "").strip()
+    evaluation_report_ref = str(runtime_refs.get("evaluation_report_ref") or payload.get("evaluation_report_ref") or "").strip()
+    reviewer_response_ref = str(runtime_refs.get("reviewer_response_ref") or payload.get("reviewer_response_ref") or "").strip()
+    if request_ref:
+        runtime_refs["request_ref"] = request_ref
+    if evaluation_report_ref:
+        runtime_refs["evaluation_report_ref"] = evaluation_report_ref
+    if reviewer_response_ref:
+        runtime_refs["reviewer_response_ref"] = reviewer_response_ref
+
+    canonical: dict[str, Any] = {
+        "status": "COMPLETED",
+        "outcome": (
+            "REPAIR_REQUIRED"
+            if evaluator_result.retryable and evaluator_result.verdict.value != "PASS"
+            else "COMPLETED"
+        ),
+        "evaluator": {
+            "verdict": evaluator_result.verdict.value,
+            "request_ref": request_ref,
+            "evaluation_report_ref": evaluation_report_ref,
+            "reviewer_response_ref": reviewer_response_ref,
+        },
+        "evaluator_result": evaluator_result.to_dict(),
+        "runtime_refs": runtime_refs,
+    }
+    if evaluator_result.summary:
+        canonical["summary"] = str(evaluator_result.summary)
+    if request_ref:
+        canonical["request_ref"] = request_ref
+    if evaluation_report_ref:
+        canonical["evaluation_report_ref"] = evaluation_report_ref
+    if reviewer_response_ref:
+        canonical["reviewer_response_ref"] = reviewer_response_ref
+        if Path(reviewer_response_ref).exists():
+            excerpt = Path(reviewer_response_ref).read_text(encoding="utf-8", errors="replace").strip()
+            if excerpt:
+                canonical["terminal_reviewer_excerpt"] = excerpt
+    completed_at_utc = str(payload.get("completed_at_utc") or "").strip()
+    if completed_at_utc:
+        canonical["completed_at_utc"] = completed_at_utc
+    return _merge_terminal_implementer_result(existing=payload, canonical=canonical)
 
 
 def materialize_terminal_implementer_result(
@@ -390,7 +657,7 @@ def materialize_terminal_implementer_result(
         node_payload = json.loads(node_path.read_text(encoding="utf-8"))
     else:
         try:
-            node_payload = dict(load_kernel_state(runtime_root).nodes.get(submission.target_node_id) or {})
+            node_payload = dict(query_kernel_state_object(runtime_root, continue_deferred=False).nodes.get(submission.target_node_id) or {})
         except Exception:
             node_payload = None
     if not node_payload:
@@ -459,11 +726,19 @@ def materialize_terminal_implementer_result(
 
     authoritative_existing = _load_optional_json(kernel_result_ref)
     authoritative_payload = _merge_terminal_implementer_result(existing=authoritative_existing, canonical=canonical_payload)
+    authoritative_payload = canonicalize_authoritative_implementer_result_payload(existing=authoritative_payload)
     _write_json(kernel_result_ref, authoritative_payload)
 
     workspace_existing = _load_optional_json(workspace_result_ref)
     workspace_payload = _merge_terminal_implementer_result(existing=workspace_existing, canonical=authoritative_payload)
+    workspace_payload = canonicalize_authoritative_implementer_result_payload(existing=workspace_payload)
     _write_json(workspace_result_ref, workspace_payload)
+    from loop_product.runtime.lifecycle import synchronize_authoritative_state
+
+    synchronize_authoritative_state(
+        state_root=runtime_root,
+        continue_deferred=False,
+    )
 
     return {
         "implementer_result_ref": str(kernel_result_ref),
@@ -476,10 +751,10 @@ def _parse_simple_reviewer_verdict(text: str) -> str:
     for line in [item.strip() for item in sample.splitlines() if item.strip()][:5]:
         match = _LEADING_REVIEWER_VERDICT_RE.search(line)
         if match:
-            return match.group(1).upper()
+            return str(match.group("verdict") or "").upper()
     match = _REVIEWER_VERDICT_RE.search(sample)
     if match:
-        return match.group(1).upper()
+        return str(match.group("verdict") or "").upper()
     return "UNKNOWN"
 
 
@@ -815,6 +1090,14 @@ def materialize_evaluator_request(
         "role_requirements": dict(submission.role_requirements),
         "agent_execution": dict(submission.agent_execution),
     }
+    if submission.implementation_package_ref:
+        request_obj["implementation_package_ref"] = submission.implementation_package_ref
+    if submission.artifact_publication_receipt_ref:
+        request_obj["artifact_publication_receipt_ref"] = submission.artifact_publication_receipt_ref
+    if submission.required_output_paths:
+        request_obj["required_output_paths"] = list(submission.required_output_paths)
+    if submission.context_refs:
+        request_obj["context_refs"] = list(submission.context_refs)
     if submission.final_effects_text_ref:
         request_obj["final_effects_text_ref"] = submission.final_effects_text_ref
     elif submission.final_effect_requirements:
@@ -840,10 +1123,62 @@ def run_evaluator_node(
 ) -> tuple[EvaluatorResult, dict[str, str]]:
     """Run the simple evaluator as a node-local evaluator boundary."""
 
-    _enforce_publication_receipt_preflight(submission)
-    _enforce_directory_artifact_hygiene_preflight(submission)
-    _enforce_required_output_preflight(submission)
-    _enforce_whole_paper_preflight(submission)
+    try:
+        _enforce_publication_receipt_preflight(submission)
+        _enforce_directory_artifact_hygiene_preflight(submission)
+        _enforce_required_output_preflight(submission)
+        _enforce_whole_paper_preflight(submission)
+    except _RetryableEvaluatorPreflightError as exc:
+        runtime_refs: dict[str, str] = {}
+        evaluator_result = EvaluatorResult(
+            verdict=EvaluatorVerdict.STUCK,
+            lane="reviewer",
+            summary=str(exc),
+            evidence_refs=list(exc.evidence_refs),
+            retryable=True,
+            diagnostics={
+                "self_attribution": exc.self_attribution or "evaluator_publication_surface",
+                "self_repair": exc.self_repair
+                or "repair the runtime-owned publication surface before rerunning the evaluator",
+                "issue_kind": exc.issue_kind,
+            },
+        )
+        accepted_transport = submit_control_envelope(
+            state_root,
+            ControlEnvelope(
+                source=submission.evaluator_node_id,
+                envelope_type="evaluator_result",
+                round_id=submission.round_id,
+                generation=submission.generation,
+                payload=evaluator_result.to_dict(),
+                status=EnvelopeStatus.REPORT,
+                note=evaluator_result.summary,
+            ),
+        )
+        if accepted_transport.status is not EnvelopeStatus.ACCEPTED:
+            return (
+                EvaluatorResult(
+                    verdict=EvaluatorVerdict.BUG,
+                    lane="reviewer",
+                    summary="evaluator preflight retryable result transport failed closed before authoritative acceptance",
+                    evidence_refs=list(exc.evidence_refs),
+                    retryable=False,
+                    diagnostics={
+                        "self_attribution": "evaluator_transport",
+                        "self_repair": "inspect gateway/kernel transport before blaming the implementation",
+                    },
+                ),
+                runtime_refs,
+            )
+        runtime_refs.update(
+            materialize_terminal_implementer_result(
+                state_root=state_root,
+                submission=submission,
+                evaluator_result=evaluator_result,
+                runtime_refs=runtime_refs,
+            )
+        )
+        return evaluator_result, runtime_refs
     request_ref, request_obj = materialize_evaluator_request(state_root=state_root, submission=submission)
     del poll_interval_s, no_progress_timeout_s, supervisor_child_argv_override
     report = run_evaluator(request=request_ref)

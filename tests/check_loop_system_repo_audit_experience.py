@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import sys
-import tempfile
 from pathlib import Path
 
 from jsonschema import Draft202012Validator, validate
@@ -33,6 +32,7 @@ def main() -> int:
         sys.path.insert(0, str(ROOT))
 
     try:
+        from test_support import temporary_repo_root
         from loop_product.kernel.authority import kernel_internal_authority
         from loop_product.kernel.audit import (
             query_audit_experience_view,
@@ -86,8 +86,8 @@ def main() -> int:
         status=NodeStatus.ACTIVE,
     )
 
-    with tempfile.TemporaryDirectory(prefix="loop_system_audit_experience_") as td:
-        state_root = Path(td) / ".loop"
+    with temporary_repo_root(prefix="loop_system_audit_experience_") as repo_root:
+        state_root = repo_root / ".loop"
         ensure_runtime_tree(state_root)
         kernel_state = KernelState(
             task_id="wave6-audit-experience",

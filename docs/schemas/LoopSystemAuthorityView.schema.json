@@ -16,6 +16,8 @@
     "delegation_map",
     "active_evaluator_lanes",
     "active_child_nodes",
+    "truthful_active_child_nodes",
+    "nonlive_active_child_nodes",
     "planned_child_nodes"
   ],
   "properties": {
@@ -51,7 +53,8 @@
           "generation",
           "round_id",
           "status",
-          "runtime_state"
+          "runtime_state",
+          "runtime_projection"
         ],
         "properties": {
           "node_id": {
@@ -139,6 +142,119 @@
                 "items": {
                   "type": "string"
                 }
+              },
+              "live_process_trusted": {
+                "type": "boolean"
+              },
+              "pid": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "pid_alive": {
+                "type": "boolean"
+              },
+              "lease_epoch": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "lease_owner_id": {
+                "type": "string"
+              },
+              "lease_freshness": {
+                "type": "string"
+              },
+              "lease_source": {
+                "type": "string"
+              },
+              "lease_duration_s": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "lease_expires_at": {
+                "type": "string"
+              },
+              "launch_event_id": {
+                "type": "string"
+              },
+              "status_result_ref": {
+                "type": "string"
+              },
+              "runtime_ref": {
+                "type": "string"
+              },
+              "process_fingerprint": {
+                "type": "string"
+              },
+              "process_started_at_utc": {
+                "type": "string"
+              }
+            }
+          },
+          "runtime_projection": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "source_kind",
+              "source_event_id",
+              "source_seq",
+              "raw_attachment_state",
+              "effective_attachment_state",
+              "lease_freshness",
+              "lease_epoch",
+              "lease_owner_id",
+              "observed_at",
+              "truthful_active"
+            ],
+            "properties": {
+              "source_kind": {
+                "type": "string",
+                "enum": [
+                  "runtime_liveness_event",
+                  "node_runtime_state"
+                ]
+              },
+              "source_event_id": {
+                "type": "string"
+              },
+              "source_seq": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "raw_attachment_state": {
+                "type": "string",
+                "enum": [
+                  "UNOBSERVED",
+                  "ATTACHED",
+                  "LOST",
+                  "TERMINAL"
+                ]
+              },
+              "effective_attachment_state": {
+                "type": "string",
+                "enum": [
+                  "UNOBSERVED",
+                  "ATTACHED",
+                  "LOST",
+                  "TERMINAL"
+                ]
+              },
+              "lease_freshness": {
+                "type": "string"
+              },
+              "lease_epoch": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "lease_owner_id": {
+                "type": "string"
+              },
+              "observed_at": {
+                "type": "string"
+              },
+              "truthful_active": {
+                "type": "boolean"
               }
             }
           }
@@ -209,11 +325,26 @@
         "type": "string"
       }
     },
+    "truthful_active_child_nodes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "nonlive_active_child_nodes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "planned_child_nodes": {
       "type": "array",
       "items": {
         "type": "string"
       }
+    },
+    "lease_fencing_summary": {
+      "type": "object"
     }
   }
 }

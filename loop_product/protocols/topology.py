@@ -119,3 +119,32 @@ class TopologyMutation:
             payload=dict(data.get("payload") or {}),
             reason=str(data.get("reason") or ""),
         )
+
+
+def topology_target_node_ids(
+    mutation: TopologyMutation,
+    *,
+    review: dict[str, Any] | None = None,
+) -> list[str]:
+    """Return normalized visible target node ids for a topology mutation."""
+
+    direct_targets = [str(item) for item in list(mutation.target_node_ids or []) if str(item).strip()]
+    if direct_targets:
+        return direct_targets
+    normalized_review = dict(review or {})
+    if mutation.kind == "relaunch":
+        replacement = dict(
+            mutation.payload.get("replacement_node")
+            or normalized_review.get("normalized_relaunch_target")
+            or {}
+        )
+        replacement_node_id = str(replacement.get("node_id") or "").strip()
+        return [replacement_node_id] if replacement_node_id else []
+    if mutation.kind == "split":
+        normalized_target_nodes = list(normalized_review.get("normalized_target_nodes") or [])
+        return [
+            str(dict(item or {}).get("node_id") or "").strip()
+            for item in normalized_target_nodes
+            if str(dict(item or {}).get("node_id") or "").strip()
+        ]
+    return []

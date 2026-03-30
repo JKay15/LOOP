@@ -4,13 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import difflib
+import errno
 import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -21,14 +25,18 @@ from typing import Any, Mapping, Sequence
 
 if __package__ in (None, ""):
     from loop_product.agent_provider import apply_env_map, resolve_agent_invocation
+    from loop_product.codex_home import default_codex_model, prepare_runtime_owned_codex_home
+    from loop_product.dispatch.publication import repair_publication_receipt_surface
     from loop_product.evaluator import role_launch as _role_launch
-    from loop_product.run_cmd import finish_running_cmd, start_cmd, terminate_running_cmd
-    from loop_product.runtime_paths import product_contract_path, product_repo_root, product_schema_path
+    from loop_product.run_cmd import _ENV_UNSET_SENTINEL, finish_running_cmd, start_cmd, terminate_running_cmd
+    from loop_product.runtime_paths import product_contract_path, product_repo_root, product_schema_path, shared_cache_helper_ref
 else:
     from ..agent_provider import apply_env_map, resolve_agent_invocation
+    from ..codex_home import default_codex_model, prepare_runtime_owned_codex_home
+    from ..dispatch.publication import repair_publication_receipt_surface
     from . import role_launch as _role_launch
-    from ..run_cmd import finish_running_cmd, start_cmd, terminate_running_cmd
-    from ..runtime_paths import product_contract_path, product_repo_root, product_schema_path
+    from ..run_cmd import _ENV_UNSET_SENTINEL, finish_running_cmd, start_cmd, terminate_running_cmd
+    from ..runtime_paths import product_contract_path, product_repo_root, product_schema_path, shared_cache_helper_ref
 
 _STANDALONE_PRODUCT_REPO_ROOT = product_repo_root()
 _ROOT = _STANDALONE_PRODUCT_REPO_ROOT
@@ -56,10 +64,31 @@ _DEFAULT_SELF_EVAL_POSITIVE_FIXTURE_FINAL_EFFECTS_TEXT = """# Bounded Positive F
 - In the current positive-path evaluator run, when the raw final-effects text is repairable, the checker auto-repairs it into normalized requirements and a requirement graph instead of stopping early.
 """
 _ROLE_IDS = ("checker", "test_designer", "ai_user", "reviewer")
+_CLONEFILE_FN = None
+if sys.platform == "darwin":
+    try:
+        _libc_path = ctypes.util.find_library("c")
+        if _libc_path:
+            _libc = ctypes.CDLL(_libc_path, use_errno=True)
+            _clonefile = getattr(_libc, "clonefile", None)
+            if _clonefile is not None:
+                _clonefile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32]
+                _clonefile.restype = ctypes.c_int
+                _CLONEFILE_FN = _clonefile
+    except Exception:
+        _CLONEFILE_FN = None
 _REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
 _TERMINAL_EVALUATION_STATUSES = {"PASS", "FAIL", "INCONCLUSIVE", "ERROR"}
 _SUPERVISOR_STATUSES = {"TERMINAL", "BUG", "STUCK"}
 _FILE_REF_LINE_SUFFIX = re.compile(r"^(?P<path>.+?):(?P<line>\d+)(?::(?P<column>\d+))?$")
+
+
+def _merge_safe_parent_transport_env() -> dict[str, str]:
+    if __package__ in (None, ""):
+        from loop_product.dispatch.launch_policy import merge_safe_parent_transport_env as _merge
+    else:
+        from ..dispatch.launch_policy import merge_safe_parent_transport_env as _merge
+    return _merge()
 _OPERATION_LOG_STEP_REF = re.compile(r"^(?:op|operation)\s*[-_#: ]?\s*(?P<index>\d+)$", re.IGNORECASE)
 _MANUAL_LINE_REF = re.compile(r"^manual[_ ]line[_ ](?P<line>\d+)$", re.IGNORECASE)
 _MANUAL_LINES_REF = re.compile(r"^manual[_ ]lines[_ ](?P<start>\d+)[_ -]+(?P<end>\d+)$", re.IGNORECASE)
@@ -209,24 +238,52 @@ def _rewrite_workspace_absolute_paths(
     text: str,
     source_workspace_root: Path,
     target_workspace_root: Path,
+    additional_path_mappings: Sequence[tuple[Path | str, Path | str]] = (),
 ) -> str:
+    def _path_string_variants(raw_path: Path | str) -> tuple[str, ...]:
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for candidate in (
+            str(Path(raw_path)),
+            str(Path(raw_path).resolve()),
+        ):
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            candidates.append(candidate)
+            if candidate.startswith("/private/"):
+                alias = candidate[len("/private") :]
+                if alias and alias not in seen:
+                    seen.add(alias)
+                    candidates.append(alias)
+            elif candidate.startswith("/var/") or candidate.startswith("/tmp/"):
+                alias = "/private" + candidate
+                if alias not in seen:
+                    seen.add(alias)
+                    candidates.append(alias)
+        return tuple(candidates)
+
     sanitized = str(text)
-    target_root = str(Path(target_workspace_root).resolve())
-    source_roots = tuple(
-        candidate
-        for candidate in dict.fromkeys(
-            (
-                str(Path(source_workspace_root)),
-                str(Path(source_workspace_root).resolve()),
-            )
-        )
-        if candidate
-    )
-    if not source_roots:
+    mapping_pairs: list[tuple[str, str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    raw_mappings: list[tuple[Path | str, Path | str]] = [
+        (source_workspace_root, target_workspace_root),
+        *list(additional_path_mappings),
+    ]
+    for raw_source_root, raw_target_root in raw_mappings:
+        target_root = str(Path(raw_target_root).resolve())
+        source_roots = _path_string_variants(raw_source_root)
+        for source_root in source_roots:
+            if source_root == target_root:
+                continue
+            pair = (source_root, target_root)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            mapping_pairs.append(pair)
+    if not mapping_pairs:
         return sanitized
-    for source_root in sorted(source_roots, key=len, reverse=True):
-        if source_root == target_root:
-            continue
+    for source_root, target_root in sorted(mapping_pairs, key=lambda item: len(item[0]), reverse=True):
         sanitized = sanitized.replace(source_root + "/", target_root + "/")
         sanitized = sanitized.replace(source_root, target_root)
     return sanitized
@@ -892,14 +949,42 @@ def _copy_tree_excluding(*, source_root: Path, dest_root: Path, excluded_paths: 
                 ignored.add(name)
         return ignored
 
-    shutil.copytree(source_root, dest_root, ignore=_ignore)
+    shutil.copytree(source_root, dest_root, ignore=_ignore, copy_function=_clone_or_copy_file)
+
+
+def _clone_or_copy_file(source: str | Path, dest: str | Path) -> Path:
+    source_path = Path(source)
+    dest_path = Path(dest)
+    if source_path.resolve() == dest_path.resolve():
+        return dest_path
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    if _CLONEFILE_FN is not None:
+        if dest_path.exists():
+            dest_path.unlink()
+        result = _CLONEFILE_FN(os.fsencode(source_path), os.fsencode(dest_path), 0)
+        if result == 0:
+            return dest_path
+        clone_err = ctypes.get_errno()
+        if clone_err not in {
+            errno.EEXIST,
+            errno.EINVAL,
+            errno.ENOSYS,
+            errno.ENOTSUP,
+            errno.EPERM,
+            errno.EXDEV,
+        }:
+            raise OSError(clone_err, os.strerror(clone_err), str(dest_path))
+        if dest_path.exists():
+            dest_path.unlink()
+    shutil.copy2(source_path, dest_path)
+    return dest_path
 
 
 def _copy_file_if_needed(*, source: Path, dest: Path) -> None:
     if source.resolve() == dest.resolve():
         return
     dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, dest)
+    _clone_or_copy_file(source, dest)
 
 
 def _copy_path_if_present(*, source: Path, dest: Path) -> None:
@@ -970,6 +1055,34 @@ def _materialize_current_run_snapshot(*, run_root: Path, snapshot_root: Path) ->
     ):
         _copy_path_if_present(source=run_root / relpath, dest=snapshot_root / relpath)
     return snapshot_root
+
+
+def _shared_current_run_snapshot_root(*, run_root: Path) -> Path:
+    shared_snapshot_root = run_root / ".loop_evaluator_internal" / "current_run_snapshot"
+    if not shared_snapshot_root.exists():
+        _materialize_current_run_snapshot(
+            run_root=run_root,
+            snapshot_root=shared_snapshot_root,
+        )
+    return shared_snapshot_root
+
+
+def _mount_shared_current_run_snapshot(*, run_root: Path, snapshot_root: Path) -> Path:
+    shared_snapshot_root = _shared_current_run_snapshot_root(run_root=run_root)
+    if snapshot_root.exists() or snapshot_root.is_symlink():
+        if snapshot_root.is_dir() and not snapshot_root.is_symlink():
+            shutil.rmtree(snapshot_root)
+        else:
+            snapshot_root.unlink()
+    snapshot_root.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        snapshot_root.symlink_to(shared_snapshot_root, target_is_directory=True)
+        return snapshot_root
+    except OSError:
+        return _materialize_current_run_snapshot(
+            run_root=run_root,
+            snapshot_root=snapshot_root,
+        )
 
 
 def _default_ai_user_excluded_paths(*, source_workspace_root: Path, output_root: Path) -> list[Path]:
@@ -1062,15 +1175,14 @@ def _materialize_ai_user_workspace(
         dest_root=workspace_copy_root,
         excluded_paths=excluded_paths,
     )
-    shared_snapshot_root = run_root / ".loop_evaluator_internal" / "current_run_snapshot"
-    if not shared_snapshot_root.exists():
-        _materialize_current_run_snapshot(
-            run_root=run_root,
-            snapshot_root=shared_snapshot_root,
-        )
-    current_run_snapshot_root = _materialize_current_run_snapshot(
+    _shared_current_run_snapshot_root(run_root=run_root)
+    current_run_snapshot_root = _mount_shared_current_run_snapshot(
         run_root=run_root,
         snapshot_root=workspace_copy_root / ".loop_evaluator_internal" / "current_run_snapshot",
+    )
+    _materialize_role_deliverable_surface(
+        request=request,
+        workspace_root=workspace_copy_root,
     )
 
     if _is_within(manual_path.resolve(), source_workspace_root):
@@ -1096,6 +1208,134 @@ def _materialize_ai_user_workspace(
         "response_path": dropbox_dir / "response.md",
         "operation_log_path": dropbox_dir / "operation_log.md",
     }
+
+
+def _deliverable_surface_source_roots(request: Mapping[str, Any]) -> list[Path]:
+    roots: list[Path] = []
+    receipt_ref_raw = str(request.get("artifact_publication_receipt_ref") or "").strip()
+    if receipt_ref_raw:
+        receipt_path = Path(receipt_ref_raw).expanduser().resolve()
+        if not receipt_path.exists():
+            raise ValueError(f"artifact_publication_receipt_ref does not exist: {receipt_path}")
+        try:
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"artifact_publication_receipt_ref is not valid JSON: {receipt_path}") from exc
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"artifact_publication_receipt_ref must contain a JSON object: {receipt_path}")
+        repair_report = repair_publication_receipt_surface(
+            publication_receipt_ref=receipt_path,
+        )
+        if not bool(repair_report.get("repairable")):
+            raise ValueError(
+                str(repair_report.get("repair_summary") or "").strip()
+                or f"artifact_publication_receipt_ref could not repair publish/live surface: {receipt_path}"
+            )
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        publish_ref_raw = str(payload.get("publish_artifact_ref") or "").strip()
+        if publish_ref_raw:
+            publish_root = Path(publish_ref_raw).expanduser().resolve()
+            if not publish_root.exists() or not publish_root.is_dir():
+                raise ValueError(
+                    f"artifact_publication_receipt_ref must resolve publish_artifact_ref to an existing directory: {publish_root}"
+                )
+            roots.append(publish_root)
+        live_ref_raw = str(payload.get("live_artifact_ref") or "").strip()
+        if live_ref_raw:
+            live_root = Path(live_ref_raw).expanduser().resolve()
+            if live_root.exists() and live_root.is_dir():
+                roots.append(live_root)
+    implementation_ref_raw = str(request.get("implementation_package_ref") or "").strip()
+    if implementation_ref_raw:
+        implementation_root = Path(implementation_ref_raw).expanduser().resolve()
+        if implementation_root.exists() and implementation_root.is_dir():
+            roots.append(implementation_root)
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        resolved = root.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        deduped.append(resolved)
+    return deduped
+
+
+def _materialize_role_deliverable_surface(*, request: Mapping[str, Any], workspace_root: Path) -> None:
+    source_roots = _deliverable_surface_source_roots(request)
+    if not source_roots:
+        return
+    deliverable_root = workspace_root / "deliverables" / "primary_artifact"
+    _copy_tree_excluding(
+        source_root=source_roots[0],
+        dest_root=deliverable_root,
+        excluded_paths=[],
+    )
+    required_output_paths = [
+        str(item).strip() for item in list(request.get("required_output_paths") or []) if str(item).strip()
+    ]
+    missing = [
+        relpath
+        for relpath in required_output_paths
+        if not (deliverable_root / relpath).exists()
+    ]
+    if missing:
+        raise ValueError(
+            "staged deliverable surface is missing required output paths after materialization: "
+            + ", ".join(missing)
+        )
+    _hydrate_staged_lean_deliverable_surface(
+        workspace_root=workspace_root,
+        deliverable_root=deliverable_root,
+        purpose=f"evaluator:staged_deliverable:{str(request.get('evaluation_id') or 'unknown')}",
+    )
+
+
+def _hydrate_staged_lean_deliverable_surface(
+    *,
+    workspace_root: Path,
+    deliverable_root: Path,
+    purpose: str,
+) -> None:
+    if not any((deliverable_root / name).is_file() for name in ("lakefile.lean", "lean-toolchain")):
+        return
+    helper_ref = shared_cache_helper_ref().resolve()
+    if not helper_ref.exists():
+        raise ValueError(f"shared-cache helper not found for staged Lean deliverable hydration: {helper_ref}")
+    external_build_root = (
+        workspace_root / ".loop_evaluator_internal" / "deliverable_builds" / (deliverable_root.name or "primary_artifact")
+    ).resolve()
+    completed = subprocess.run(
+        [
+            str(helper_ref),
+            "--repo-root",
+            str(product_repo_root().parent.resolve()),
+            "--workspace-root",
+            str(deliverable_root.resolve()),
+            "--external-build-root",
+            str(external_build_root),
+            "--purpose",
+            purpose,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise ValueError("staged Lean deliverable hydration failed" + (f": {detail}" if detail else ""))
+
+
+def _role_workspace_additional_path_mappings(
+    *,
+    request: Mapping[str, Any],
+    workspace_root: Path,
+) -> list[tuple[Path, Path]]:
+    deliverable_root = workspace_root / "deliverables" / "primary_artifact"
+    return [
+        (source_root, deliverable_root)
+        for source_root in _deliverable_surface_source_roots(request)
+    ]
 
 
 def _materialize_codex_role_workspace(
@@ -1124,9 +1364,13 @@ def _materialize_codex_role_workspace(
         if workspace_root.exists():
             shutil.rmtree(workspace_root)
         workspace_root.mkdir(parents=True, exist_ok=True)
-    current_run_snapshot_root = _materialize_current_run_snapshot(
+    current_run_snapshot_root = _mount_shared_current_run_snapshot(
         run_root=run_root,
         snapshot_root=workspace_root / ".loop_evaluator_internal" / "current_run_snapshot",
+    )
+    _materialize_role_deliverable_surface(
+        request=request,
+        workspace_root=workspace_root,
     )
     ordinary_test_artifact_root = workspace_root / ".loop_evaluator_internal" / safe_role_id / "ordinary_tests"
     return {
@@ -1142,6 +1386,7 @@ def _materialize_staged_role_context_ref(
     source_workspace_root: Path,
     source_path: Path,
     label: str,
+    additional_path_mappings: Sequence[tuple[Path | str, Path | str]] = (),
 ) -> Path:
     def _rewrite_if_workspace_text(staged_path: Path) -> None:
         if staged_path.suffix.lower() not in {".md", ".markdown", ".txt", ".rst", ".json", ".yaml", ".yml", ".toml", ".tex"}:
@@ -1150,11 +1395,15 @@ def _materialize_staged_role_context_ref(
             text = staged_path.read_text(encoding="utf-8")
         except Exception:
             return
-        source_prefix = str(source_root)
-        staged_prefix = str(staged_root)
-        if source_prefix not in text:
+        rewritten = _rewrite_workspace_absolute_paths(
+            text=text,
+            source_workspace_root=source_root,
+            target_workspace_root=staged_root,
+            additional_path_mappings=additional_path_mappings,
+        )
+        if rewritten == text:
             return
-        staged_path.write_text(text.replace(source_prefix, staged_prefix), encoding="utf-8")
+        staged_path.write_text(rewritten, encoding="utf-8")
 
     resolved_source = source_path.resolve()
     staged_root = staged_workspace_root.resolve()
@@ -1164,10 +1413,18 @@ def _materialize_staged_role_context_ref(
         if candidate.exists():
             _rewrite_if_workspace_text(candidate)
             return candidate
+    for source_prefix_raw, target_prefix_raw in additional_path_mappings:
+        source_prefix = Path(source_prefix_raw).resolve()
+        target_prefix = Path(target_prefix_raw).resolve()
+        if not _is_within(resolved_source, source_prefix):
+            continue
+        candidate = target_prefix / resolved_source.relative_to(source_prefix)
+        if candidate.exists():
+            _rewrite_if_workspace_text(candidate)
+            return candidate
     staged_input_path = staged_root / ".loop_evaluator_internal" / "inputs" / f"{label}__{resolved_source.name}"
     _copy_file_if_needed(source=resolved_source, dest=staged_input_path)
-    if _is_within(resolved_source, source_root):
-        _rewrite_if_workspace_text(staged_input_path)
+    _rewrite_if_workspace_text(staged_input_path)
     return staged_input_path
 
 
@@ -1403,6 +1660,30 @@ def _normalize_request(request: Mapping[str, Any], *, request_path: Path | None 
     normalized["workspace_root"] = str(workspace_root)
     normalized["output_root"] = str(output_root)
     normalized["product_manual_ref"] = str(_resolve_path(workspace_root, str(normalized["product_manual_ref"])))
+    implementation_package_ref = str(normalized.get("implementation_package_ref") or "").strip()
+    if implementation_package_ref:
+        normalized["implementation_package_ref"] = str(_resolve_path(request_anchor_root, implementation_package_ref))
+    artifact_publication_receipt_ref = str(normalized.get("artifact_publication_receipt_ref") or "").strip()
+    if artifact_publication_receipt_ref:
+        normalized["artifact_publication_receipt_ref"] = str(
+            _resolve_path(request_anchor_root, artifact_publication_receipt_ref)
+        )
+    required_output_paths = normalized.get("required_output_paths") or []
+    if required_output_paths:
+        if not isinstance(required_output_paths, list):
+            raise ValueError("required_output_paths must be a list when provided")
+        normalized["required_output_paths"] = [
+            str(item).strip() for item in required_output_paths if str(item).strip()
+        ]
+    context_refs = normalized.get("context_refs") or []
+    if context_refs:
+        if not isinstance(context_refs, list):
+            raise ValueError("context_refs must be a list when provided")
+        normalized["context_refs"] = [
+            str(_resolve_path(request_anchor_root, str(item).strip()))
+            for item in context_refs
+            if str(item).strip()
+        ]
 
     final_effects_text_ref = str(normalized.get("final_effects_text_ref") or "").strip()
     if final_effects_text_ref:
@@ -2108,6 +2389,9 @@ def _normalize_agent_config(request: Mapping[str, Any], role_id: str) -> dict[st
     reasoning_effort = str(merged.get("reasoning_effort") or "").strip().lower()
     if reasoning_effort and reasoning_effort not in _REASONING_EFFORTS:
         raise ValueError(f"unsupported reasoning_effort for {role_id}: {reasoning_effort}")
+    provider_id = str(merged.get("agent_provider") or "").strip().lower()
+    if provider_id == "codex_cli" and not str(merged.get("model") or "").strip():
+        merged["model"] = default_codex_model()
     return merged
 
 
@@ -2125,6 +2409,9 @@ def _effective_agent_cmd(*, resolved: Any, config: Mapping[str, Any]) -> str:
         '${LOOP_PRODUCT_EVAL_OUTPUT_SCHEMA:+--output-schema "$LOOP_PRODUCT_EVAL_OUTPUT_SCHEMA"}',
         '-o "${LOOP_PRODUCT_EVAL_RAW_RESPONSE_PATH:-$LOOP_PRODUCT_EVAL_RESPONSE_PATH}"',
     ]
+    model = str(config.get("model") or "").strip()
+    if model:
+        parts.append(f"-m {shlex.quote(model)}")
     reasoning_effort = str(config.get("reasoning_effort") or "").strip().lower()
     if reasoning_effort in _REASONING_EFFORTS:
         config_value = f'model_reasoning_effort="{reasoning_effort}"'
@@ -2151,9 +2438,8 @@ def _agent_runtime_env_overrides(
     role_root: Path | None = None,
 ) -> dict[str, str]:
     del resolved, effective_cmd
-    del role_root
     sanitized_parent_codex_env = {
-        key: ""
+        key: _ENV_UNSET_SENTINEL
         for key in os.environ
         if key.startswith("CODEX_") and key != "CODEX_HOME"
     }
@@ -2162,8 +2448,13 @@ def _agent_runtime_env_overrides(
     for part in existing_pythonpath:
         if part not in repo_pythonpath:
             repo_pythonpath.append(part)
+    runtime_codex_home = prepare_runtime_owned_codex_home(
+        runtime_home=((Path(role_root).resolve() / ".codex_runtime") if role_root is not None else (run_root / ".codex_runtime"))
+    )
     return {
         **sanitized_parent_codex_env,
+        "CODEX_HOME": str(runtime_codex_home),
+        **_merge_safe_parent_transport_env(),
         "PYTHONPATH": os.pathsep.join(repo_pythonpath),
         "OTEL_SDK_DISABLED": "true",
         "OTEL_TRACES_EXPORTER": "none",
@@ -2307,6 +2598,9 @@ def _provider_retry_delay_s(issue_kind: str, *, failure_count: int) -> float | N
     plans: dict[str, tuple[float, ...]] = {
         "provider_transport": (1.0, 2.0),
         "provider_runtime": (1.0, 2.0),
+        # Preserve one short lane-local retry so direct same-run evaluator resumes keep
+        # the historical bounded retry contract. Runtime-owned supervision still owns
+        # the durable outer cooldown/queue once a run settles on RECOVERY_REQUIRED.
         "provider_capacity": (2.0,),
     }
     delays = plans.get(str(issue_kind or "").strip())
@@ -2494,6 +2788,14 @@ def _invoke_role(
     final_exit_code = -1
     final_attempt_count = 0
     terminal_error: Exception | None = None
+    terminal_success_streams: list[str] | None = None
+    terminal_success_patterns: list[str] | None = None
+    if (
+        str(launch_spec.get("launch_mode") or "") == "provider_argv"
+        and str(launch_spec.get("provider_id") or "") == "codex_cli"
+    ):
+        terminal_success_streams = ["stderr"]
+        terminal_success_patterns = [r"\btokens used\b"]
     for attempt_index in range(1, 5):
         final_attempt_count = attempt_index
         for stale_path in (
@@ -2522,6 +2824,10 @@ def _invoke_role(
             label=f"{safe_role_label}__{attempt_suffix}",
             timeout_s=3600,
             idle_timeout_s=600,
+            terminal_success_paths=[str(effective_response_path)],
+            terminal_success_stable_s=1.0,
+            terminal_success_streams=terminal_success_streams,
+            terminal_success_patterns=terminal_success_patterns,
             reconnect_grace_s=30,
             reconnect_max_events=8,
         )
@@ -4927,6 +5233,10 @@ def _run_ai_user_effect(
         manual_path=manual_path,
     )
     staged_workspace_root = Path(staging["workspace_root"])
+    staged_path_mappings = _role_workspace_additional_path_mappings(
+        request=request,
+        workspace_root=staged_workspace_root,
+    )
     staged_manual_path = Path(staging["manual_path"])
     effect_scratch_dir = Path(staging["scratch_dir"])
     current_run_snapshot_root = Path(staging["current_run_snapshot_root"])
@@ -4935,6 +5245,7 @@ def _run_ai_user_effect(
         text=manual_text,
         source_workspace_root=Path(str(request["workspace_root"])),
         target_workspace_root=staged_workspace_root,
+        additional_path_mappings=staged_path_mappings,
     )
     prompt_text = build_ai_user_prompt(
         request=request,
@@ -5346,10 +5657,15 @@ def run_evaluator_prototype(*, request: Mapping[str, Any] | str | Path) -> dict[
                     role_id="checker",
                     copy_source_workspace=False,
                 )
+                checker_path_mappings = _role_workspace_additional_path_mappings(
+                    request=normalized_request,
+                    workspace_root=Path(checker_workspace["workspace_root"]),
+                )
                 staged_goals_text = _rewrite_workspace_absolute_paths(
                     text=goals_text,
                     source_workspace_root=workspace_root,
                     target_workspace_root=Path(checker_workspace["workspace_root"]),
+                    additional_path_mappings=checker_path_mappings,
                 )
                 checker_result_raw, checker_run = _invoke_role(
                     role_id="checker",
@@ -5373,6 +5689,7 @@ def run_evaluator_prototype(*, request: Mapping[str, Any] | str | Path) -> dict[
                                 source_workspace_root=workspace_root,
                                 source_path=goals_path,
                                 label="final_effects_text",
+                                additional_path_mappings=checker_path_mappings,
                             )
                         ),
                     },
@@ -5409,10 +5726,15 @@ def run_evaluator_prototype(*, request: Mapping[str, Any] | str | Path) -> dict[
                 role_id="test_ai",
                 copy_source_workspace=True,
             )
+            test_designer_path_mappings = _role_workspace_additional_path_mappings(
+                request=normalized_request,
+                workspace_root=Path(test_designer_workspace["workspace_root"]),
+            )
             staged_manual_text = _rewrite_workspace_absolute_paths(
                 text=manual_text,
                 source_workspace_root=workspace_root,
                 target_workspace_root=Path(test_designer_workspace["workspace_root"]),
+                additional_path_mappings=test_designer_path_mappings,
             )
             designer_result, designer_run = _invoke_role(
                 role_id="test_designer",
@@ -5444,6 +5766,7 @@ def run_evaluator_prototype(*, request: Mapping[str, Any] | str | Path) -> dict[
                             source_workspace_root=workspace_root,
                             source_path=manual_path,
                             label="product_manual",
+                            additional_path_mappings=test_designer_path_mappings,
                         )
                     ),
                     "final_effect_requirements": final_effect_requirements,
@@ -5493,10 +5816,15 @@ def run_evaluator_prototype(*, request: Mapping[str, Any] | str | Path) -> dict[
                 role_id="reviewer",
                 copy_source_workspace=False,
             )
+            reviewer_path_mappings = _role_workspace_additional_path_mappings(
+                request=normalized_request,
+                workspace_root=Path(reviewer_workspace["workspace_root"]),
+            )
             staged_reviewer_manual_text = _rewrite_workspace_absolute_paths(
                 text=manual_text,
                 source_workspace_root=workspace_root,
                 target_workspace_root=Path(reviewer_workspace["workspace_root"]),
+                additional_path_mappings=reviewer_path_mappings,
             )
             reviewer_result_raw, reviewer_run = _invoke_role(
                 role_id="reviewer",
@@ -5527,6 +5855,7 @@ def run_evaluator_prototype(*, request: Mapping[str, Any] | str | Path) -> dict[
                             source_workspace_root=workspace_root,
                             source_path=manual_path,
                             label="product_manual",
+                            additional_path_mappings=reviewer_path_mappings,
                         )
                     ),
                     "final_effect_requirements": final_effect_requirements,

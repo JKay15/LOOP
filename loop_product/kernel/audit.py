@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from loop_product.kernel.state import load_kernel_state
+from loop_product.kernel.state import query_kernel_state_object
 from loop_product.protocols.schema import validate_repo_object
 from loop_product.runtime_paths import require_runtime_root
 
@@ -64,7 +64,7 @@ def query_audit_experience_view(state_root: Path, *, node_id: str | None = None,
     """Return the IF-6 read-only audit and experience view."""
 
     state_root = require_runtime_root(state_root)
-    kernel_state = load_kernel_state(state_root)
+    kernel_state = query_kernel_state_object(state_root, continue_deferred=False)
     recent_all = query_recent_audit_events(state_root, limit=max(int(limit), 1) * 5)
     recent_structural_decisions = [
         item

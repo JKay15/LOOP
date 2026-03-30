@@ -40,6 +40,29 @@ def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def authoritative_result_retryable_nonterminal(payload: Mapping[str, Any]) -> bool:
+    evaluator_result = dict(payload.get("evaluator_result") or {})
+    verdict = str(evaluator_result.get("verdict") or "").strip().upper()
+    retryable = bool(evaluator_result.get("retryable"))
+    return bool(verdict) and retryable and verdict != "PASS"
+
+
+def authoritative_result_has_evaluator_evidence(payload: Mapping[str, Any]) -> bool:
+    evaluator_result = dict(payload.get("evaluator_result") or {})
+    verdict = str(evaluator_result.get("verdict") or "").strip().upper()
+    if not verdict:
+        return False
+    for candidate in (
+        payload.get("evaluation_report_ref"),
+        dict(payload.get("runtime_refs") or {}).get("evaluation_report_ref"),
+        dict(payload.get("evaluator") or {}).get("evaluation_report_ref"),
+    ):
+        ref = str(candidate or "").strip()
+        if ref and Path(ref).expanduser().resolve().exists():
+            return True
+    return False
+
+
 def latest_evaluator_run_state_ref(*, state_root: Path, node_id: str) -> Path | None:
     runtime_root = require_runtime_root(state_root)
     base = runtime_root / "artifacts" / "evaluator_runs" / node_id
@@ -69,22 +92,16 @@ def evaluator_run_is_inflight(payload: Mapping[str, Any]) -> bool:
 def evaluator_backed_terminal_closure(payload: Mapping[str, Any]) -> bool:
     if str(payload.get("status") or "").strip().upper() != "COMPLETED":
         return False
-    evaluator_result = dict(payload.get("evaluator_result") or {})
-    verdict = str(evaluator_result.get("verdict") or "").strip().upper()
-    if not verdict:
+    if not authoritative_result_has_evaluator_evidence(payload):
         return False
-    for candidate in (
-        payload.get("evaluation_report_ref"),
-        dict(payload.get("runtime_refs") or {}).get("evaluation_report_ref"),
-        dict(payload.get("evaluator") or {}).get("evaluation_report_ref"),
-    ):
-        ref = str(candidate or "").strip()
-        if ref and Path(ref).expanduser().resolve().exists():
-            return True
-    return False
+    if authoritative_result_retryable_nonterminal(payload):
+        return False
+    return True
 
 
 def authoritative_result_claims_terminal_state(payload: Mapping[str, Any]) -> bool:
+    if authoritative_result_retryable_nonterminal(payload):
+        return False
     status = str(payload.get("status") or "").strip().upper()
     outcome = str(payload.get("outcome") or "").strip().upper()
     if status in _TERMINALISH_RESULT_STATUSES:

@@ -33,6 +33,7 @@
     "node_id": { "type": "string", "minLength": 1 },
     "workspace_root": { "type": "string", "minLength": 1 },
     "state_root": { "type": "string", "minLength": 1 },
+    "runtime_root_identity_token": { "type": "string", "minLength": 1 },
     "startup_health_timeout_ms": { "type": "integer", "minimum": 0 },
     "startup_retry_limit": { "type": "integer", "minimum": 0 },
     "attempt_count": { "type": "integer", "minimum": 0 },

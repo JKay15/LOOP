@@ -17,6 +17,7 @@ from loop_product.kernel.state import KernelState, persist_kernel_state
 from loop_product.protocols.node import NodeSpec, NodeStatus
 from loop_product.protocols.schema import validate_repo_object
 from loop_product.runtime_paths import (
+    default_child_workspace_root,
     require_runtime_root,
     resolve_implementer_project_root,
 )
@@ -56,6 +57,7 @@ def materialize_child(
     terminal_authority_scope: str = TERMINAL_AUTHORITY_SCOPE_SPEC.default_value,
     required_output_paths: list[str] | None = None,
     startup_required_output_paths: list[str] | None = None,
+    progress_checkpoints: list[dict[str, Any]] | None = None,
     workspace_root: str | Path | None = None,
     codex_home: str | Path | None = None,
     depends_on_node_ids: list[str] | None = None,
@@ -80,10 +82,15 @@ def materialize_child(
     resolved_startup_required_output_paths = [
         str(item).strip() for item in (startup_required_output_paths or []) if str(item).strip()
     ]
+    resolved_progress_checkpoints = list(progress_checkpoints or [])
     resolved_depends_on = [str(item).strip() for item in (depends_on_node_ids or []) if str(item).strip()]
     resolved_result_sink_ref = result_sink_ref or f"artifacts/{node_id}/result.json"
     resolved_lineage_ref = lineage_ref or f"{parent_snapshot.get('lineage_ref') or parent_node_id}->{node_id}"
-    resolved_workspace_root = resolve_implementer_project_root(node_id=node_id, workspace_root=workspace_root)
+    default_workspace_root = default_child_workspace_root(state_root=state_root, node_id=node_id)
+    resolved_workspace_root = resolve_implementer_project_root(
+        node_id=node_id,
+        workspace_root=workspace_root if workspace_root not in (None, "") else default_workspace_root,
+    )
     resolved_workspace_root.mkdir(parents=True, exist_ok=True)
     node = NodeSpec(
         node_id=node_id,
@@ -104,6 +111,7 @@ def materialize_child(
         ),
         required_output_paths=resolved_required_output_paths,
         startup_required_output_paths=resolved_startup_required_output_paths,
+        progress_checkpoints=resolved_progress_checkpoints,
         workspace_root=str(resolved_workspace_root),
         codex_home="",
         depends_on_node_ids=resolved_depends_on,
@@ -131,6 +139,7 @@ def materialize_child(
         "terminal_authority_scope": str(node.terminal_authority_scope),
         "required_output_paths": list(node.required_output_paths),
         "startup_required_output_paths": list(node.startup_required_output_paths),
+        "progress_checkpoints": list(node.progress_checkpoints),
         "workspace_root": str(node.workspace_root),
         "codex_home": str(node.codex_home),
         "depends_on_node_ids": list(node.depends_on_node_ids),

@@ -7,14 +7,29 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from loop_product.dispatch.bootstrap import bootstrap_first_implementer_node
-from loop_product.dispatch.launch_runtime import launch_child_from_result_ref
+from loop_product.dispatch.launch_runtime import terminate_runtime_owned_launch_result_ref
 from loop_product.kernel.authority import KernelMutationAuthority
 from loop_product.kernel.state import ACTIVE_NODE_STATUSES, KernelState, persist_node_snapshot
 from loop_product.protocols.control_envelope import ControlEnvelope
 from loop_product.protocols.node import NodeSpec, RuntimeAttachmentState, normalize_runtime_state
 from loop_product.protocols.topology import TopologyMutation
+from loop_product.runtime.launch_surface import launch_child_from_result_ref
 from loop_product.runtime_paths import node_machine_handoff_ref
 from loop_product.topology.budget import normalized_complexity_budget
+
+
+def _latest_runtime_status_payload(runtime_state: Mapping[str, Any]) -> dict[str, Any]:
+    evidence_refs = [str(item or "").strip() for item in list(dict(runtime_state or {}).get("evidence_refs") or [])]
+    for ref in reversed(evidence_refs):
+        if not ref.endswith("ChildRuntimeStatusResult.json"):
+            continue
+        try:
+            payload = json.loads(Path(ref).expanduser().resolve().read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return {}
 
 
 def build_resume_request(
@@ -105,6 +120,8 @@ def review_recovery_request(kernel_state: KernelState, mutation: TopologyMutatio
     allowed_actions = {str(item) for item in source.get("allowed_actions") or []}
     source_runtime_state = normalize_runtime_state(dict(source.get("runtime_state") or {}))
     source_attachment_state = str(source_runtime_state.get("attachment_state") or RuntimeAttachmentState.UNOBSERVED.value)
+    latest_runtime_status = _latest_runtime_status_payload(source_runtime_state)
+    latest_recovery_reason = str(latest_runtime_status.get("recovery_reason") or "").strip()
     payload = dict(mutation.payload or {})
     normalized_runtime_loss_signal = _normalized_runtime_loss_signal(payload.get("runtime_loss_signal"))
     self_attribution = str(payload.get("self_attribution") or "").strip()
@@ -142,6 +159,7 @@ def review_recovery_request(kernel_state: KernelState, mutation: TopologyMutatio
         active_runtime_loss_ok = source_status == "ACTIVE" and (
             source_attachment_state == RuntimeAttachmentState.LOST.value or bool(normalized_runtime_loss_signal)
         )
+        state_blocked_runtime_truth = source_status == "BLOCKED" and latest_recovery_reason == "node_status_blocked"
         checks = [
             {
                 "check_id": "R1_source_node_authorized",
@@ -160,6 +178,11 @@ def review_recovery_request(kernel_state: KernelState, mutation: TopologyMutatio
                 "passed": source_status != "ACTIVE" or active_runtime_loss_ok,
                 "detail": "retry on an ACTIVE node requires explicit runtime-loss evidence or a persisted LOST runtime attachment",
             },
+            {
+                "check_id": "R4_retryable_blocker",
+                "passed": not state_blocked_runtime_truth,
+                "detail": "retry must not re-arm a BLOCKED node when the latest trusted runtime status already says recovery_reason=node_status_blocked",
+            },
         ]
         accepted = all(bool(item["passed"]) for item in checks)
         return {
@@ -173,6 +196,7 @@ def review_recovery_request(kernel_state: KernelState, mutation: TopologyMutatio
             "self_attribution": self_attribution,
             "self_repair": self_repair,
             "normalized_runtime_loss_signal": normalized_runtime_loss_signal,
+            "latest_runtime_recovery_reason": latest_recovery_reason,
         }
 
     if mutation.kind == "relaunch":
@@ -286,7 +310,11 @@ def apply_accepted_recovery_mutation(
             )
         kernel_state.blocked_reasons.pop(source_node_id, None)
         persist_node_snapshot(state_root, source_record, authority=authority)
-        if mutation.kind == "resume" and previous_runtime_state.get("attachment_state") != RuntimeAttachmentState.ATTACHED.value:
+        if (
+            mutation.kind == "resume"
+            and previous_runtime_state.get("attachment_state") != RuntimeAttachmentState.ATTACHED.value
+            and _resume_relaunch_available(state_root=state_root, source_record=source_record)
+        ):
             try:
                 _bootstrap_and_launch_resumed_node(
                     state_root=state_root,
@@ -354,6 +382,48 @@ def apply_accepted_recovery_mutation(
         lineage_ref=str(target.get("lineage_ref") or ""),
         authority=authority,
     )
+    if not _resume_relaunch_available(state_root=state_root, source_record=source_record):
+        return
+    replacement_record = dict(kernel_state.nodes.get(replacement_node_id) or {})
+    launch_result_ref = ""
+    try:
+        from loop_product.child_supervision_sidecar import ensure_child_supervision_running
+        from loop_product.kernel.topology import _child_bootstrap_request_from_source_handoff
+
+        bootstrap_payload = bootstrap_first_implementer_node(
+            authority=authority,
+            **_child_bootstrap_request_from_source_handoff(
+                state_root=state_root,
+                source_record=source_record,
+                child_record=replacement_record,
+            ),
+        )
+        launch_payload = launch_child_from_result_ref(result_ref=str(bootstrap_payload.get("bootstrap_result_ref") or ""))
+        launch_result_ref = str(launch_payload.get("launch_result_ref") or "").strip()
+        if not launch_result_ref:
+            raise ValueError("accepted relaunch replacement launch did not return launch_result_ref")
+        ensure_child_supervision_running(launch_result_ref=launch_result_ref)
+    except Exception as exc:  # noqa: BLE001
+        if launch_result_ref:
+            try:
+                terminate_runtime_owned_launch_result_ref(result_ref=launch_result_ref)
+            except Exception:
+                pass
+        if replacement_node_id in kernel_state.nodes:
+            replacement_record = kernel_state.nodes[replacement_node_id]
+            summary = f"accepted relaunch replacement bootstrap/launch failed: {exc}"
+            replacement_record["status"] = "BLOCKED"
+            replacement_record["runtime_state"] = normalize_runtime_state(
+                {
+                    "attachment_state": RuntimeAttachmentState.LOST.value,
+                    "observed_at": str(envelope.accepted_at or ""),
+                    "summary": summary,
+                    "observation_kind": "relaunch_launch_error",
+                    "evidence_refs": [f"control_envelope:{str(envelope.envelope_id or '')}"],
+                }
+            )
+            kernel_state.blocked_reasons[replacement_node_id] = summary
+            persist_node_snapshot(state_root, replacement_record, authority=authority)
 
 
 def _normalized_relaunch_target(
@@ -430,10 +500,26 @@ def _same_node_continue_exact_request(*, state_root: Path, source_record: Mappin
         ),
         "endpoint_artifact_ref": endpoint_artifact_ref,
         "workspace_mirror_relpath": str(handoff.get("workspace_mirror_relpath") or "deliverables/primary_artifact"),
+        "workspace_live_artifact_relpath": str(handoff.get("workspace_live_artifact_relpath") or ""),
         "external_publish_target": str(handoff.get("external_publish_target") or ""),
+        "required_output_paths": [
+            str(item).strip() for item in list(handoff.get("required_output_paths") or []) if str(item).strip()
+        ],
+        "startup_required_output_paths": [
+            str(item).strip() for item in list(handoff.get("startup_required_output_paths") or []) if str(item).strip()
+        ],
+        "progress_checkpoints": list(handoff.get("progress_checkpoints") or []),
         "context_refs": [str(item) for item in list(handoff.get("context_refs") or [])],
         "result_sink_ref": result_sink_ref,
     }
+
+
+def _resume_relaunch_available(*, state_root: Path, source_record: Mapping[str, Any]) -> bool:
+    workspace_root = str(source_record.get("workspace_root") or "").strip()
+    node_id = str(source_record.get("node_id") or "").strip()
+    if not workspace_root or not node_id:
+        return False
+    return node_machine_handoff_ref(state_root=state_root, node_id=node_id).exists()
 
 
 def _bootstrap_and_launch_resumed_node(
@@ -442,11 +528,24 @@ def _bootstrap_and_launch_resumed_node(
     source_record: Mapping[str, Any],
     authority: KernelMutationAuthority | None = None,
 ) -> None:
+    from loop_product.child_supervision_sidecar import ensure_child_supervision_running
+
     bootstrap_payload = bootstrap_first_implementer_node(
         authority=authority,
         **_same_node_continue_exact_request(state_root=state_root, source_record=source_record),
     )
-    launch_child_from_result_ref(result_ref=str(bootstrap_payload.get("bootstrap_result_ref") or ""))
+    launch_payload = launch_child_from_result_ref(result_ref=str(bootstrap_payload.get("bootstrap_result_ref") or ""))
+    launch_result_ref = str(launch_payload.get("launch_result_ref") or "").strip()
+    if not launch_result_ref:
+        raise ValueError("resume relaunch did not return launch_result_ref")
+    try:
+        ensure_child_supervision_running(launch_result_ref=launch_result_ref)
+    except Exception:
+        try:
+            terminate_runtime_owned_launch_result_ref(result_ref=launch_result_ref)
+        except Exception:
+            pass
+        raise
 
 
 def _archive_superseded_authoritative_result(

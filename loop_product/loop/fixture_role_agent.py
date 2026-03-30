@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import sys
 import time
 from pathlib import Path
@@ -365,6 +366,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--failing-role", default="")
     parser.add_argument("--failure-message", default="")
+    parser.add_argument("--failure-exit-code", type=int, default=None)
+    parser.add_argument("--failure-signal", default="")
     return parser.parse_args(argv)
 
 
@@ -400,6 +403,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.scenario == "lane_failure":
         if args.failing_role and role == args.failing_role:
             print(args.failure_message or "synthetic evaluator lane failure", file=sys.stderr)
+            failure_signal = str(args.failure_signal or "").strip().upper()
+            if failure_signal:
+                try:
+                    signum = getattr(signal, failure_signal)
+                except AttributeError as exc:
+                    raise SystemExit(f"unknown failure signal: {failure_signal}") from exc
+                os.kill(os.getpid(), int(signum))
+                raise AssertionError("unreachable after os.kill")
+            if args.failure_exit_code is not None:
+                return int(args.failure_exit_code)
             return 3
         if role == "checker":
             _write_json(result_path, _checker_single_requirement())

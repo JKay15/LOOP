@@ -17,6 +17,7 @@
     "workflow_scope",
     "artifact_scope",
     "terminal_authority_scope",
+    "progress_checkpoints",
     "workspace_root",
     "codex_home",
     "depends_on_node_ids",
@@ -142,6 +143,40 @@
         "type": "string"
       }
     },
+    "progress_checkpoints": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "checkpoint_id",
+          "description",
+          "required_any_of",
+          "window_s"
+        ],
+        "properties": {
+          "checkpoint_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": {
+            "type": "string"
+          },
+          "required_any_of": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "window_s": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          }
+        }
+      }
+    },
     "workspace_root": {
       "type": "string"
     },
@@ -194,6 +229,53 @@
           "items": {
             "type": "string"
           }
+        },
+        "live_process_trusted": {
+          "type": "boolean"
+        },
+        "pid": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pid_alive": {
+          "type": "boolean"
+        },
+        "lease_epoch": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lease_owner_id": {
+          "type": "string"
+        },
+        "lease_freshness": {
+          "type": "string"
+        },
+        "lease_source": {
+          "type": "string"
+        },
+        "lease_duration_s": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "lease_expires_at": {
+          "type": "string"
+        },
+        "launch_event_id": {
+          "type": "string"
+        },
+        "status_result_ref": {
+          "type": "string"
+        },
+        "runtime_ref": {
+          "type": "string"
+        },
+        "process_fingerprint": {
+          "type": "string"
+        },
+        "process_started_at_utc": {
+          "type": "string"
         }
       }
     },
@@ -201,6 +283,33 @@
       "type": "string"
     },
     "result_sink_ref": {
+      "type": "string"
+    },
+    "authoritative_result_ref": {
+      "type": "string"
+    },
+    "authoritative_result_status": {
+      "type": "string"
+    },
+    "authoritative_result_outcome": {
+      "type": "string"
+    },
+    "authoritative_result_summary": {
+      "type": "string"
+    },
+    "authoritative_evaluator_verdict": {
+      "type": "string"
+    },
+    "authoritative_evaluation_report_ref": {
+      "type": "string"
+    },
+    "authoritative_reviewer_response_ref": {
+      "type": "string"
+    },
+    "authoritative_workspace_result_sink_ref": {
+      "type": "string"
+    },
+    "authoritative_workspace_mirror_ref": {
       "type": "string"
     },
     "lineage_ref": {
@@ -215,6 +324,23 @@
         "COMPLETED",
         "FAILED"
       ]
+    },
+    "projection_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "last_applied_seq": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "projection_updated_at": {
+      "type": "string"
+    },
+    "source_event_journal_ref": {
+      "type": "string"
+    },
+    "projection_bundle_ref": {
+      "type": "string"
     }
   }
 }

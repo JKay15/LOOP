@@ -392,6 +392,9 @@ def main() -> int:
 
         required_kernel_surface = {
             "query_authority_view",
+            "query_commit_state_view",
+            "query_event_journal_status_view",
+            "query_projection_consistency_view",
             "query_recent_audit_events",
             "route_user_requirements",
             "submit_control_envelope",

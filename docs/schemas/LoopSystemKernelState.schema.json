@@ -171,6 +171,23 @@
     "accepted_envelope_count": {
       "type": "integer",
       "minimum": 0
+    },
+    "projection_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "last_applied_seq": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "projection_updated_at": {
+      "type": "string"
+    },
+    "source_event_journal_ref": {
+      "type": "string"
+    },
+    "projection_bundle_ref": {
+      "type": "string"
     }
   }
 }

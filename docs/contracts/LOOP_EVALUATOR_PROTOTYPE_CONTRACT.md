@@ -32,7 +32,7 @@ For delegated evaluator AI roles:
 - if a delegated role has already produced a non-empty authoritative terminal response artifact and a committed provider terminal marker has also been observed on the configured launch streams, the runtime may settle the role from that artifact instead of waiting indefinitely for provider-side exit cleanup
 - response-file stability alone is not a success signal; post-response non-zero exits without that terminal marker must remain terminal `ERROR`
 - if no authoritative terminal response artifact exists, the runtime must still fail closed rather than inventing success from transport chatter alone
-- keep auth/config on the default host home instead of changing `CODEX_HOME` merely to select role-local rules
+- materialize a runtime-owned `CODEX_HOME` for delegated evaluator roles that shares host auth/config surfaces while isolating mutable state DBs, sessions, and logs from the host default `~/.codex`
 - exclude runtime-owned/generated source directories such as `.loop/`, `.loop_runtime/`, `workspace/`, and `.uv-cache/` when copying staged evaluator role workspaces from the source workspace
 - generic evaluator submissions should default delegated evaluator reasoning to `high` unless the caller explicitly overrides it
 

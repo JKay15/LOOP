@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import sys
-import tempfile
 from pathlib import Path
 
 from jsonschema import Draft202012Validator, validate
@@ -33,6 +32,7 @@ def main() -> int:
         sys.path.insert(0, str(ROOT))
 
     try:
+        from test_support import temporary_repo_root
         from loop_product.dispatch.heartbeat import build_child_dispatch_status
         from loop_product.gateway.normalize import normalize_control_envelope
         from loop_product.kernel.authority import kernel_internal_authority
@@ -179,8 +179,8 @@ def main() -> int:
         if envelope.envelope_type in {"local_control_decision", "child_dispatch_status", "node_terminal_result", "evaluator_result"} and envelope.status is not EnvelopeStatus.REPORT:
             return _fail("report envelopes must remain reports before kernel acceptance")
 
-    with tempfile.TemporaryDirectory(prefix="loop_system_control_objects_") as td:
-        state_root = Path(td) / ".loop"
+    with temporary_repo_root(prefix="loop_system_control_objects_") as repo_root:
+        state_root = repo_root / ".loop"
         ensure_runtime_tree(state_root)
         kernel_state = KernelState(
             task_id="wave4-control-objects",

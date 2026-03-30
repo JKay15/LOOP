@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import sys
-import tempfile
 from pathlib import Path
 
 
@@ -78,9 +77,10 @@ def main() -> int:
     from loop_product.protocols.control_envelope import EnvelopeStatus
     from loop_product.protocols.node import NodeStatus
     from loop_product.topology.split_review import build_split_request
+    from test_support import temporary_repo_root
 
-    with tempfile.TemporaryDirectory(prefix="loop_system_deferred_split_") as td:
-        state_root = Path(td) / ".loop"
+    with temporary_repo_root(prefix="loop_system_deferred_split_") as repo_root:
+        state_root = repo_root / ".loop"
         _persist_base_state(state_root)
         source_node = _base_source_node()
         mutation = build_split_request(

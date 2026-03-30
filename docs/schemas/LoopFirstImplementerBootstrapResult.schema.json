@@ -20,6 +20,7 @@
     "workspace_live_artifact_ref",
     "artifact_publication_receipt_ref",
     "artifact_publication_runner_ref",
+    "shared_cache_runner_ref",
     "workspace_result_sink_ref",
     "kernel_result_sink_ref",
     "evaluator_submission_ref",
@@ -104,6 +105,10 @@
       "minLength": 1
     },
     "artifact_publication_runner_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "shared_cache_runner_ref": {
       "type": "string",
       "minLength": 1
     },

@@ -267,6 +267,9 @@ def main() -> int:
             result_sink_ref="artifacts/child-implementer-001/implementer_result.json",
             lineage_ref="root-kernel->child-implementer-001",
             status=NodeStatus.ACTIVE,
+            workflow_scope="whole_paper_formalization",
+            artifact_scope="slice",
+            terminal_authority_scope="local",
         )
         prompt_text = bootstrap_module._render_child_prompt(
             workspace_root=workspace_root,
@@ -296,6 +299,8 @@ def main() -> int:
             return _fail("bootstrap child prompt must pin activation_condition to machine-evaluable after:<node_id>:<requirement> syntax")
         if "activation_rationale" not in prompt_text:
             return _fail("bootstrap child prompt must tell the implementer where explanatory activation prose belongs")
+        if "analysis/slice_execution_decision.json" not in prompt_text.lower():
+            return _fail("bootstrap child prompt must require a machine-auditable slice execution decision before extended theorem search")
         if "WHOLE_PAPER_STATUS.json" not in prompt_text:
             return _fail("bootstrap child prompt must require structured whole-paper terminal evidence before evaluator")
         if "exact frozen refs in the handoff/prompt as authoritative" not in prompt_text:
@@ -320,6 +325,8 @@ def main() -> int:
         state_root = temp_root / ".loop" / "split-helper"
         workspace_root = temp_root / "workspace"
         workspace_root.mkdir(parents=True, exist_ok=True)
+        live_root = workspace_root / ".tmp_primary_artifact"
+        live_root.mkdir(parents=True, exist_ok=True)
         ensure_runtime_tree(state_root)
         root_node = NodeSpec(
             node_id="root-kernel",
@@ -370,6 +377,10 @@ def main() -> int:
                 {
                     "node_id": child_node.node_id,
                     "round_id": child_node.round_id,
+                    "workspace_root": str(workspace_root.resolve()),
+                    "workspace_mirror_relpath": "deliverables/primary_artifact",
+                    "workspace_live_artifact_relpath": ".tmp_primary_artifact",
+                    "workspace_live_artifact_ref": str(live_root.resolve()),
                     "kernel_result_sink_ref": str((state_root / child_node.result_sink_ref).resolve()),
                 },
                 indent=2,
@@ -414,6 +425,63 @@ def main() -> int:
         result_payload = json.loads(result_ref.read_text(encoding="utf-8"))
         if str(result_payload.get("status") or "") != "ACCEPTED":
             return _fail("split helper must surface ACCEPTED when kernel review accepts the proposal")
+        handoff_md = workspace_root / "FROZEN_HANDOFF.md"
+        handoff_md.write_text(
+            "\n".join(
+                [
+                    "# Frozen Handoff",
+                    "",
+                    f"- node_id: `{child_node.node_id}`",
+                    f"- state_root: `{state_root.resolve()}`",
+                    "",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        md_proposal = workspace_root / "SplitRequestFromMarkdownHandoff.json"
+        md_proposal.write_text(
+            json.dumps(
+                {
+                    "split_mode": "parallel",
+                    "reason": "markdown handoff path should resolve to canonical machine handoff json",
+                    "completed_work": "block A inventory and starter formalization",
+                    "remaining_work": "blocks D/E still remain independent",
+                    "target_nodes": [
+                        {"node_id": "child-001-md-block-d", "goal_slice": "formalize Block D"},
+                        {"node_id": "child-001-md-block-e", "goal_slice": "formalize Block E"},
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        kernel_state_payload = json.loads((state_root / "state" / "kernel_state.json").read_text(encoding="utf-8"))
+        kernel_state_payload["nodes"]["child-001"]["status"] = "ACTIVE"
+        (state_root / "state" / "kernel_state.json").write_text(
+            json.dumps(kernel_state_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        child_state_path = state_root / "state" / "child-001.json"
+        child_state_payload = json.loads(child_state_path.read_text(encoding="utf-8"))
+        child_state_payload["status"] = "ACTIVE"
+        child_state_path.write_text(json.dumps(child_state_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        md_result_ref = workspace_root / "SplitRequestResultFromMarkdownHandoff.json"
+        md_proc = subprocess.run(
+            [str(helper), "--handoff-ref", str(handoff_md), "--proposal-ref", str(md_proposal), "--result-ref", str(md_result_ref)],
+            capture_output=True,
+            text=True,
+        )
+        if md_proc.returncode != 0:
+            return _fail(
+                "split helper must accept FROZEN_HANDOFF.md by resolving the canonical machine handoff JSON; "
+                f"stderr={md_proc.stderr.strip()!r}"
+            )
+        md_result_payload = json.loads(md_result_ref.read_text(encoding="utf-8"))
+        if str(md_result_payload.get("status") or "") != "ACCEPTED":
+            return _fail("split helper must still surface ACCEPTED when the caller provides the markdown handoff surface")
 
         kernel_state_payload = json.loads((state_root / "state" / "kernel_state.json").read_text(encoding="utf-8"))
         kernel_state_payload["nodes"]["child-001"]["status"] = "ACTIVE"
@@ -475,6 +543,103 @@ def main() -> int:
             return _fail("safe prose activation rationale must not persist as a machine activation_condition")
         if "upstream boundary is ready" not in str(normalized_state.get("activation_rationale") or ""):
             return _fail("safe prose activation rationale must persist in activation_rationale")
+
+        kernel_state_payload = json.loads((state_root / "state" / "kernel_state.json").read_text(encoding="utf-8"))
+        kernel_state_payload["nodes"]["child-001"]["status"] = "ACTIVE"
+        for node_id, node_payload in kernel_state_payload["nodes"].items():
+            if node_id not in {"root-kernel", "child-001"}:
+                node_payload["status"] = "COMPLETED"
+        (state_root / "state" / "kernel_state.json").write_text(
+            json.dumps(kernel_state_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        child_state_path.write_text(json.dumps(child_state_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        for node_state_path in (state_root / "state").glob("child-001-*.json"):
+            node_state_payload = json.loads(node_state_path.read_text(encoding="utf-8"))
+            node_state_payload["status"] = "COMPLETED"
+            node_state_path.write_text(json.dumps(node_state_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        contract_proposal = workspace_root / "ContractfulSplitRequest.json"
+        contract_proposal.write_text(
+            json.dumps(
+                {
+                    "split_mode": "parallel",
+                    "reason": "whole-paper slice child must preserve machine startup and progress contracts",
+                    "completed_work": "source partitioned the whole paper into child slices",
+                    "remaining_work": "two slice-local formalization children remain",
+                    "target_nodes": [
+                        {
+                            "node_id": "child-001-slice-a",
+                            "goal_slice": "formalize the linear-bias slice",
+                            "workflow_scope": "whole_paper_formalization",
+                            "artifact_scope": "slice",
+                            "terminal_authority_scope": "local",
+                            "startup_required_output_paths": [
+                                "README.md",
+                                "TRACEABILITY.md",
+                                "SLICE_STATUS.json",
+                                "analysis/SLICE_BOUNDARY.json",
+                            ],
+                        },
+                        {
+                            "node_id": "child-001-slice-b",
+                            "goal_slice": "formalize the monotone-bias slice",
+                            "workflow_scope": "whole_paper_formalization",
+                            "artifact_scope": "slice",
+                            "terminal_authority_scope": "local",
+                        },
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        contract_result_ref = workspace_root / "ContractfulSplitRequestResult.json"
+        contract_proc = subprocess.run(
+            [str(helper), "--handoff-ref", str(handoff), "--proposal-ref", str(contract_proposal), "--result-ref", str(contract_result_ref)],
+            capture_output=True,
+            text=True,
+        )
+        if contract_proc.returncode != 0:
+            return _fail(
+                "split helper must preserve machine startup/progress contracts for whole-paper slice targets; "
+                f"stderr={contract_proc.stderr.strip()!r}"
+            )
+        contract_payload = json.loads(contract_result_ref.read_text(encoding="utf-8"))
+        if str(contract_payload.get("status") or "") != "ACCEPTED":
+            return _fail("contractful split helper case must be accepted")
+        expected_slice_startup = [
+            "README.md",
+            "TRACEABILITY.md",
+            "SLICE_STATUS.json",
+            "analysis/SLICE_BOUNDARY.json",
+        ]
+        expected_slice_progress = [
+            {
+                "checkpoint_id": "whole_paper_slice_execution_decision",
+                "description": (
+                    "After the deterministic slice startup bundle is materialized, record a slice-local execution decision or submit a further split proposal before extended theorem search."
+                ),
+                "required_any_of": [
+                    "analysis/SLICE_EXECUTION_DECISION.json",
+                    "split/SPLIT_REQUEST_SUBMISSION_RESULT.json",
+                    "split/SPLIT_DECLINE_REASON.md",
+                ],
+                "window_s": 300.0,
+            }
+        ]
+        explicit_slice_state = json.loads((state_root / "state" / "child-001-slice-a.json").read_text(encoding="utf-8"))
+        defaulted_slice_state = json.loads((state_root / "state" / "child-001-slice-b.json").read_text(encoding="utf-8"))
+        if list(explicit_slice_state.get("startup_required_output_paths") or []) != expected_slice_startup:
+            return _fail("split helper must preserve explicit startup_required_output_paths into accepted child state")
+        if list(explicit_slice_state.get("progress_checkpoints") or []) != expected_slice_progress:
+            return _fail("split helper must default slice progress_checkpoints into accepted child state")
+        if list(defaulted_slice_state.get("startup_required_output_paths") or []) != expected_slice_startup:
+            return _fail("split helper must default slice startup_required_output_paths when the proposal omits them")
+        if list(defaulted_slice_state.get("progress_checkpoints") or []) != expected_slice_progress:
+            return _fail("split helper must default slice progress_checkpoints when the proposal omits them")
 
         bad_proposal = workspace_root / "BadSplitRequest.json"
         bad_proposal.write_text(
@@ -659,6 +824,272 @@ def main() -> int:
         activate_result_payload = json.loads(activate_result_ref.read_text(encoding="utf-8"))
         if str(activate_result_payload.get("status") or "") != "ACCEPTED":
             return _fail("activate helper must surface ACCEPTED when kernel review accepts the proposal")
+        deferred_md_proposal = workspace_root / "SplitRequestMarkdownActivate.json"
+        deferred_md_proposal.write_text(
+            json.dumps(
+                {
+                    "split_mode": "deferred",
+                    "reason": "create a second deferred child for markdown-handoff activate coverage",
+                    "completed_work": "source node owns extraction and partition",
+                    "remaining_work": "a second follow-up child formalizes another deferred branch after source terminal",
+                    "target_nodes": [
+                        {
+                            "node_id": "child-001-followup-md",
+                            "goal_slice": "formalize the deferred markdown branch",
+                            "depends_on_node_ids": ["child-001"],
+                            "activation_condition": "after:child-001:terminal",
+                        }
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        deferred_md_split_result_ref = workspace_root / "SplitRequestMarkdownActivateResult.json"
+        kernel_state_obj = json.loads((state_root / "state" / "kernel_state.json").read_text(encoding="utf-8"))
+        kernel_state_obj["nodes"]["child-001"]["status"] = "ACTIVE"
+        for node_id, node_payload in kernel_state_obj["nodes"].items():
+            if node_id not in {"root-kernel", "child-001"}:
+                node_payload["status"] = "COMPLETED"
+        (state_root / "state" / "kernel_state.json").write_text(
+            json.dumps(kernel_state_obj, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        source_state = json.loads(source_state_path.read_text(encoding="utf-8"))
+        source_state["status"] = "ACTIVE"
+        source_state_path.write_text(json.dumps(source_state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        for node_state_path in (state_root / "state").glob("child-001-*.json"):
+            node_state_payload = json.loads(node_state_path.read_text(encoding="utf-8"))
+            node_state_payload["status"] = "COMPLETED"
+            node_state_path.write_text(json.dumps(node_state_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        deferred_md_split_proc = subprocess.run(
+            [str(split_helper), "--handoff-ref", str(handoff), "--proposal-ref", str(deferred_md_proposal), "--result-ref", str(deferred_md_split_result_ref)],
+            capture_output=True,
+            text=True,
+        )
+        if deferred_md_split_proc.returncode != 0:
+            return _fail(
+                "activate markdown coverage requires a second deferred split helper submission to succeed first; "
+                f"stderr={deferred_md_split_proc.stderr.strip()!r}"
+            )
+        handoff_md = workspace_root / "FROZEN_HANDOFF.md"
+        handoff_md.write_text(
+            "\n".join(
+                [
+                    "# Frozen Handoff",
+                    "",
+                    f"- node_id: `{child_node.node_id}`",
+                    f"- state_root: `{state_root.resolve()}`",
+                    "",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        kernel_state_obj = json.loads((state_root / "state" / "kernel_state.json").read_text(encoding="utf-8"))
+        kernel_state_obj["nodes"]["child-001"]["status"] = "COMPLETED"
+        (state_root / "state" / "kernel_state.json").write_text(
+            json.dumps(kernel_state_obj, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        source_state = json.loads(source_state_path.read_text(encoding="utf-8"))
+        source_state["status"] = "COMPLETED"
+        source_state_path.write_text(json.dumps(source_state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        activate_md_result_ref = workspace_root / "ActivateRequestResultFromMarkdownHandoff.json"
+        activate_md_proposal = workspace_root / "ActivateRequestFromMarkdownHandoff.json"
+        activate_md_proposal.write_text(
+            json.dumps(
+                {
+                    "target_node_id": "child-001-followup-md",
+                    "reason": "source checkpoint completed; activate deferred child via markdown handoff surface",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        activate_md_proc = subprocess.run(
+            [
+                str(activate_helper),
+                "--handoff-ref",
+                str(handoff_md),
+                "--proposal-ref",
+                str(activate_md_proposal),
+                "--result-ref",
+                str(activate_md_result_ref),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if activate_md_proc.returncode != 0:
+            return _fail(
+                "activate helper must accept FROZEN_HANDOFF.md by resolving the canonical machine handoff JSON; "
+                f"stderr={activate_md_proc.stderr.strip()!r}"
+            )
+        activate_md_result_payload = json.loads(activate_md_result_ref.read_text(encoding="utf-8"))
+        if str(activate_md_result_payload.get("status") or "") != "ACCEPTED":
+            return _fail("activate helper must still surface ACCEPTED when the caller provides the markdown handoff surface")
+
+    with tempfile.TemporaryDirectory(prefix="loop_product_split_helper_defaults_") as td:
+        temp_root = Path(td)
+        state_root = temp_root / ".loop" / "split-helper-defaults"
+        workspace_root = temp_root / "workspace"
+        live_root = workspace_root / ".tmp_primary_artifact"
+        workspace_root.mkdir(parents=True, exist_ok=True)
+        live_root.mkdir(parents=True, exist_ok=True)
+        ensure_runtime_tree(state_root)
+        root_node = NodeSpec(
+            node_id="root-kernel",
+            node_kind="kernel",
+            goal_slice="test default helper refs",
+            parent_node_id=None,
+            generation=0,
+            round_id="R0",
+            execution_policy={"mode": "kernel"},
+            reasoning_profile={"role": "kernel", "thinking_budget": "medium"},
+            budget_profile={"max_rounds": 2},
+            allowed_actions=["dispatch", "submit", "audit"],
+            delegation_ref="",
+            result_sink_ref="artifacts/root/result.json",
+            lineage_ref="root-kernel",
+            status=NodeStatus.ACTIVE,
+        )
+        child_node = NodeSpec(
+            node_id="child-001",
+            node_kind="implementer",
+            goal_slice="test default helper refs from frozen handoff",
+            parent_node_id="root-kernel",
+            generation=1,
+            round_id="R1",
+            execution_policy={"sandbox_mode": "danger-full-access"},
+            reasoning_profile={"role": "implementer", "thinking_budget": "high"},
+            budget_profile={"max_rounds": 2},
+            allowed_actions=["implement", "evaluate", "report", "split_request"],
+            workspace_root=str(workspace_root.resolve()),
+            delegation_ref="state/delegations/child-001.json",
+            result_sink_ref="artifacts/child-001/implementer_result.json",
+            lineage_ref="root-kernel->child-001",
+            status=NodeStatus.ACTIVE,
+            workflow_scope="whole_paper_formalization",
+            artifact_scope="slice",
+            terminal_authority_scope="local",
+        )
+        kernel_state = KernelState(
+            task_id="split-helper-defaults-test",
+            root_goal="exercise helper default refs",
+            root_node_id=root_node.node_id,
+        )
+        kernel_state.register_node(root_node)
+        kernel_state.register_node(child_node)
+        persist_kernel_state(state_root, kernel_state, authority=kernel_internal_authority())
+
+        handoff = node_machine_handoff_ref(state_root=state_root, node_id=child_node.node_id)
+        handoff.parent.mkdir(parents=True, exist_ok=True)
+        handoff.write_text(
+            json.dumps(
+                {
+                    "node_id": child_node.node_id,
+                    "round_id": child_node.round_id,
+                    "workspace_root": str(workspace_root.resolve()),
+                    "workspace_mirror_relpath": "deliverables/primary_artifact",
+                    "workspace_live_artifact_relpath": ".tmp_primary_artifact",
+                    "workspace_live_artifact_ref": str(live_root.resolve()),
+                    "kernel_result_sink_ref": str((state_root / child_node.result_sink_ref).resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        split_default_proposal_ref = live_root / "split" / "SPLIT_REQUEST_PROPOSAL.json"
+        split_default_proposal_ref.parent.mkdir(parents=True, exist_ok=True)
+        split_default_proposal_ref.write_text(
+            json.dumps(
+                {
+                    "split_mode": "deferred",
+                    "reason": "default split helper refs should derive from handoff live root",
+                    "completed_work": "source prepared the first boundary",
+                    "remaining_work": "one deferred follow-up remains",
+                    "target_nodes": [
+                        {
+                            "node_id": "child-001-followup-default",
+                            "goal_slice": "formalize the deferred follow-up branch",
+                            "depends_on_node_ids": ["child-001"],
+                            "activation_condition": "after:child-001:terminal",
+                        }
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        split_default_result_ref = live_root / "split" / "SPLIT_REQUEST_SUBMISSION_RESULT.json"
+        split_helper = ROOT / "scripts" / "submit_split_request_from_handoff.sh"
+        split_default_proc = subprocess.run(
+            [str(split_helper), "--handoff-ref", str(handoff)],
+            capture_output=True,
+            text=True,
+        )
+        if split_default_proc.returncode != 0:
+            return _fail(
+                "split helper must derive deterministic proposal/result refs from frozen handoff when callers omit them; "
+                f"stderr={split_default_proc.stderr.strip()!r}"
+            )
+        if not split_default_result_ref.exists():
+            return _fail("split helper default-path mode must materialize the deterministic submission result under the live control root")
+        split_default_payload = json.loads(split_default_result_ref.read_text(encoding="utf-8"))
+        if str(split_default_payload.get("status") or "") != "ACCEPTED":
+            return _fail("split helper default-path mode must still surface ACCEPTED")
+
+        kernel_state_payload = json.loads((state_root / "state" / "kernel_state.json").read_text(encoding="utf-8"))
+        kernel_state_payload["nodes"]["child-001"]["status"] = "COMPLETED"
+        (state_root / "state" / "kernel_state.json").write_text(
+            json.dumps(kernel_state_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        child_state_path = state_root / "state" / "child-001.json"
+        child_state_payload = json.loads(child_state_path.read_text(encoding="utf-8"))
+        child_state_payload["status"] = "COMPLETED"
+        child_state_path.write_text(json.dumps(child_state_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        activate_default_proposal_ref = live_root / "activate" / "ACTIVATE_REQUEST_PROPOSAL.json"
+        activate_default_proposal_ref.parent.mkdir(parents=True, exist_ok=True)
+        activate_default_proposal_ref.write_text(
+            json.dumps(
+                {
+                    "target_node_id": "child-001-followup-default",
+                    "reason": "default activate helper refs should derive from handoff live root",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        activate_default_result_ref = live_root / "activate" / "ACTIVATE_REQUEST_SUBMISSION_RESULT.json"
+        activate_helper = ROOT / "scripts" / "submit_activate_request_from_handoff.sh"
+        activate_default_proc = subprocess.run(
+            [str(activate_helper), "--handoff-ref", str(handoff)],
+            capture_output=True,
+            text=True,
+        )
+        if activate_default_proc.returncode != 0:
+            return _fail(
+                "activate helper must derive deterministic proposal/result refs from frozen handoff when callers omit them; "
+                f"stderr={activate_default_proc.stderr.strip()!r}"
+            )
+        if not activate_default_result_ref.exists():
+            return _fail("activate helper default-path mode must materialize the deterministic submission result under the live control root")
+        activate_default_payload = json.loads(activate_default_result_ref.read_text(encoding="utf-8"))
+        if str(activate_default_payload.get("status") or "") != "ACCEPTED":
+            return _fail("activate helper default-path mode must still surface ACCEPTED")
 
     print("[loop-system-split-instruction-chain] OK")
     return 0

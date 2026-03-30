@@ -152,6 +152,10 @@
       },
       "type": "object"
     },
+    "artifact_publication_receipt_ref": {
+      "minLength": 1,
+      "type": "string"
+    },
     "ai_user_scheduler": {
       "additionalProperties": false,
       "properties": {
@@ -161,6 +165,13 @@
         }
       },
       "type": "object"
+    },
+    "context_refs": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array"
     },
     "evaluation_id": {
       "minLength": 1,
@@ -177,6 +188,10 @@
       "minLength": 1,
       "type": "string"
     },
+    "implementation_package_ref": {
+      "minLength": 1,
+      "type": "string"
+    },
     "output_root": {
       "minLength": 1,
       "type": "string"
@@ -184,6 +199,13 @@
     "product_manual_ref": {
       "minLength": 1,
       "type": "string"
+    },
+    "required_output_paths": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array"
     },
     "role_requirements": {
       "additionalProperties": false,

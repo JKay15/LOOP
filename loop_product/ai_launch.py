@@ -20,7 +20,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
-from .run_cmd import RunCmdResult, RunningCmdHandle, finish_running_cmd, start_cmd, terminate_running_cmd
+from .run_cmd import (
+    RunCmdResult,
+    RunningCmdHandle,
+    build_sealed_parent_env,
+    finish_running_cmd,
+    start_cmd,
+    terminate_running_cmd,
+)
 
 _SAFE_PARENT_ENV_KEYS = {
     "ALL_PROXY",
@@ -175,20 +182,68 @@ def _resolve_tmux_target_session() -> str:
     return "loop-product-ai"
 
 
+def _parse_tmux_window_metadata(raw: str) -> tuple[str, str, str, int]:
+    parts = str(raw or "").strip().split()
+    if len(parts) != 4:
+        raise RuntimeError(f"tmux bridge returned unexpected window metadata: {raw!r}")
+    out_session, window_index, pane_id, pane_pid = parts
+    return out_session, window_index, pane_id, int(pane_pid)
+
+
+def _tmux_start_window(*, session_name: str, window_name: str, wrapper_script: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "tmux",
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{session_name} #{window_index} #{pane_id} #{pane_pid}",
+            "-t",
+            session_name,
+            "-n",
+            window_name,
+            str(wrapper_script),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _tmux_start_session(*, session_name: str, window_name: str, wrapper_script: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "tmux",
+            "new-session",
+            "-d",
+            "-P",
+            "-F",
+            "#{session_name} #{window_index} #{pane_id} #{pane_pid}",
+            "-s",
+            session_name,
+            "-n",
+            window_name,
+            str(wrapper_script),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def _tmux_env(env: Mapping[str, str] | None) -> dict[str, str]:
-    merged: dict[str, str] = {}
-    for key in _SAFE_PARENT_ENV_KEYS:
-        value = str(os.environ.get(key) or "").strip()
-        if value:
-            merged[key] = value
-    for key, value in dict(env or {}).items():
-        merged[str(key)] = str(value)
+    merged = build_sealed_parent_env(env=env, allowed_parent_env_keys=_SAFE_PARENT_ENV_KEYS)
     for key in list(merged):
-        if key.startswith("CODEX_"):
+        if key.startswith("CODEX_") and key != "CODEX_HOME":
             merged.pop(key, None)
         if key.startswith("TMUX"):
             merged.pop(key, None)
     return merged
+
+
+def _scrubbed_parent_codex_env_keys() -> list[str]:
+    return sorted(key for key in os.environ if key.startswith("CODEX_") and key != "CODEX_HOME")
 
 
 def _write_tmux_wrapper_script(
@@ -204,6 +259,8 @@ def _write_tmux_wrapper_script(
     ready_path: Path | None = None,
 ) -> None:
     lines = ["#!/bin/sh", "set +e", f"cd {shlex.quote(str(cwd))} || exit 111"]
+    for key in _scrubbed_parent_codex_env_keys():
+        lines.append(f"unset {key}")
     for key, value in env.items():
         lines.append(f"export {key}={shlex.quote(str(value))}")
     cmd_text = shlex.join([str(item) for item in cmd])
@@ -256,30 +313,19 @@ def _start_tmux_launch(
         ready_path=ready_path,
     )
     session_name = _resolve_tmux_target_session()
-    probe = subprocess.run(
-        [
-            "tmux",
-            "new-window",
-            "-d",
-            "-P",
-            "-F",
-            "#{session_name} #{window_index} #{pane_id} #{pane_pid}",
-            "-t",
-            session_name,
-            "-n",
-            safe_label[:40],
-            str(wrapper_script),
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    window_name = safe_label[:40]
+    probe = _tmux_start_window(session_name=session_name, window_name=window_name, wrapper_script=wrapper_script)
     if probe.returncode != 0:
-        raise RuntimeError(f"tmux bridge failed to start window: {probe.stderr.strip() or probe.stdout.strip()}")
-    parts = str(probe.stdout or "").strip().split()
-    if len(parts) != 4:
-        raise RuntimeError(f"tmux bridge returned unexpected window metadata: {probe.stdout!r}")
-    out_session, window_index, pane_id, pane_pid = parts
+        detail = str(probe.stderr or probe.stdout or "").strip()
+        if (
+            "no server running" in detail.lower()
+            or "can't find session" in detail.lower()
+            or "no sessions" in detail.lower()
+        ):
+            probe = _tmux_start_session(session_name=session_name, window_name=window_name, wrapper_script=wrapper_script)
+        if probe.returncode != 0:
+            raise RuntimeError(f"tmux bridge failed to start window: {str(probe.stderr or probe.stdout or '').strip()}")
+    out_session, window_index, pane_id, pane_pid = _parse_tmux_window_metadata(str(probe.stdout or ""))
     pipe_probe = subprocess.run(
         [
             "tmux",
@@ -307,11 +353,11 @@ def _start_tmux_launch(
         stdout_path=stdout_path,
         stderr_path=stderr_path,
         started_at_s=time.time(),
-        pid=int(pane_pid),
+        pid=pane_pid,
         tmux_session_name=out_session,
         tmux_window_index=window_index,
         tmux_pane_id=pane_id,
-        tmux_pane_pid=int(pane_pid),
+        tmux_pane_pid=pane_pid,
         tmux_exit_code_path=exit_code_path,
         tmux_script_path=wrapper_script,
     )
@@ -327,14 +373,17 @@ def _start_direct_launch(
     stdin_path: str | Path | None,
     start_new_session: bool,
 ) -> AiLaunchHandle:
+    direct_env = _tmux_env(env)
     handle = start_cmd(
         cmd=cmd,
         cwd=cwd,
         log_dir=log_dir,
         label=label,
-        env=env,
+        env=direct_env,
         stdin_path=stdin_path,
         start_new_session=start_new_session,
+        inherit_parent_env=False,
+        allowed_parent_env_keys=(),
     )
     return AiLaunchHandle(
         mode="direct",

@@ -15,6 +15,7 @@ from . import prototype as _legacy
 from . import role_launch as _role_launch
 from . import run_state as _run_state
 from ..agent_provider import apply_env_map, resolve_agent_invocation
+from ..dispatch.publication import repair_publication_receipt_surface
 from .agent_execution_policy import validate_repo_shipped_role_agent_cmd
 from ..runtime_paths import product_repo_root, product_schema_path
 
@@ -47,6 +48,18 @@ _STRUCTURED_ISSUE_RULES: tuple[tuple[str, tuple[str, ...], str, str], ...] = (
         "repair the command sequence before retrying the evaluator lane.",
     ),
 )
+_INTERRUPTION_TEXT_NEEDLES: tuple[str, ...] = (
+    "terminated by signal",
+    "received signal",
+    "signal ",
+    "sigterm",
+    "sigkill",
+    "interrupted",
+    "hard-killed",
+    "hard killed",
+    "killed",
+    "terminated",
+)
 
 
 def _safe_slug(text: str) -> str:
@@ -75,6 +88,128 @@ def _compact_detail(text: str, *, limit: int = 240) -> str:
     if len(compact) <= limit:
         return compact
     return compact[: limit - 3] + "..."
+
+
+def _source_workspace_copy_required(request: Mapping[str, Any]) -> bool:
+    implementation_ref_raw = str(request.get("implementation_package_ref") or "").strip()
+    if not implementation_ref_raw:
+        return True
+    implementation_ref = Path(implementation_ref_raw).expanduser().resolve()
+    return implementation_ref.is_dir()
+
+
+def _deliverable_surface_source_roots(request: Mapping[str, Any]) -> list[Path]:
+    roots: list[Path] = []
+    receipt_ref_raw = str(request.get("artifact_publication_receipt_ref") or "").strip()
+    if receipt_ref_raw:
+        receipt_path = Path(receipt_ref_raw).expanduser().resolve()
+        if not receipt_path.exists():
+            raise ValueError(f"artifact_publication_receipt_ref does not exist: {receipt_path}")
+        try:
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"artifact_publication_receipt_ref is not valid JSON: {receipt_path}") from exc
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"artifact_publication_receipt_ref must contain a JSON object: {receipt_path}")
+        repair_report = repair_publication_receipt_surface(
+            publication_receipt_ref=receipt_path,
+        )
+        if not bool(repair_report.get("repairable")):
+            raise ValueError(
+                str(repair_report.get("repair_summary") or "").strip()
+                or f"artifact_publication_receipt_ref could not repair publish/live surface: {receipt_path}"
+            )
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        publish_ref_raw = str(payload.get("publish_artifact_ref") or "").strip()
+        if publish_ref_raw:
+            publish_root = Path(publish_ref_raw).expanduser().resolve()
+            if not publish_root.exists() or not publish_root.is_dir():
+                raise ValueError(
+                    f"artifact_publication_receipt_ref must resolve publish_artifact_ref to an existing directory: {publish_root}"
+                )
+            roots.append(publish_root)
+        live_ref_raw = str(payload.get("live_artifact_ref") or "").strip()
+        if live_ref_raw:
+            live_root = Path(live_ref_raw).expanduser().resolve()
+            if live_root.exists() and live_root.is_dir():
+                roots.append(live_root)
+    implementation_ref_raw = str(request.get("implementation_package_ref") or "").strip()
+    if implementation_ref_raw:
+        implementation_root = Path(implementation_ref_raw).expanduser().resolve()
+        if implementation_root.exists() and implementation_root.is_dir():
+            roots.append(implementation_root)
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        resolved = root.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        deduped.append(resolved)
+    return deduped
+
+
+def _role_workspace_path_mappings(*, request: Mapping[str, Any], workspace_root: Path) -> list[tuple[Path, Path]]:
+    deliverable_root = workspace_root / "deliverables" / "primary_artifact"
+    return [
+        (source_root, deliverable_root)
+        for source_root in _deliverable_surface_source_roots(request)
+    ]
+
+
+def _materialize_role_deliverable_surface(*, request: Mapping[str, Any], workspace_root: Path) -> None:
+    source_roots = _deliverable_surface_source_roots(request)
+    if not source_roots:
+        return
+    deliverable_root = workspace_root / "deliverables" / "primary_artifact"
+    _legacy._copy_tree_excluding(
+        source_root=source_roots[0],
+        dest_root=deliverable_root,
+        excluded_paths=[],
+    )
+    required_output_paths = [
+        str(item).strip() for item in list(request.get("required_output_paths") or []) if str(item).strip()
+    ]
+    missing = [
+        relpath
+        for relpath in required_output_paths
+        if not (deliverable_root / relpath).exists()
+    ]
+    if missing:
+        raise ValueError(
+            "staged deliverable surface is missing required output paths after materialization: "
+            + ", ".join(missing)
+        )
+    _legacy._hydrate_staged_lean_deliverable_surface(
+        workspace_root=workspace_root,
+        deliverable_root=deliverable_root,
+        purpose=f"simple_evaluator:staged_deliverable:{str(request.get('evaluation_id') or 'unknown')}",
+    )
+
+
+def _extract_exit_code_from_message(message: str) -> int | None:
+    match = re.search(r"exit code\s+(-?\d+)", str(message or ""), flags=re.IGNORECASE)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _classify_runtime_interruption(*, exit_code: int | None, detail_text: str) -> dict[str, str] | None:
+    lowered = str(detail_text or "").lower()
+    if exit_code is None:
+        if not any(needle in lowered for needle in _INTERRUPTION_TEXT_NEEDLES):
+            return None
+    elif exit_code >= 0 and exit_code < 128 and not any(needle in lowered for needle in _INTERRUPTION_TEXT_NEEDLES):
+        return None
+    return {
+        "kind": "STRUCTURED_EXCEPTION",
+        "issue_kind": "provider_runtime",
+        "self_attribution": "evaluator_exec_provider_runtime",
+        "self_repair": "retry the same evaluator lane with bounded backoff because the provider CLI or delegated runtime was interrupted before producing structured output.",
+    }
 
 
 def _classify_evaluator_side_issue(message: str) -> dict[str, str] | None:
@@ -122,6 +257,12 @@ def _classify_evaluator_side_issue(message: str) -> dict[str, str] | None:
             "self_attribution": self_attribution,
             "self_repair": self_repair,
         }
+    interruption_issue = _classify_runtime_interruption(
+        exit_code=_extract_exit_code_from_message(message),
+        detail_text=message,
+    )
+    if interruption_issue is not None:
+        return interruption_issue
     return None
 
 
@@ -198,9 +339,13 @@ def _materialize_simple_role_workspace(
 
             shutil.rmtree(workspace_root)
         workspace_root.mkdir(parents=True, exist_ok=True)
-    _legacy._materialize_current_run_snapshot(
+    _legacy._mount_shared_current_run_snapshot(
         run_root=run_root,
         snapshot_root=workspace_root / ".loop_evaluator_internal" / "current_run_snapshot",
+    )
+    _materialize_role_deliverable_surface(
+        request=request,
+        workspace_root=workspace_root,
     )
     return workspace_root
 
@@ -548,6 +693,14 @@ def _invoke_text_role(
         detail = _compact_detail(final_raw_output_text or _read_text(final_stderr_ref))
         suffix = f": {detail}" if detail else ""
         issue_kind = str(final_issue.get("issue_kind") or "").strip()
+        if not issue_kind:
+            interruption_issue = _classify_runtime_interruption(
+                exit_code=final_exit_code,
+                detail_text=detail,
+            )
+            if interruption_issue is not None:
+                final_issue = interruption_issue
+                issue_kind = str(final_issue.get("issue_kind") or "").strip()
         if issue_kind.startswith("provider_"):
             raise RuntimeError(f"{role_instance_id} hit an upstream {issue_kind} blocker before producing result.json{suffix}")
         raise RuntimeError(f"{role_instance_id} failed with exit code {final_exit_code}{suffix}")
@@ -819,6 +972,7 @@ def _run_lane(
     if str(lane_state.get("status") or "") == "COMPLETED":
         return lane_state
 
+    needs_source_workspace_copy = _source_workspace_copy_required(request)
     lane_state["status"] = "RUNNING"
     lane_state.pop("error", None)
     state["lanes_by_unit_id"][unit_id] = lane_state
@@ -832,12 +986,17 @@ def _run_lane(
             role_dir=test_ai_role_dir,
             role_id="test_ai",
             workspace_name=f"test_ai__{unit_id}",
-            copy_source_workspace=True,
+            copy_source_workspace=needs_source_workspace_copy,
+        )
+        test_ai_path_mappings = _role_workspace_path_mappings(
+            request=request,
+            workspace_root=test_ai_workspace,
         )
         test_ai_manual_text = _legacy._rewrite_workspace_absolute_paths(
             text=manual_text,
             source_workspace_root=workspace_root,
             target_workspace_root=test_ai_workspace,
+            additional_path_mappings=test_ai_path_mappings,
         )
         try:
             test_ai = _invoke_text_role(
@@ -863,6 +1022,7 @@ def _run_lane(
                             source_workspace_root=workspace_root,
                             source_path=manual_path,
                             label="product_manual",
+                            additional_path_mappings=test_ai_path_mappings,
                         )
                     ),
                 },
@@ -894,12 +1054,17 @@ def _run_lane(
             role_dir=ai_user_role_dir,
             role_id="ai_user",
             workspace_name=f"ai_user__{unit_id}",
-            copy_source_workspace=True,
+            copy_source_workspace=needs_source_workspace_copy,
+        )
+        ai_user_path_mappings = _role_workspace_path_mappings(
+            request=request,
+            workspace_root=ai_user_workspace,
         )
         ai_user_manual_text = _legacy._rewrite_workspace_absolute_paths(
             text=manual_text,
             source_workspace_root=workspace_root,
             target_workspace_root=ai_user_workspace,
+            additional_path_mappings=ai_user_path_mappings,
         )
         try:
             ai_user = _invoke_text_role(
@@ -925,6 +1090,7 @@ def _run_lane(
                             source_workspace_root=workspace_root,
                             source_path=manual_path,
                             label="product_manual",
+                            additional_path_mappings=ai_user_path_mappings,
                         )
                     ),
                 },
@@ -1113,6 +1279,10 @@ def run_evaluator_simple_prototype(*, request: Mapping[str, Any] | str | Path) -
                     workspace_name="checker",
                     copy_source_workspace=False,
                 )
+                checker_path_mappings = _role_workspace_path_mappings(
+                    request=normalized_request,
+                    workspace_root=checker_workspace_root,
+                )
                 state["checker"] = {
                     **checker_state,
                     "status": "RUNNING",
@@ -1133,6 +1303,7 @@ def run_evaluator_simple_prototype(*, request: Mapping[str, Any] | str | Path) -
                                 text=goals_text,
                                 source_workspace_root=workspace_root,
                                 target_workspace_root=checker_workspace_root,
+                                additional_path_mappings=checker_path_mappings,
                             ),
                             result_path=(
                                 _legacy._role_runtime_artifact_root(
@@ -1159,6 +1330,7 @@ def run_evaluator_simple_prototype(*, request: Mapping[str, Any] | str | Path) -
                                     source_workspace_root=workspace_root,
                                     source_path=goals_path,
                                     label="final_effects_text",
+                                    additional_path_mappings=checker_path_mappings,
                                 )
                             ),
                         },
@@ -1357,6 +1529,10 @@ def run_evaluator_simple_prototype(*, request: Mapping[str, Any] | str | Path) -
                 workspace_name="reviewer",
                 copy_source_workspace=False,
             )
+            reviewer_path_mappings = _role_workspace_path_mappings(
+                request=normalized_request,
+                workspace_root=reviewer_workspace_root,
+            )
             state["reviewer"] = {
                 **reviewer_state,
                 "status": "RUNNING",
@@ -1368,6 +1544,7 @@ def run_evaluator_simple_prototype(*, request: Mapping[str, Any] | str | Path) -
                     text=manual_text,
                     source_workspace_root=workspace_root,
                     target_workspace_root=reviewer_workspace_root,
+                    additional_path_mappings=reviewer_path_mappings,
                 )
                 reviewer_run = _invoke_text_role(
                     request=normalized_request,
@@ -1392,6 +1569,7 @@ def run_evaluator_simple_prototype(*, request: Mapping[str, Any] | str | Path) -
                                 source_workspace_root=workspace_root,
                                 source_path=manual_path,
                                 label="product_manual",
+                                additional_path_mappings=reviewer_path_mappings,
                             )
                         ),
                         "checker_result": dict(_project_checker_result_from_state(state) or {}),

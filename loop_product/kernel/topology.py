@@ -11,14 +11,15 @@ from loop_product.child_supervision_sidecar import ensure_child_supervision_runn
 from loop_product.control_intent import normalize_activation_condition
 from loop_product.dispatch.bootstrap import bootstrap_first_implementer_node
 from loop_product.dispatch.child_dispatch import materialize_child
-from loop_product.dispatch.launch_runtime import launch_child_from_result_ref, terminate_runtime_owned_launch_result_ref
+from loop_product.dispatch.launch_runtime import terminate_runtime_owned_launch_result_ref
 from loop_product.kernel.authority import KernelMutationAuthority, require_kernel_authority
 from loop_product.kernel.state import KernelState, persist_node_snapshot
 from loop_product.protocols.control_envelope import ControlEnvelope
 from loop_product.protocols.node import NodeStatus, RuntimeAttachmentState, normalize_runtime_state
 from loop_product.protocols.topology import TopologyMutation
 from loop_product.runtime.recover import apply_accepted_recovery_mutation, review_recovery_request
-from loop_product.runtime_paths import node_live_artifact_root, product_repo_root, require_runtime_root
+from loop_product.runtime.launch_surface import launch_child_from_result_ref
+from loop_product.runtime_paths import node_live_artifact_root, require_runtime_root, shared_cache_helper_ref
 from loop_product.runtime_paths import node_machine_handoff_ref
 from loop_product.topology.activate import review_activate_request
 from loop_product.topology.merge import review_merge_request
@@ -64,7 +65,7 @@ def _child_bootstrap_request_from_source_handoff(
     handoff_md_ref = source_workspace_root / "FROZEN_HANDOFF.md"
     if handoff_md_ref.exists():
         inherited_context_refs.append(str(handoff_md_ref.resolve()))
-    shared_cache_helper = (product_repo_root().resolve() / "scripts" / "ensure_workspace_lake_packages.sh").resolve()
+    shared_cache_helper = shared_cache_helper_ref()
     inherited_context_refs.append(str(shared_cache_helper))
     deduped_context_refs: list[str] = []
     seen_context_refs: set[str] = set()
@@ -103,6 +104,7 @@ def _child_bootstrap_request_from_source_handoff(
         "startup_required_output_paths": [
             str(item).strip() for item in list(child_record.get("startup_required_output_paths") or []) if str(item).strip()
         ],
+        "progress_checkpoints": list(child_record.get("progress_checkpoints") or []),
         "context_refs": deduped_context_refs,
         "result_sink_ref": result_sink_ref,
     }
@@ -369,6 +371,7 @@ def apply_accepted_topology_mutation(
             terminal_authority_scope=str(target.get("terminal_authority_scope") or "local"),
             required_output_paths=list(target.get("required_output_paths") or []),
             startup_required_output_paths=list(target.get("startup_required_output_paths") or []),
+            progress_checkpoints=list(target.get("progress_checkpoints") or []),
             workspace_root=str(target.get("workspace_root") or ""),
             codex_home=str(target.get("codex_home") or ""),
             depends_on_node_ids=list(target.get("depends_on_node_ids") or []),

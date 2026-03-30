@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -23,6 +24,7 @@ def main() -> int:
             build_codex_cli_child_launch,
             codex_reasoning_effort_for_thinking_budget,
         )
+        from loop_product.codex_home import default_codex_model  # type: ignore
     except Exception as exc:  # noqa: BLE001
         return _fail(f"failed to import launch-policy helpers: {exc}")
 
@@ -41,19 +43,36 @@ def main() -> int:
 
     workspace_root = ROOT / "workspace" / "example-project"
     prompt_path = workspace_root / "CHILD_PROMPT.md"
-    launch = build_codex_cli_child_launch(
-        workspace_root=workspace_root,
-        sandbox_mode="danger-full-access",
-        thinking_budget="medium",
-        prompt_path=prompt_path,
-    )
+    original_env = {key: os.environ.get(key) for key in ("http_proxy", "all_proxy", "NO_PROXY")}
+    os.environ["http_proxy"] = "http://127.0.0.1:7890"
+    os.environ["all_proxy"] = "socks5://127.0.0.1:7890"
+    os.environ["NO_PROXY"] = "localhost,127.0.0.1"
+    try:
+        launch = build_codex_cli_child_launch(
+            workspace_root=workspace_root,
+            sandbox_mode="danger-full-access",
+            thinking_budget="medium",
+            prompt_path=prompt_path,
+        )
+    finally:
+        for key, value in original_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
     if str(launch.get("cwd") or "") != str(workspace_root.resolve()):
         return _fail("child launch helper must pin cwd to the node workspace root")
     if str(launch.get("stdin_path") or "") != str(prompt_path.resolve()):
         return _fail("child launch helper must preserve the prompt file as stdin_path")
 
     env = dict(launch.get("env") or {})
-    if env:
+    if env.get("HTTP_PROXY") != "http://127.0.0.1:7890" or env.get("http_proxy") != "http://127.0.0.1:7890":
+        return _fail(f"child launch helper must preserve parent HTTP proxy transport env, got {env!r}")
+    if env.get("ALL_PROXY") != "socks5://127.0.0.1:7890" or env.get("all_proxy") != "socks5://127.0.0.1:7890":
+        return _fail(f"child launch helper must preserve parent ALL_PROXY transport env, got {env!r}")
+    if env.get("NO_PROXY") != "localhost,127.0.0.1" or env.get("no_proxy") != "localhost,127.0.0.1":
+        return _fail(f"child launch helper must preserve parent NO_PROXY transport env, got {env!r}")
+    if "HOME" in env or "CODEX_HOME" in env:
         return _fail(f"child launch helper must not override HOME or CODEX_HOME, got {env!r}")
 
     argv = list(launch.get("argv") or [])
@@ -68,6 +87,8 @@ def main() -> int:
         "danger-full-access",
         "--add-dir",
         expected_codex_home,
+        "-m",
+        default_codex_model(),
         "-c",
         'model_reasoning_effort="medium"',
         "-",

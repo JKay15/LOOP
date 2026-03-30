@@ -42,6 +42,8 @@ def _wait_dead(pid: int, timeout_s: float = 5.0) -> None:
 
 def main() -> int:
     from loop_product.runtime import bootstrap_first_implementer_node
+    from loop_product.runtime import cleanup_test_runtime_root
+    from loop_product.runtime_paths import node_machine_handoff_ref
 
     request_schema = _load_schema("LoopOrphanedActiveRecoveryRequest.schema.json")
     result_schema = _load_schema("LoopOrphanedActiveRecoveryResult.schema.json")
@@ -93,6 +95,23 @@ def main() -> int:
 
         workspace_root = ROOT / "workspace" / "test-orphaned-active-recovery-helper"
         state_root = ROOT / ".loop" / "test-orphaned-active-recovery-helper"
+        shutil.rmtree(workspace_root, ignore_errors=True)
+        shutil.rmtree(state_root, ignore_errors=True)
+        cleanup_errors: list[str] = []
+
+        def _cleanup_runtime(*, state_root_value: Path | None, workspace_root_value: Path | None) -> None:
+            if state_root_value is None or workspace_root_value is None:
+                return
+            try:
+                receipt = cleanup_test_runtime_root(state_root=state_root_value, repo_root=ROOT)
+            except Exception as exc:
+                cleanup_errors.append(f"cleanup_test_runtime_root failed for {state_root_value}: {exc}")
+                return
+            if not bool(receipt.get("quiesced")):
+                cleanup_errors.append(f"cleanup_test_runtime_root did not quiesce {state_root_value}: {receipt}")
+            if list(receipt.get("remaining_owned_processes") or []):
+                cleanup_errors.append(f"cleanup_test_runtime_root left owned processes for {state_root_value}: {receipt}")
+
         try:
             bootstrap = bootstrap_first_implementer_node(
                 mode="fresh",
@@ -105,7 +124,28 @@ def main() -> int:
                 workspace_mirror_relpath="deliverables/out.html",
                 external_publish_target=str((temp_root / "Desktop" / "out.html").resolve()),
                 context_refs=[],
+                startup_required_output_paths=[
+                    "README.md",
+                    "TRACEABILITY.md",
+                    "analysis/STARTUP_BOUNDARY.json",
+                ],
+                progress_checkpoints=[
+                    {
+                        "checkpoint_id": "recovery_decision",
+                        "description": "persist the first machine-auditable execution decision after startup",
+                        "required_any_of": [
+                            "analysis/EXECUTION_DECISION.json",
+                            "split/SPLIT_DECLINE_REASON.md",
+                        ],
+                        "window_s": 300.0,
+                    }
+                ],
             )
+            initial_handoff_ref = Path(str(bootstrap.get("handoff_json_ref") or "")).resolve()
+            initial_handoff_payload = json.loads(initial_handoff_ref.read_text(encoding="utf-8"))
+            expected_live_relpath = str(initial_handoff_payload.get("workspace_live_artifact_relpath") or "")
+            expected_startup_outputs = list(initial_handoff_payload.get("startup_required_output_paths") or [])
+            expected_progress_checkpoints = list(initial_handoff_payload.get("progress_checkpoints") or [])
 
             script = ROOT / "scripts" / "recover_orphaned_active.sh"
             bad_proc = subprocess.run(
@@ -218,7 +258,10 @@ def main() -> int:
             if premature_recovery_proc.returncode == 0:
                 return _fail("recovery helper must reject same-node retry while the latest child pid is still live")
 
-            os.kill(live_pid, signal.SIGTERM)
+            try:
+                os.kill(live_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
             _wait_dead(live_pid)
 
             stale_epoch = time.time() - 25.0
@@ -290,6 +333,15 @@ def main() -> int:
                 cwd=str(ROOT),
                 text=True,
                 capture_output=True,
+                env={
+                    **dict(os.environ),
+                    "HTTP_PROXY": "http://127.0.0.1:7890",
+                    "http_proxy": "http://127.0.0.1:7890",
+                    "ALL_PROXY": "socks5://127.0.0.1:7890",
+                    "all_proxy": "socks5://127.0.0.1:7890",
+                    "NO_PROXY": "localhost,127.0.0.1",
+                    "no_proxy": "localhost,127.0.0.1",
+                },
             )
             if proc.returncode != 0:
                 return _fail(f"recovery helper wrapper must accept direct structured flags after confirmed runtime loss: {proc.stderr or proc.stdout}")
@@ -310,6 +362,11 @@ def main() -> int:
                 return _fail("recovery helper must relaunch through codex exec pinned to the same workspace root")
             if launch_spec.get("stdin_path") != str((workspace_root / "CHILD_PROMPT.md").resolve()):
                 return _fail("recovery helper must relaunch the same child prompt")
+            launch_env = dict(launch_spec.get("env") or {})
+            if launch_env.get("HTTP_PROXY") != "http://127.0.0.1:7890" or launch_env.get("http_proxy") != "http://127.0.0.1:7890":
+                return _fail("recovery helper must preserve proxy transport env in the relaunch launch_spec")
+            if launch_env.get("ALL_PROXY") != "socks5://127.0.0.1:7890" or launch_env.get("all_proxy") != "socks5://127.0.0.1:7890":
+                return _fail("recovery helper must preserve all_proxy transport env in the relaunch launch_spec")
 
             request_ref = Path(str(recovery.get("recovery_request_ref") or ""))
             result_ref = Path(str(recovery.get("recovery_result_ref") or ""))
@@ -318,7 +375,10 @@ def main() -> int:
 
             runtime_state = json.loads((state_root / "state" / "test-orphaned-active-recovery-helper.json").read_text(encoding="utf-8")).get("runtime_state") or {}
             if str(runtime_state.get("attachment_state") or "") != "UNOBSERVED":
-                return _fail("accepted retry must reset the node runtime attachment to UNOBSERVED")
+                return _fail(
+                    "accepted retry must reset the node runtime attachment to UNOBSERVED, "
+                    f"got {str(runtime_state.get('attachment_state') or '')!r}"
+                )
 
             if Path(str(recovery.get("confirmed_launch_result_ref") or "")).resolve() != Path(str(live_launch.get("launch_result_ref") or "")).resolve():
                 return _fail("recovery helper must record which committed launch result was freshly rechecked")
@@ -334,6 +394,22 @@ def main() -> int:
                 return _fail("same-node recovery must refresh the bootstrap evaluator manual instead of reusing a stale poisoned copy")
             if "Poisoned Final Effects" in refreshed_effects_text:
                 return _fail("same-node recovery must refresh the bootstrap evaluator final effects instead of reusing a stale poisoned copy")
+            refreshed_handoff_ref = node_machine_handoff_ref(state_root=state_root, node_id="test-orphaned-active-recovery-helper")
+            refreshed_handoff = json.loads(refreshed_handoff_ref.read_text(encoding="utf-8"))
+            if str(refreshed_handoff.get("workspace_live_artifact_relpath") or "") != expected_live_relpath:
+                return _fail("same-node orphaned-active recovery must preserve workspace_live_artifact_relpath in the refreshed frozen handoff")
+            if list(refreshed_handoff.get("startup_required_output_paths") or []) != expected_startup_outputs:
+                return _fail("same-node orphaned-active recovery must preserve startup_required_output_paths in the refreshed frozen handoff")
+            if list(refreshed_handoff.get("progress_checkpoints") or []) != expected_progress_checkpoints:
+                return _fail("same-node orphaned-active recovery must preserve progress_checkpoints in the refreshed frozen handoff")
+            recovery_context_ref = Path(str(recovery.get("recovery_context_ref") or "")).resolve()
+            if not recovery_context_ref.exists():
+                return _fail("accepted orphaned-active recovery must persist RECOVERY_CONTEXT.md")
+            refreshed_context_refs = [str(item) for item in list(refreshed_handoff.get("context_refs") or [])]
+            if str(recovery_context_ref) not in refreshed_context_refs:
+                return _fail("accepted orphaned-active recovery must inject RECOVERY_CONTEXT.md into the refreshed frozen handoff context refs")
+            if str(Path(str(live_launch.get("launch_result_ref") or "")).resolve()) not in refreshed_context_refs:
+                return _fail("accepted orphaned-active recovery must preserve recovery evidence refs in the refreshed frozen handoff context refs")
 
             reused_launch_proc = subprocess.run(
                 [
@@ -386,6 +462,169 @@ def main() -> int:
                 return _fail("recovery launch must reuse the replacement child after it becomes the live same-node process")
             if int(reused_launch_again.get("pid") or 0) != reused_pid:
                 return _fail("recovery reuse launch must point at the exact live replacement child pid")
+
+            workspace_root_retryable = ROOT / "workspace" / "test-orphaned-active-recovery-helper-retryable"
+            state_root_retryable = ROOT / ".loop" / "test-orphaned-active-recovery-helper-retryable"
+            shutil.rmtree(workspace_root_retryable, ignore_errors=True)
+            shutil.rmtree(state_root_retryable, ignore_errors=True)
+            retryable_bootstrap = bootstrap_first_implementer_node(
+                mode="fresh",
+                task_slug="test-orphaned-active-recovery-helper-retryable",
+                root_goal="bootstrap one implementer node for stale runtime status refresh validation",
+                child_goal_slice="accept same-node retry after refreshing a stale terminal status for a retryable fail lane",
+                endpoint_artifact_ref=str(endpoint.resolve()),
+                workspace_root=str(workspace_root_retryable),
+                state_root=str(state_root_retryable),
+                workspace_mirror_relpath="deliverables/out.txt",
+                external_publish_target=str((temp_root / "Desktop" / "out-retryable.txt").resolve()),
+                context_refs=[],
+            )
+            retryable_node_id = str(retryable_bootstrap["node_id"])
+            retryable_result_ref = state_root_retryable / "artifacts" / retryable_node_id / "implementer_result.json"
+            retryable_result_ref.parent.mkdir(parents=True, exist_ok=True)
+            retryable_result_ref.write_text(
+                json.dumps(
+                    {
+                        "schema": "loop_product.implementer_result",
+                        "schema_version": "0.1.0",
+                        "node_id": retryable_node_id,
+                        "status": "COMPLETED",
+                        "outcome": "REPAIR_REQUIRED",
+                        "summary": "simple evaluator reviewer verdict=FAIL",
+                        "evaluator_result": {
+                            "verdict": "FAIL",
+                            "retryable": True,
+                            "summary": "simple evaluator reviewer verdict=FAIL",
+                            "diagnostics": {
+                                "self_attribution": "implementation_gap",
+                                "self_repair": "repair the unmet in-scope requirements and rerun evaluator",
+                            },
+                        },
+                        "evaluation_report_ref": str((temp_root / "retryable-EvaluationReport.json").resolve()),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (temp_root / "retryable-EvaluationReport.json").write_text("{}\n", encoding="utf-8")
+            retryable_launch_result_ref = (
+                state_root_retryable / "artifacts" / "launches" / retryable_node_id / "attempt_001" / "ChildLaunchResult.json"
+            )
+            retryable_launch_result_ref.parent.mkdir(parents=True, exist_ok=True)
+            retryable_launch_request_ref = retryable_launch_result_ref.with_name("ChildLaunchRequest.json")
+            retryable_stdout_ref = retryable_launch_result_ref.with_name(f"{retryable_node_id}.stdout.txt")
+            retryable_stderr_ref = retryable_launch_result_ref.with_name(f"{retryable_node_id}.stderr.txt")
+            retryable_stdout_ref.write_text("stale retryable lane output\n", encoding="utf-8")
+            retryable_stderr_ref.write_text("", encoding="utf-8")
+            retryable_launch_request_ref.write_text("{}\n", encoding="utf-8")
+            retryable_launch_result_ref.write_text(
+                json.dumps(
+                    {
+                        "source_result_ref": str(retryable_result_ref.resolve()),
+                        "launch_result_ref": str(retryable_launch_result_ref.resolve()),
+                        "launch_request_ref": str(retryable_launch_request_ref.resolve()),
+                        "launch_log_dir": str(retryable_launch_result_ref.parent.resolve()),
+                        "launch_decision": "started",
+                        "node_id": retryable_node_id,
+                        "state_root": str(state_root_retryable.resolve()),
+                        "workspace_root": str(workspace_root_retryable.resolve()),
+                        "startup_health_timeout_ms": 12000,
+                        "startup_retry_limit": 1,
+                        "attempt_count": 1,
+                        "retryable_failure_kind": "",
+                        "attempts": [],
+                        "stdin_ref": str((workspace_root_retryable / "CHILD_PROMPT.md").resolve()),
+                        "wrapped_argv": ["codex", "exec", "-"],
+                        "pid": 999999,
+                        "exit_code": 1,
+                        "stdout_ref": str(retryable_stdout_ref.resolve()),
+                        "stderr_ref": str(retryable_stderr_ref.resolve()),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            stale_retryable_status_ref = retryable_launch_result_ref.with_name("stale-terminal-status.json")
+            stale_retryable_status_ref.write_text(
+                json.dumps(
+                    {
+                        "launch_result_ref": str(retryable_launch_result_ref.resolve()),
+                        "status_result_ref": str(stale_retryable_status_ref.resolve()),
+                        "node_id": retryable_node_id,
+                        "state_root": str(state_root_retryable.resolve()),
+                        "workspace_root": str(workspace_root_retryable.resolve()),
+                        "pid": 999999,
+                        "pid_alive": False,
+                        "exit_code": 1,
+                        "lifecycle_status": "ACTIVE",
+                        "runtime_attachment_state": "TERMINAL",
+                        "runtime_observation_kind": "terminal_result",
+                        "runtime_summary": "stale terminal view from an older runtime-status helper",
+                        "runtime_evidence_refs": [str(retryable_result_ref.resolve())],
+                        "latest_log_ref": str(retryable_stdout_ref.resolve()),
+                        "latest_log_mtime": "",
+                        "latest_log_age_s": 999.0,
+                        "stdout_ref": str(retryable_stdout_ref.resolve()),
+                        "stderr_ref": str(retryable_stderr_ref.resolve()),
+                        "stalled_hint": False,
+                        "recovery_eligible": False,
+                        "recovery_reason": "authoritative_terminal_result",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            retryable_proc = subprocess.run(
+                [
+                    str(script),
+                    "--state-root",
+                    str(state_root_retryable),
+                    "--node-id",
+                    retryable_node_id,
+                    "--workspace-root",
+                    str(workspace_root_retryable),
+                    "--confirmed-launch-result-ref",
+                    str(retryable_launch_result_ref.resolve()),
+                    "--confirmed-runtime-status-ref",
+                    str(stale_retryable_status_ref.resolve()),
+                    "--reason",
+                    "retryable evaluator fail left the node active but the stale status ref still looked terminal",
+                    "--self-attribution",
+                    "implementation_gap",
+                    "--self-repair",
+                    "continue the same implementer task, repair the unmet in-scope requirements, and rerun evaluator",
+                    "--observation-kind",
+                    "retryable_terminal_result",
+                    "--summary",
+                    "stale runtime status must be refreshed before same-node recovery is judged",
+                    "--evidence-ref",
+                    str(retryable_result_ref.resolve()),
+                ],
+                cwd=str(ROOT),
+                text=True,
+                capture_output=True,
+            )
+            if retryable_proc.returncode != 0:
+                return _fail(
+                    "orphaned-active recovery helper must refresh stale terminal confirmed runtime status for retryable FAIL lanes "
+                    f"instead of rejecting the same-node retry: {retryable_proc.stderr or retryable_proc.stdout}"
+                )
+            retryable_recovery = json.loads(retryable_proc.stdout)
+            Draft202012Validator(result_schema).validate(retryable_recovery)
+            if str(retryable_recovery.get("confirmed_runtime_recovery_reason") or "") == "authoritative_terminal_result":
+                return _fail("recovery helper must not keep using a stale authoritative_terminal_result status after refresh")
+            refreshed_retryable_status_ref = Path(str(retryable_recovery.get("confirmed_runtime_status_ref") or ""))
+            if not refreshed_retryable_status_ref.exists():
+                return _fail("recovery helper must persist the refreshed runtime status it actually used for retryable FAIL recovery")
+            if refreshed_retryable_status_ref.resolve() == stale_retryable_status_ref.resolve():
+                return _fail("recovery helper must replace stale terminal confirmed runtime status with a fresh trusted status")
         finally:
             for pid_name in ("live_pid", "reused_pid"):
                 pid_value = locals().get(pid_name, 0)
@@ -402,8 +641,25 @@ def main() -> int:
                     except ProcessLookupError:
                         break
                     time.sleep(0.05)
+            retryable_workspace = locals().get("workspace_root_retryable")
+            retryable_state = locals().get("state_root_retryable")
+            _cleanup_runtime(
+                state_root_value=state_root if isinstance(locals().get("state_root"), Path) else None,
+                workspace_root_value=workspace_root if isinstance(locals().get("workspace_root"), Path) else None,
+            )
+            _cleanup_runtime(
+                state_root_value=retryable_state if isinstance(retryable_state, Path) else None,
+                workspace_root_value=retryable_workspace if isinstance(retryable_workspace, Path) else None,
+            )
             shutil.rmtree(workspace_root, ignore_errors=True)
             shutil.rmtree(state_root, ignore_errors=True)
+            if isinstance(retryable_workspace, Path):
+                shutil.rmtree(retryable_workspace, ignore_errors=True)
+            if isinstance(retryable_state, Path):
+                shutil.rmtree(retryable_state, ignore_errors=True)
+
+        if cleanup_errors:
+            return _fail("; ".join(cleanup_errors))
 
     print("[loop-system-orphaned-active-recovery-helper] OK")
     return 0

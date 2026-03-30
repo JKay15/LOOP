@@ -57,6 +57,7 @@ class NodeSpec:
     terminal_authority_scope: str = TERMINAL_AUTHORITY_SCOPE_SPEC.default_value
     required_output_paths: list[str] = field(default_factory=list)
     startup_required_output_paths: list[str] = field(default_factory=list)
+    progress_checkpoints: list[dict[str, Any]] = field(default_factory=list)
     workspace_root: str = ""
     codex_home: str = ""
     depends_on_node_ids: list[str] = field(default_factory=list)
@@ -78,6 +79,7 @@ class NodeSpec:
             self.terminal_authority_scope,
             TERMINAL_AUTHORITY_SCOPE_SPEC,
         )
+        data["progress_checkpoints"] = normalize_progress_checkpoints(self.progress_checkpoints)
         data["runtime_state"] = normalize_runtime_state(self.runtime_state)
         data["status"] = self.status.value
         return data
@@ -106,6 +108,7 @@ class NodeSpec:
             startup_required_output_paths=[
                 str(item) for item in (data.get("startup_required_output_paths") or []) if str(item).strip()
             ],
+            progress_checkpoints=normalize_progress_checkpoints(data.get("progress_checkpoints") or []),
             workspace_root=str(data.get("workspace_root") or ""),
             codex_home=str(data.get("codex_home") or ""),
             depends_on_node_ids=[str(item) for item in (data.get("depends_on_node_ids") or [])],
@@ -147,3 +150,27 @@ def normalize_runtime_state(state: dict[str, Any] | None = None) -> dict[str, An
     normalized["observation_kind"] = str(normalized.get("observation_kind") or "")
     normalized["evidence_refs"] = [str(item) for item in (normalized.get("evidence_refs") or [])]
     return normalized
+
+
+def normalize_progress_checkpoints(raw: Any) -> list[dict[str, Any]]:
+    checkpoints: list[dict[str, Any]] = []
+    for item in list(raw or []):
+        if not isinstance(item, dict):
+            continue
+        checkpoint_id = str(item.get("checkpoint_id") or "").strip()
+        required_any_of = [str(path).strip() for path in list(item.get("required_any_of") or []) if str(path).strip()]
+        try:
+            window_s = float(item.get("window_s") or 0.0)
+        except (TypeError, ValueError):
+            window_s = 0.0
+        if not checkpoint_id or not required_any_of or window_s <= 0.0:
+            continue
+        checkpoints.append(
+            {
+                "checkpoint_id": checkpoint_id,
+                "description": str(item.get("description") or "").strip(),
+                "required_any_of": required_any_of,
+                "window_s": window_s,
+            }
+        )
+    return checkpoints

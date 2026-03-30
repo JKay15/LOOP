@@ -8,7 +8,8 @@ import shlex
 from pathlib import Path
 from typing import Any, Mapping
 
-from ..run_cmd import run_cmd
+from ..codex_home import default_codex_model
+from ..run_cmd import _ENV_UNSET_SENTINEL, run_cmd
 
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 _ENV_REF_RE = re.compile(r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))")
@@ -55,6 +56,26 @@ def _expand_env_refs(raw: str, env: Mapping[str, str]) -> str:
     return _ENV_REF_RE.sub(_replace, str(raw))
 
 
+def _argv_uses_uv_project(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    if str(argv[0]).strip() != "uv":
+        return False
+    saw_run = False
+    for index, token in enumerate(argv[1:], start=1):
+        value = str(token).strip()
+        if value == "run":
+            saw_run = True
+            continue
+        if not saw_run:
+            continue
+        if value in {"--project", "-p"}:
+            return index + 1 < len(argv)
+        if value.startswith("--project="):
+            return True
+    return False
+
+
 def _build_provider_argv(
     *,
     provider_id: str,
@@ -62,6 +83,7 @@ def _build_provider_argv(
     prompt_arg: str,
     sandbox_mode: str,
     reasoning_effort: str,
+    model: str,
     prompt_path: Path,
     workspace_root: Path,
     response_path: Path,
@@ -84,6 +106,8 @@ def _build_provider_argv(
             argv.extend(["--output-schema", str(output_schema_path.resolve())])
         output_target = raw_response_path if raw_response_path is not None else response_path
         argv.extend(["-o", str(output_target.resolve())])
+        if str(model or "").strip():
+            argv.extend(["-m", str(model).strip()])
         if reasoning_effort in _SUPPORTED_REASONING_EFFORTS:
             argv.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
         if prompt_transport == "stdin":
@@ -135,6 +159,8 @@ def build_committed_role_launch_spec(
         }
         merged_env.update(expanded_parsed_env)
         expanded_argv = [_expand_env_refs(token, merged_env) for token in argv]
+        if _argv_uses_uv_project(expanded_argv):
+            merged_env["VIRTUAL_ENV"] = _ENV_UNSET_SENTINEL
         return {
             "argv": expanded_argv,
             "env": merged_env,
@@ -148,12 +174,16 @@ def build_committed_role_launch_spec(
     prompt_arg = str(getattr(resolved, "prompt_arg", "") or "").strip()
     sandbox_mode = str(config.get("sandbox_mode") or "danger-full-access").strip() or "danger-full-access"
     reasoning_effort = str(config.get("reasoning_effort") or "").strip().lower()
+    model = str(config.get("model") or "").strip()
+    if provider_id == "codex_cli" and not model:
+        model = default_codex_model()
     argv, stdin_path = _build_provider_argv(
         provider_id=provider_id,
         prompt_transport=prompt_transport,
         prompt_arg=prompt_arg,
         sandbox_mode=sandbox_mode,
         reasoning_effort=reasoning_effort,
+        model=model,
         prompt_path=prompt_path,
         workspace_root=workspace_root,
         response_path=response_path,
@@ -200,4 +230,5 @@ def run_committed_role_launch(
         reconnect_max_events=reconnect_max_events,
         capture_text=False,
         env={str(k): str(v) for k, v in dict(launch_spec.get("env") or {}).items()},
+        inherit_parent_env=False,
     )

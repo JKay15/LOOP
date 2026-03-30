@@ -31,6 +31,24 @@ def product_repo_root() -> Path:
     return _PRODUCT_REPO_ROOT
 
 
+def shared_cache_helper_ref() -> Path:
+    """Return the canonical committed shared-cache helper path.
+
+    The helper currently lives in the outer LeanAtlas repo rather than the
+    standalone `loop_product_repo/` tree. Prefer the outer committed path when
+    it exists, but keep a deterministic fallback for environments that may
+    vendor the helper into the product repo later.
+    """
+
+    outer_candidate = (_PRODUCT_REPO_ROOT.parent / "scripts" / "ensure_workspace_lake_packages.sh").resolve()
+    if outer_candidate.exists():
+        return outer_candidate
+    inner_candidate = (_PRODUCT_REPO_ROOT / "scripts" / "ensure_workspace_lake_packages.sh").resolve()
+    if inner_candidate.exists():
+        return inner_candidate
+    return outer_candidate
+
+
 def default_workspace_root() -> Path:
     """Return the default product workspace root for repo-local runs."""
 
@@ -53,6 +71,13 @@ def safe_runtime_name(name: str) -> str:
     """Return a filesystem-safe deterministic name for workspace/state-root allocation."""
 
     return _safe_workspace_name(name)
+
+
+def default_child_workspace_root(*, state_root: str | Path, node_id: str) -> Path:
+    """Return the default run-scoped workspace root for one kernel-materialized child."""
+
+    runtime_name = safe_runtime_name(Path(state_root).expanduser().resolve().name)
+    return (implementer_workspace_root().resolve() / runtime_name / _safe_workspace_name(node_id)).resolve()
 
 
 def resolve_implementer_project_root(*, node_id: str, workspace_root: str | Path | None = None) -> Path:

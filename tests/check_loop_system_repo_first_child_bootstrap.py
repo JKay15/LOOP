@@ -14,6 +14,7 @@ from jsonschema import Draft202012Validator
 
 
 ROOT = Path(__file__).resolve().parents[1]
+OUTER_ROOT = ROOT.parent
 
 
 def _fail(msg: str) -> int:
@@ -33,13 +34,17 @@ def _load_schema(name: str) -> dict[str, object]:
 def main() -> int:
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
+    if str(OUTER_ROOT) not in sys.path:
+        sys.path.insert(0, str(OUTER_ROOT))
 
     try:
         import loop_product as loop_product_package
         import loop_product.runtime as runtime_surface
+        from tools.workflow.shared_cache import ensure_workspace_lake_packages
 
         from loop_product.dispatch.child_dispatch import materialize_child
         from loop_product.dispatch.child_dispatch import load_child_runtime_context
+        from loop_product.dispatch.bootstrap import _persist_bootstrap_result
         from loop_product.kernel.authority import kernel_internal_authority
         from loop_product.kernel.policy import (
             implementer_budget_profile,
@@ -179,12 +184,24 @@ def main() -> int:
             handoff_json = Path(str(result.get("handoff_json_ref") or ""))
             handoff_md = Path(str(result.get("handoff_md_ref") or ""))
             child_prompt = Path(str(result.get("child_prompt_ref") or ""))
+            shared_cache_runner = workspace_root / "ENSURE_SHARED_CACHE.sh"
             node_ref = Path(str(result.get("node_ref") or ""))
             delegation_ref = Path(str(result.get("delegation_ref") or ""))
             bootstrap_result_ref = Path(str(result.get("bootstrap_result_ref") or ""))
             for path in (handoff_json, handoff_md, child_prompt, node_ref, delegation_ref, bootstrap_result_ref):
                 if not path.exists():
                     return _fail(f"fresh bootstrap must materialize {path}")
+            expected_live_artifact_relpath = ".tmp_primary_artifact/gon_birthday_poster.html"
+            expected_live_artifact_ref = str((workspace_root / expected_live_artifact_relpath).resolve())
+            if not shared_cache_runner.exists():
+                return _fail("fresh bootstrap must materialize a node-local ENSURE_SHARED_CACHE.sh wrapper")
+            shared_cache_runner_text = shared_cache_runner.read_text(encoding="utf-8")
+            if '--workspace-root "' + expected_live_artifact_ref + '"' not in shared_cache_runner_text:
+                return _fail("shared-cache runner must prebind the exact live artifact root instead of forcing the child to guess argv")
+            if '--purpose "test-first-child-bootstrap live-root shared-cache hydration"' not in shared_cache_runner_text:
+                return _fail("shared-cache runner must prebind an audit-friendly purpose string")
+            if f"`{shared_cache_runner.resolve()}`" not in child_prompt.read_text(encoding="utf-8"):
+                return _fail("child prompt must point at the exact node-local shared-cache runner instead of a generic helper path")
 
             handoff_payload = json.loads(handoff_json.read_text(encoding="utf-8"))
             if str(handoff_payload.get("endpoint_artifact_ref") or "") != str(endpoint_artifact.resolve()):
@@ -193,8 +210,6 @@ def main() -> int:
                 return _fail("frozen handoff must persist the exact state_root for topology helpers")
             if str(handoff_payload.get("workspace_mirror_relpath") or "") != "deliverables/gon_birthday_poster.html":
                 return _fail("frozen handoff must persist the workspace mirror relpath")
-            expected_live_artifact_relpath = ".tmp_primary_artifact/gon_birthday_poster.html"
-            expected_live_artifact_ref = str((workspace_root / expected_live_artifact_relpath).resolve())
             if str(handoff_payload.get("workspace_live_artifact_relpath") or "") != expected_live_artifact_relpath:
                 return _fail("frozen handoff must persist the exact live artifact relpath separate from the publish root")
             if str(handoff_payload.get("workspace_live_artifact_ref") or "") != expected_live_artifact_ref:
@@ -213,6 +228,17 @@ def main() -> int:
             expected_publication_runner_ref = str((workspace_root / "PUBLISH_WORKSPACE_ARTIFACT.sh").resolve())
             expected_split_runner_ref = str((workspace_root / "SUBMIT_SPLIT_REQUEST.sh").resolve())
             expected_activate_runner_ref = str((workspace_root / "SUBMIT_ACTIVATE_REQUEST.sh").resolve())
+            expected_control_root_ref = str((workspace_root / ".tmp_primary_artifact").resolve())
+            expected_split_proposal_ref = str((workspace_root / ".tmp_primary_artifact" / "split" / "SPLIT_REQUEST_PROPOSAL.json").resolve())
+            expected_split_submission_ref = str(
+                (workspace_root / ".tmp_primary_artifact" / "split" / "SPLIT_REQUEST_SUBMISSION_RESULT.json").resolve()
+            )
+            expected_activate_proposal_ref = str(
+                (workspace_root / ".tmp_primary_artifact" / "activate" / "ACTIVATE_REQUEST_PROPOSAL.json").resolve()
+            )
+            expected_activate_submission_ref = str(
+                (workspace_root / ".tmp_primary_artifact" / "activate" / "ACTIVATE_REQUEST_SUBMISSION_RESULT.json").resolve()
+            )
             expected_evaluator_manual_ref = str((evaluator_bundle_root / "EvaluatorProductManual.md").resolve())
             expected_evaluator_final_effects_ref = str((evaluator_bundle_root / "EvaluatorFinalEffects.md").resolve())
             if str(handoff_payload.get("workspace_result_sink_relpath") or "") != expected_workspace_sink_relpath:
@@ -229,6 +255,8 @@ def main() -> int:
                 return _fail("frozen handoff must persist the exact artifact publication receipt ref")
             if str(handoff_payload.get("artifact_publication_runner_ref") or "") != expected_publication_runner_ref:
                 return _fail("frozen handoff must persist the exact workspace-local publication runner ref")
+            if str(handoff_payload.get("shared_cache_runner_ref") or "") != str(shared_cache_runner.resolve()):
+                return _fail("frozen handoff must persist the exact node-local shared-cache runner ref")
             if str(handoff_payload.get("external_publication_owner") or "") != "root-kernel":
                 return _fail("frozen handoff must persist root-kernel as the normal external publication owner")
             if str(handoff_payload.get("external_input_policy") or "") != "read_only_external_inputs_allowed_when_required_by_frozen_endpoint":
@@ -247,6 +275,22 @@ def main() -> int:
                 return _fail("bootstrap result must surface the exact artifact publication receipt ref")
             if str(result.get("artifact_publication_runner_ref") or "") != expected_publication_runner_ref:
                 return _fail("bootstrap result must surface the exact workspace-local publication runner ref")
+            if str(result.get("shared_cache_runner_ref") or "") != str(shared_cache_runner.resolve()):
+                return _fail("bootstrap result must surface the exact node-local shared-cache runner ref")
+            split_runner_text = Path(expected_split_runner_ref).read_text(encoding="utf-8")
+            if f'--proposal-ref "{expected_split_proposal_ref}"' not in split_runner_text:
+                return _fail("split runner must pin the deterministic split proposal ref under the control-surface root")
+            if f'--result-ref "{expected_split_submission_ref}"' not in split_runner_text:
+                return _fail("split runner must pin the deterministic split submission result ref under the control-surface root")
+            if expected_control_root_ref not in split_runner_text:
+                return _fail("split runner must anchor deterministic control refs at the control-surface root instead of the file artifact path")
+            activate_runner_text = Path(expected_activate_runner_ref).read_text(encoding="utf-8")
+            if f'--proposal-ref "{expected_activate_proposal_ref}"' not in activate_runner_text:
+                return _fail("activate runner must pin the deterministic activate proposal ref under the control-surface root")
+            if f'--result-ref "{expected_activate_submission_ref}"' not in activate_runner_text:
+                return _fail("activate runner must pin the deterministic activate submission result ref under the control-surface root")
+            if expected_control_root_ref not in activate_runner_text:
+                return _fail("activate runner must anchor deterministic control refs at the control-surface root instead of the file artifact path")
             if handoff_json.parent == workspace_root.resolve():
                 return _fail("machine-only frozen handoff must not be materialized inside the agent-visible workspace")
             if (workspace_root / "FROZEN_HANDOFF.json").exists():
@@ -262,7 +306,7 @@ def main() -> int:
             prompt_text = child_prompt.read_text(encoding="utf-8")
             for needle in (
                 "Read and follow:",
-                str((workspace_root.parent / "AGENTS.md").resolve()),
+                str((ROOT / "workspace" / "AGENTS.md").resolve()),
                 str(handoff_md.resolve()),
                 "You are not the root kernel.",
                 "Keep durable implementation writes inside the current workspace root, except for the exact authoritative kernel-visible result sink frozen in the handoff.",
@@ -285,14 +329,15 @@ def main() -> int:
                 expected_live_artifact_ref,
                 expected_publication_receipt_ref,
                 expected_publication_runner_ref,
+                str(shared_cache_runner.resolve()),
                 expected_kernel_sink_ref,
                 expected_workspace_sink_ref,
                 "fresh workspace-local Lean package",
                 "Build in the live artifact root first and treat the workspace mirror as publish-only",
                 "Publish through the exact publication runner before evaluator or terminal report",
                 "A child-authored WHOLE_PAPER_STATUS.json or branch README is not a publication receipt",
-                "shared-cache helper named in the frozen handoff context refs",
-                "before the first `lake build`",
+                "call the exact shared-cache runner named below before the first `lake build`",
+                "do not invoke the generic helper path with guessed argv",
                 "live `git clone`, `lake update`, or `lake exe cache get`",
                 "artifact-local `.lake/packages`",
                 "exact frozen refs in the handoff/prompt as authoritative",
@@ -436,7 +481,11 @@ def main() -> int:
                 "workspace_mirror_relpath": "deliverables/primary_artifact",
                 "workspace_live_artifact_relpath": split_live_relpath,
                 "external_publish_target": "",
-                "context_refs": [str(endpoint_artifact.resolve()), str(handoff_md.resolve())],
+                "context_refs": [
+                    str(endpoint_artifact.resolve()),
+                    str(handoff_md.resolve()),
+                    str(shared_cache_helper_ref),
+                ],
                 "required_output_paths": ["README.md", "TRACEABILITY.md", "WHOLE_PAPER_STATUS.json"],
                 "startup_required_output_paths": ["README.md", "TRACEABILITY.md"],
                 "result_sink_ref": split_node.result_sink_ref,
@@ -446,8 +495,11 @@ def main() -> int:
             Draft202012Validator(result_schema).validate(split_bootstrap)
             split_handoff = json.loads(Path(str(split_bootstrap.get("handoff_json_ref") or "")).read_text(encoding="utf-8"))
             split_child_prompt = Path(str(split_bootstrap.get("child_prompt_ref") or ""))
+            split_shared_cache_runner = split_workspace_root / "ENSURE_SHARED_CACHE.sh"
             if not split_child_prompt.exists():
                 return _fail("split child bootstrap must materialize a child prompt")
+            if not split_shared_cache_runner.exists():
+                return _fail("split child bootstrap must materialize a node-local shared-cache runner")
             if str(split_handoff.get("goal_slice") or "") != split_goal_slice:
                 return _fail("split child frozen handoff must persist canonical goal_slice alongside child_goal_slice")
             if list(split_handoff.get("required_outputs") or []) != ["README.md", "TRACEABILITY.md", "WHOLE_PAPER_STATUS.json"]:
@@ -465,6 +517,14 @@ def main() -> int:
                 return _fail("split child bootstrap must persist a node-scoped evaluator submission ref")
             if str(split_handoff.get("workspace_live_artifact_ref") or "") != str(split_live_root.resolve()):
                 return _fail("split child bootstrap must preserve the exact external live artifact root")
+            if str(split_handoff.get("shared_cache_runner_ref") or "") != str(split_shared_cache_runner.resolve()):
+                return _fail("split child frozen handoff must persist the exact node-local shared-cache runner ref")
+            if not (split_live_root / ".lake").is_symlink():
+                return _fail("generic split child bootstrap must preseed an externalized .lake mount when the committed shared-cache helper is present in frozen context refs")
+            if not (split_live_root / ".lake" / "packages").is_symlink():
+                return _fail("generic split child bootstrap must preseed shared-cache packages when the committed helper is explicit in context refs")
+            if not (split_live_root / ".lake" / "build").is_symlink():
+                return _fail("generic split child bootstrap must preseed an externalized build mount when the committed helper is explicit in context refs")
             split_submission_payload = json.loads(Path(split_submission_ref).read_text(encoding="utf-8"))
             if str(split_submission_payload.get("goal_slice") or "") != split_goal_slice:
                 return _fail("split child evaluator submission must preserve the narrowed slice goal")
@@ -478,6 +538,12 @@ def main() -> int:
             split_manual_text = Path(split_manual_ref).read_text(encoding="utf-8")
             if "# Slice-Scoped Evaluator Product Manual" not in split_manual_text:
                 return _fail("split child mentioning whole-paper dependency text must still receive the slice-scoped evaluator manual")
+            if "truthful local split-continuation artifact is acceptable" not in split_manual_text.lower():
+                return _fail("split child evaluator manual must explicitly allow truthful local split-continuation closeout instead of requiring full slice completion")
+            if "slice_local_formalization_complete" not in split_manual_text.lower() or "local_slice_complete_pending_parent_integration" not in split_manual_text.lower():
+                return _fail("split child evaluator manual must explicitly recognize truthful slice-local completion pending parent integration")
+            if "whole-paper terminal classification remains parent-owned" not in split_manual_text.lower():
+                return _fail("split child evaluator manual must make parent-owned whole-paper closeout explicit for locally completed slices")
             split_final_effects_text = Path(split_final_effects_ref).read_text(encoding="utf-8").lower()
             if "whole-paper faithful complete formalization" in split_final_effects_text:
                 return _fail("split child evaluator bundle must not reuse whole-paper final effects text")
@@ -485,8 +551,18 @@ def main() -> int:
                 return _fail("split child evaluator bundle must stay slice-scoped instead of advertising whole-paper terminal classifications")
             if "must not claim whole-paper terminal classifications" not in split_final_effects_text:
                 return _fail("split child evaluator final effects must explicitly forbid whole-paper terminal classification claims")
+            if "split_accepted_continue_implementation" not in split_final_effects_text:
+                return _fail("split child evaluator final effects must explicitly recognize truthful local split-continuation closure")
+            if "do not require the released remaining work to already be completed inside this node" not in split_final_effects_text:
+                return _fail("split child evaluator final effects must distinguish truthful local split release from full slice completion")
+            if "slice_local_formalization_complete" not in split_final_effects_text or "local_slice_complete_pending_parent_integration" not in split_final_effects_text:
+                return _fail("split child evaluator final effects must explicitly recognize truthful slice-local completion pending parent integration")
+            if "whole-paper closeout remains parent-owned" not in split_final_effects_text:
+                return _fail("split child evaluator final effects must distinguish local slice completion from whole-paper terminal authority")
             if "this node is slice-scoped and does not own whole-paper terminal classification authority" not in split_child_prompt.read_text(encoding="utf-8").lower():
                 return _fail("split child prompt must explicitly deny whole-paper terminal classification authority for ordinary slices")
+            if f"`{split_shared_cache_runner.resolve()}`" not in split_child_prompt.read_text(encoding="utf-8"):
+                return _fail("split child prompt must point at the exact node-local shared-cache runner instead of a generic helper path")
 
             launch_spec = dict(result.get("launch_spec") or {})
             argv = list(launch_spec.get("argv") or [])
@@ -603,16 +679,22 @@ def main() -> int:
                     [
                         "\\title{Whole Paper Fixture}",
                         "\\section{Intro}",
+                        "This introduction cites \\cite{intro2024} before any theorem environment.",
                         "\\begin{definition}\\label{def:calib}",
                         "Calibration is a property.",
                         "\\end{definition}",
                         "\\section{Main Result}",
                         "\\begin{theorem}\\label{thm:main}",
-                        "Assume Definition~\\ref{def:calib} and \\cite{foo2020}.",
+                        "Assume Definition~\\ref{def:calib}.",
                         "\\end{theorem}",
+                        "\\bibliography{references}",
                     ]
                 )
                 + "\n",
+                encoding="utf-8",
+            )
+            (whole_paper_cache_root / "source" / "references.bib").write_text(
+                "@article{intro2024,\n  title={Intro Citation},\n  author={Example, A.},\n  year={2024}\n}\n",
                 encoding="utf-8",
             )
             whole_paper_endpoint_artifact = (
@@ -708,11 +790,50 @@ def main() -> int:
                 "analysis/internal_dependency_graph.json",
                 "analysis/block_partition_draft.json",
                 "external_dependencies/EXTERNAL_DEPENDENCY_LEDGER.json",
+                "split/SPLIT_REQUEST_PROPOSAL.json",
+                "split/SPLIT_REVIEW.json",
+            ]
+            expected_whole_paper_progress_checkpoints = [
+                {
+                    "checkpoint_id": "whole_paper_source_split_decision",
+                    "description": (
+                        "After the deterministic source control bundle is materialized, explicitly submit or decline the staged split proposal."
+                    ),
+                    "required_any_of": [
+                        "split/SPLIT_REQUEST_SUBMISSION_RESULT.json",
+                        "split/SPLIT_DECLINE_REASON.md",
+                    ],
+                    "window_s": 300.0,
+                }
+            ]
+            expected_whole_paper_slice_startup_outputs = [
+                "README.md",
+                "TRACEABILITY.md",
+                "SLICE_STATUS.json",
+                "analysis/SLICE_BOUNDARY.json",
+            ]
+            expected_whole_paper_slice_progress_checkpoints = [
+                {
+                    "checkpoint_id": "whole_paper_slice_execution_decision",
+                    "description": (
+                        "After the deterministic slice startup bundle is materialized, record a slice-local execution decision or submit a further split proposal before extended theorem search."
+                    ),
+                    "required_any_of": [
+                        "analysis/SLICE_EXECUTION_DECISION.json",
+                        "split/SPLIT_REQUEST_SUBMISSION_RESULT.json",
+                        "split/SPLIT_DECLINE_REASON.md",
+                    ],
+                    "window_s": 300.0,
+                }
             ]
             if list(whole_paper_request.get("startup_required_output_paths") or []) != expected_whole_paper_startup_outputs:
                 return _fail("whole-paper endpoint bootstrap must emit a machine-readable startup_required_output_paths contract")
             if list(whole_paper_handoff_payload.get("startup_required_output_paths") or []) != expected_whole_paper_startup_outputs:
                 return _fail("whole-paper frozen handoff must preserve the startup_required_output_paths contract")
+            if list(whole_paper_request.get("progress_checkpoints") or []) != expected_whole_paper_progress_checkpoints:
+                return _fail("whole-paper endpoint bootstrap must emit a machine-readable post-startup progress checkpoint contract")
+            if list(whole_paper_handoff_payload.get("progress_checkpoints") or []) != expected_whole_paper_progress_checkpoints:
+                return _fail("whole-paper frozen handoff must preserve the progress checkpoint contract")
             whole_paper_live_root = Path(str(whole_paper_bootstrap.get("workspace_live_artifact_ref") or "")).resolve()
             expected_live_files = [
                 whole_paper_live_root / "README.md",
@@ -723,6 +844,8 @@ def main() -> int:
                 whole_paper_live_root / "analysis" / "internal_dependency_graph.json",
                 whole_paper_live_root / "analysis" / "block_partition_draft.json",
                 whole_paper_live_root / "external_dependencies" / "EXTERNAL_DEPENDENCY_LEDGER.json",
+                whole_paper_live_root / "split" / "SPLIT_REQUEST_PROPOSAL.json",
+                whole_paper_live_root / "split" / "SPLIT_REVIEW.json",
             ]
             if not all(path.exists() for path in expected_live_files):
                 return _fail("whole-paper endpoint bootstrap must materialize the deterministic startup extraction batch in the live artifact root")
@@ -731,6 +854,8 @@ def main() -> int:
             dependency_graph_payload = json.loads((whole_paper_live_root / "analysis" / "internal_dependency_graph.json").read_text(encoding="utf-8"))
             block_partition_payload = json.loads((whole_paper_live_root / "analysis" / "block_partition_draft.json").read_text(encoding="utf-8"))
             external_dependency_payload = json.loads((whole_paper_live_root / "external_dependencies" / "EXTERNAL_DEPENDENCY_LEDGER.json").read_text(encoding="utf-8"))
+            split_request_payload = json.loads((whole_paper_live_root / "split" / "SPLIT_REQUEST_PROPOSAL.json").read_text(encoding="utf-8"))
+            split_review_payload = json.loads((whole_paper_live_root / "split" / "SPLIT_REVIEW.json").read_text(encoding="utf-8"))
             status_payload = json.loads((whole_paper_live_root / "WHOLE_PAPER_STATUS.json").read_text(encoding="utf-8"))
             if str(source_structure_payload.get("source_tex_ref") or "") != str(whole_paper_source_ref.resolve()):
                 return _fail("whole-paper startup extraction batch must record the exact source TeX ref it parsed")
@@ -744,10 +869,28 @@ def main() -> int:
                 return _fail("whole-paper startup extraction batch must emit an initial partition draft")
             if int(external_dependency_payload.get("citation_key_count") or 0) < 1:
                 return _fail("whole-paper startup extraction batch must emit a non-empty external dependency ledger when the source TeX contains citations")
+            if "intro2024" not in list(external_dependency_payload.get("citation_keys") or []):
+                return _fail("whole-paper startup extraction batch must track citations that appear outside theorem-like environments")
+            if str(split_request_payload.get("split_mode") or "") != "parallel" or len(list(split_request_payload.get("target_nodes") or [])) < 2:
+                return _fail("whole-paper startup control bundle must materialize a deterministic split request scaffold with at least two target nodes")
+            for target_node in list(split_request_payload.get("target_nodes") or []):
+                if list(target_node.get("startup_required_output_paths") or []) != expected_whole_paper_slice_startup_outputs:
+                    return _fail("deterministic whole-paper split targets must carry the slice startup_required_output_paths contract")
+                if list(target_node.get("progress_checkpoints") or []) != expected_whole_paper_slice_progress_checkpoints:
+                    return _fail("deterministic whole-paper split targets must carry the slice progress checkpoint contract")
+            if list(split_review_payload.get("expected_decision_artifacts") or []) != [
+                "split/SPLIT_REQUEST_SUBMISSION_RESULT.json",
+                "split/SPLIT_DECLINE_REASON.md",
+            ]:
+                return _fail("whole-paper startup control bundle must materialize an explicit split-decision review scaffold")
             if not bool(status_payload.get("startup_batch_materialized")):
                 return _fail("whole-paper startup status file must record that the deterministic startup batch was materialized")
             if not bool(status_payload.get("startup_control_bundle_materialized")):
                 return _fail("whole-paper startup status file must record that the deterministic source control bundle was materialized")
+            if not bool(status_payload.get("split_proposal_materialized")):
+                return _fail("whole-paper startup status file must record that the deterministic split proposal scaffold was materialized")
+            if not bool(status_payload.get("split_decision_checkpoint_pending")):
+                return _fail("whole-paper startup status file must record that the split-decision checkpoint is still pending")
 
             whole_paper_child_prompt = Path(str(whole_paper_bootstrap.get("child_prompt_ref") or ""))
             whole_paper_prompt_text = whole_paper_child_prompt.read_text(encoding="utf-8").lower()
@@ -755,6 +898,126 @@ def main() -> int:
                 return _fail("whole-paper source prompt must identify the source phase explicitly")
             if "do not read evaluator manuals or final-effects docs during the opening extraction/partition phase" not in whole_paper_prompt_text:
                 return _fail("whole-paper source prompt must explicitly delay evaluator-manual reading until after source control work advances")
+            if "split/split_request_proposal.json" not in whole_paper_prompt_text or "split/split_decline_reason.md" not in whole_paper_prompt_text:
+                return _fail("whole-paper source prompt must direct the source node toward the deterministic split decision artifacts")
+
+            split_slice_workspace_root = ROOT / "workspace" / "test-whole-paper-slice-bootstrap-default-startup"
+            split_slice_state_root = ROOT / ".loop" / "test-whole-paper-slice-bootstrap-default-startup"
+            shutil.rmtree(split_slice_workspace_root, ignore_errors=True)
+            shutil.rmtree(split_slice_state_root, ignore_errors=True)
+            split_slice_workspace_root.mkdir(parents=True, exist_ok=True)
+            split_slice_state_root.mkdir(parents=True, exist_ok=True)
+            split_slice_request = {
+                "mode": "fresh",
+                "task_slug": "test-whole-paper-slice-bootstrap-default-startup",
+                "root_goal": "bootstrap a whole-paper slice child with deterministic startup defaults",
+                "child_goal_slice": "Faithfully formalize the whole-paper block `Linearly Biased Predictor` from the deterministic partition draft.",
+                "workflow_scope": "whole_paper_formalization",
+                "artifact_scope": "slice",
+                "terminal_authority_scope": "local",
+                "endpoint_artifact_ref": str(whole_paper_endpoint_artifact.resolve()),
+                "workspace_root": str(split_slice_workspace_root.resolve()),
+                "state_root": str(split_slice_state_root.resolve()),
+                "node_id": "test-whole-paper-slice-bootstrap-default-startup",
+                "workspace_mirror_relpath": "deliverables/primary_artifact",
+                "workspace_live_artifact_relpath": str(
+                    node_live_artifact_root(
+                        state_root=split_slice_state_root.resolve(),
+                        node_id="test-whole-paper-slice-bootstrap-default-startup",
+                        workspace_mirror_relpath="deliverables/primary_artifact",
+                    )
+                ),
+                "external_publish_target": str((temp_root / "Desktop" / "whole-paper-slice-default-startup").resolve()),
+                "context_refs": list(whole_paper_handoff_payload.get("context_refs") or []),
+                "result_sink_ref": "artifacts/whole_paper_slice_default_startup/result.json",
+            }
+            Draft202012Validator(request_schema).validate(split_slice_request)
+            split_slice_bootstrap = bootstrap_first_implementer_node(**split_slice_request)
+            Draft202012Validator(result_schema).validate(split_slice_bootstrap)
+            split_slice_bootstrap_result = Path(str(split_slice_bootstrap.get("bootstrap_result_ref") or ""))
+            split_slice_request_payload = json.loads(
+                (split_slice_bootstrap_result.parent / "FirstImplementerBootstrapRequest.json").read_text(encoding="utf-8")
+            )
+            if list(split_slice_request_payload.get("startup_required_output_paths") or []) != expected_whole_paper_slice_startup_outputs:
+                return _fail("whole-paper slice bootstrap must default startup_required_output_paths instead of leaving them empty")
+            if list(split_slice_request_payload.get("progress_checkpoints") or []) != expected_whole_paper_slice_progress_checkpoints:
+                return _fail("whole-paper slice bootstrap must default progress_checkpoints instead of leaving them empty")
+            split_slice_live_root = Path(str(split_slice_bootstrap.get("workspace_live_artifact_ref") or "")).resolve()
+            expected_slice_live_files = [
+                split_slice_live_root / "README.md",
+                split_slice_live_root / "TRACEABILITY.md",
+                split_slice_live_root / "SLICE_STATUS.json",
+                split_slice_live_root / "analysis" / "SLICE_BOUNDARY.json",
+            ]
+            if not all(path.exists() for path in expected_slice_live_files):
+                return _fail("whole-paper slice bootstrap must materialize the deterministic slice startup batch in the live artifact root")
+            if not (split_slice_live_root / ".lake").is_symlink():
+                return _fail("whole-paper slice bootstrap must preseed an externalized .lake mount in the external live root")
+            split_slice_child_prompt = Path(str(split_slice_bootstrap.get("child_prompt_ref") or ""))
+            split_slice_prompt_text = split_slice_child_prompt.read_text(encoding="utf-8")
+            if str((ROOT / "workspace" / "AGENTS.md").resolve()) not in split_slice_prompt_text:
+                return _fail("whole-paper slice child prompt must point at the canonical workspace AGENTS surface")
+            if not (split_slice_live_root / ".lake" / "packages").is_symlink():
+                return _fail("whole-paper slice bootstrap must preseed a shared-cache packages symlink in the external live root")
+            if not (split_slice_live_root / ".lake" / "build").is_symlink():
+                return _fail("whole-paper slice bootstrap must preseed an externalized build symlink in the external live root")
+            split_slice_lake_mount = split_slice_live_root / ".lake"
+            split_slice_lake_target = split_slice_lake_mount.resolve()
+            split_slice_packages_target = (split_slice_lake_mount / "packages").resolve()
+            split_slice_build_target = (split_slice_lake_mount / "build").resolve()
+            split_slice_seed_marker = split_slice_lake_target / ".leanatlas_shared_cache_seed.json"
+            split_slice_lake_mount.unlink()
+            split_slice_lake_mount.mkdir(parents=True, exist_ok=True)
+            if split_slice_seed_marker.exists():
+                shutil.copy2(split_slice_seed_marker, split_slice_lake_mount / split_slice_seed_marker.name)
+            (split_slice_lake_mount / "packages").symlink_to(split_slice_packages_target, target_is_directory=True)
+            (split_slice_lake_mount / "build").symlink_to(split_slice_build_target, target_is_directory=True)
+            repaired_cache = ensure_workspace_lake_packages(
+                repo_root=ROOT.parent.resolve(),
+                workspace_root=split_slice_live_root.resolve(),
+                purpose="test degraded external live-root lake mount repair",
+            )
+            if str(repaired_cache.method) == "present":
+                return _fail("shared-cache helper must not accept a degraded external live-root .lake mount as present")
+            if not (split_slice_live_root / ".lake").is_symlink():
+                return _fail("shared-cache helper must repair degraded external live-root .lake mounts back to a symlink")
+            if (split_slice_live_root / ".lake").resolve() != split_slice_lake_target.resolve():
+                return _fail("shared-cache helper must restore the inferred runtime-owned live-lake target when repairing degraded mounts")
+            split_slice_status = json.loads((split_slice_live_root / "SLICE_STATUS.json").read_text(encoding="utf-8"))
+            split_slice_boundary = json.loads((split_slice_live_root / "analysis" / "SLICE_BOUNDARY.json").read_text(encoding="utf-8"))
+            if str(split_slice_status.get("artifact_scope") or "") != "slice" or str(split_slice_status.get("terminal_authority_scope") or "") != "local":
+                return _fail("whole-paper slice startup status must stay slice-scoped and local-authority")
+            if str(split_slice_boundary.get("goal_slice") or "") != str(split_slice_request["child_goal_slice"]):
+                return _fail("whole-paper slice startup boundary must preserve the frozen child goal slice")
+            second_slice_request_payload = dict(split_slice_request_payload)
+            second_slice_request_payload.update(
+                {
+                    "node_id": "test-whole-paper-slice-bootstrap-default-startup-second",
+                    "task_slug": "test-whole-paper-slice-bootstrap-default-startup-second",
+                    "child_goal_slice": "Faithfully formalize the whole-paper block `Nearly Monotone Biased Predictor` from the deterministic partition draft.",
+                    "workspace_root": str((ROOT / "workspace" / "test-whole-paper-slice-bootstrap-default-startup-second").resolve()),
+                    "result_sink_ref": "artifacts/whole_paper_slice_default_startup_second/result.json",
+                }
+            )
+            second_slice_result_payload = dict(split_slice_bootstrap)
+            second_slice_result_payload.update(
+                {
+                    "node_id": "test-whole-paper-slice-bootstrap-default-startup-second",
+                    "workspace_root": str((ROOT / "workspace" / "test-whole-paper-slice-bootstrap-default-startup-second").resolve()),
+                }
+            )
+            second_slice_bootstrap_result = _persist_bootstrap_result(
+                state_root=split_slice_state_root.resolve(),
+                request_payload=second_slice_request_payload,
+                result_payload=second_slice_result_payload,
+            )
+            if split_slice_bootstrap_result == second_slice_bootstrap_result:
+                return _fail("whole-paper slice bootstrap results must be persisted per-node instead of sharing one mutable result ref")
+            persisted_second_slice_request_payload = json.loads(
+                (second_slice_bootstrap_result.parent / "FirstImplementerBootstrapRequest.json").read_text(encoding="utf-8")
+            )
+            if str(split_slice_request_payload.get("node_id") or "") == str(persisted_second_slice_request_payload.get("node_id") or ""):
+                return _fail("per-node bootstrap request artifacts must preserve distinct node identities for sibling split children")
 
             expected_whole_paper_refs = {
                 str(whole_paper_endpoint_artifact.resolve()),
@@ -791,6 +1054,8 @@ def main() -> int:
             shutil.rmtree(ROOT / ".loop" / "test-first-child-bootstrap-from-endpoint", ignore_errors=True)
             shutil.rmtree(ROOT / "workspace" / "test-first-child-bootstrap-whole-paper", ignore_errors=True)
             shutil.rmtree(ROOT / ".loop" / "test-first-child-bootstrap-whole-paper", ignore_errors=True)
+            shutil.rmtree(ROOT / "workspace" / "test-whole-paper-slice-bootstrap-default-startup", ignore_errors=True)
+            shutil.rmtree(ROOT / ".loop" / "test-whole-paper-slice-bootstrap-default-startup", ignore_errors=True)
 
     print("[loop-system-first-child-bootstrap] OK")
     return 0

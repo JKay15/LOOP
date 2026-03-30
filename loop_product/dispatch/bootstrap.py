@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -11,10 +12,14 @@ from loop_product.control_intent import (
     ARTIFACT_SCOPE_SPEC,
     TERMINAL_AUTHORITY_SCOPE_SPEC,
     WORKFLOW_SCOPE_SPEC,
+    default_activate_request_refs,
+    default_progress_checkpoints as control_default_progress_checkpoints,
+    default_split_request_refs,
+    default_startup_required_output_paths as control_default_startup_required_output_paths,
     normalize_machine_choice,
 )
 from loop_product.dispatch.child_dispatch import materialize_child
-from loop_product.dispatch.launch_policy import build_codex_cli_child_launch
+from loop_product.dispatch.launch_policy import build_codex_cli_child_launch, merge_runtime_transport_env
 from loop_product.kernel.authority import KernelMutationAuthority
 from loop_product.kernel.policy import (
     implementer_budget_profile,
@@ -23,8 +28,14 @@ from loop_product.kernel.policy import (
     kernel_execution_policy,
     kernel_reasoning_profile,
 )
-from loop_product.kernel.state import KernelState, ensure_runtime_tree, load_kernel_state, persist_kernel_state
-from loop_product.protocols.node import NodeSpec, NodeStatus
+from loop_product.kernel.state import (
+    KernelState,
+    ensure_runtime_tree,
+    persist_kernel_state,
+    persist_node_snapshot,
+    query_kernel_state_object,
+)
+from loop_product.protocols.node import NodeSpec, NodeStatus, normalize_progress_checkpoints
 from loop_product.protocols.schema import validate_repo_object
 from loop_product.runtime_paths import (
     implementer_workspace_root,
@@ -32,6 +43,7 @@ from loop_product.runtime_paths import (
     product_repo_root,
     require_runtime_root,
     safe_runtime_name,
+    shared_cache_helper_ref,
     state_scope_root,
 )
 
@@ -65,6 +77,7 @@ _THEOREM_LIKE_ENV_NAMES = frozenset(
         "conjecture",
     }
 )
+_REFERENCE_STRUCTURED_ENV_NAMES = frozenset(set(_THEOREM_LIKE_ENV_NAMES) | {"equation"})
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -94,6 +107,19 @@ def _dedupe_refs(items: list[str]) -> list[str]:
     return out
 
 
+def _strip_latex_comment(line: str) -> str:
+    text = str(line or "")
+    escaped = False
+    for idx, ch in enumerate(text):
+        if ch == "\\":
+            escaped = not escaped
+            continue
+        if ch == "%" and not escaped:
+            return text[:idx]
+        escaped = False
+    return text
+
+
 def _existing_absolute_path_refs(texts: list[str]) -> list[str]:
     refs: list[str] = []
     for text in texts:
@@ -106,6 +132,65 @@ def _existing_absolute_path_refs(texts: list[str]) -> list[str]:
             if path.exists():
                 refs.append(str(path.resolve()))
     return _dedupe_refs(refs)
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _preseed_external_live_root_shared_cache_mount(*, workspace_root: Path, live_root: Path, purpose: str) -> None:
+    workspace_path = workspace_root.resolve()
+    live_path = live_root.resolve()
+    if _is_relative_to(live_path, workspace_path):
+        return
+    helper_path = shared_cache_helper_ref().resolve()
+    if not helper_path.exists():
+        raise ValueError(f"shared-cache helper not found for external live root preseed: {helper_path}")
+    repo_root = product_repo_root().parent.resolve()
+    live_path.mkdir(parents=True, exist_ok=True)
+    completed = subprocess.run(
+        [
+            str(helper_path),
+            "--repo-root",
+            str(repo_root),
+            "--workspace-root",
+            str(live_path),
+            "--purpose",
+            purpose,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise ValueError(
+            "external live-root shared-cache preseed failed"
+            + (f": {detail}" if detail else "")
+        )
+    lake_root = live_path / ".lake"
+    if not lake_root.is_symlink():
+        raise ValueError(
+            "external live-root shared-cache preseed must externalize the entire .lake mount"
+        )
+
+
+def _context_refs_explicitly_request_shared_cache_mount(*, context_refs: list[str]) -> bool:
+    helper_ref = shared_cache_helper_ref().resolve()
+    for item in context_refs:
+        ref = str(item or "").strip()
+        if not ref:
+            continue
+        try:
+            if Path(ref).expanduser().resolve() == helper_ref:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _existing_relative_path_refs(*, texts: list[str], search_roots: list[Path]) -> list[str]:
@@ -240,9 +325,15 @@ def _resolve_fresh_roots(*, task_slug: str, workspace_root: str | Path | None, s
 
 def _ensure_kernel_state(*, state_root: Path, task_slug: str, root_goal: str, authority: KernelMutationAuthority) -> KernelState:
     ensure_runtime_tree(state_root)
+    from loop_product.runtime.gc import ensure_housekeeping_reap_controller_service_for_runtime_root
+    from loop_product.runtime.control_plane import ensure_repo_control_plane_service_for_runtime_root
+
+    repo_services = ensure_repo_control_plane_service_for_runtime_root(state_root=state_root)
+    if str(repo_services.get("skip_reason") or "").strip() == "non_top_level_runtime_root":
+        ensure_housekeeping_reap_controller_service_for_runtime_root(state_root=state_root)
     kernel_state_path = state_root / "state" / "kernel_state.json"
     if kernel_state_path.exists():
-        return load_kernel_state(state_root)
+        return query_kernel_state_object(state_root, continue_deferred=False)
 
     root_node = NodeSpec(
         node_id="root-kernel",
@@ -286,6 +377,7 @@ def _build_handoff_payload(
     external_publish_target: str,
     required_output_paths: list[str],
     startup_required_output_paths: list[str],
+    progress_checkpoints: list[dict[str, Any]],
     context_refs: list[str],
     result_sink_ref: str,
     workspace_result_sink_relpath: str,
@@ -293,6 +385,7 @@ def _build_handoff_payload(
     kernel_result_sink_ref: str,
     artifact_publication_receipt_ref: str,
     artifact_publication_runner_ref: str,
+    shared_cache_runner_ref: str,
     evaluator_submission_ref: str,
     evaluator_runner_ref: str,
 ) -> dict[str, Any]:
@@ -332,6 +425,7 @@ def _build_handoff_payload(
         "startup_required_output_paths": [
             str(item).strip() for item in list(startup_required_output_paths or []) if str(item).strip()
         ],
+        "progress_checkpoints": normalize_progress_checkpoints(progress_checkpoints),
         "context_refs": agent_context_refs,
         "result_sink_ref": result_sink_ref,
         "workspace_result_sink_relpath": workspace_result_sink_relpath,
@@ -339,6 +433,7 @@ def _build_handoff_payload(
         "kernel_result_sink_ref": kernel_result_sink_ref,
         "artifact_publication_receipt_ref": artifact_publication_receipt_ref,
         "artifact_publication_runner_ref": artifact_publication_runner_ref,
+        "shared_cache_runner_ref": shared_cache_runner_ref,
         "evaluator_submission_ref": evaluator_submission_ref,
         "evaluator_runner_ref": evaluator_runner_ref,
         "external_publication_owner": "root-kernel",
@@ -388,6 +483,7 @@ def _render_handoff_md(payload: dict[str, Any]) -> str:
         f"- kernel_result_sink_ref: `{payload['kernel_result_sink_ref']}`",
         f"- artifact_publication_receipt_ref: `{payload['artifact_publication_receipt_ref']}`",
         f"- artifact_publication_runner_ref: `{payload['artifact_publication_runner_ref']}`",
+        f"- shared_cache_runner_ref: `{payload['shared_cache_runner_ref']}`",
         f"- evaluator_submission_ref: `{payload['evaluator_submission_ref']}`",
         f"- evaluator_runner_ref: `{payload['evaluator_runner_ref']}`",
         f"- external_publication_owner: `{payload['external_publication_owner']}`",
@@ -398,12 +494,21 @@ def _render_handoff_md(payload: dict[str, Any]) -> str:
     startup_required_output_paths = [
         str(item) for item in payload.get("startup_required_output_paths") or [] if str(item).strip()
     ]
+    progress_checkpoints = normalize_progress_checkpoints(payload.get("progress_checkpoints") or [])
     if required_output_paths:
         lines.extend(["", "## Required Outputs", ""])
         lines.extend(f"- `{item}`" for item in required_output_paths)
     if startup_required_output_paths:
         lines.extend(["", "## Startup Required Outputs", ""])
         lines.extend(f"- `{item}`" for item in startup_required_output_paths)
+    if progress_checkpoints:
+        lines.extend(["", "## Progress Checkpoints", ""])
+        for checkpoint in progress_checkpoints:
+            lines.append(f"- `{checkpoint['checkpoint_id']}` ({checkpoint['window_s']}s)")
+            if str(checkpoint.get("description") or "").strip():
+                lines.append(f"  - {checkpoint['description']}")
+            for relpath in checkpoint.get("required_any_of") or []:
+                lines.append(f"  - requires any of: `{relpath}`")
     if context_refs:
         lines.extend(["", "## Context Refs", ""])
         lines.extend(f"- `{item}`" for item in context_refs)
@@ -418,6 +523,7 @@ def _render_child_prompt(
     workspace_live_artifact_abs: Path,
     artifact_publication_receipt_abs: Path,
     artifact_publication_runner_abs: Path,
+    shared_cache_runner_abs: Path,
     split_runner_abs: Path,
     activate_runner_abs: Path,
     workspace_result_sink_abs: Path,
@@ -425,8 +531,9 @@ def _render_child_prompt(
     evaluator_submission_abs: Path,
     evaluator_runner_abs: Path,
 ) -> str:
-    workspace_agents = (workspace_root.parent / "AGENTS.md").resolve()
     repo_root = product_repo_root().resolve()
+    canonical_workspace_agents = (repo_root / "workspace" / "AGENTS.md").resolve()
+    workspace_agents = canonical_workspace_agents if canonical_workspace_agents.exists() else (workspace_root.parent / "AGENTS.md").resolve()
     loop_runner_skill = (repo_root / ".agents" / "skills" / "loop-runner" / "SKILL.md").resolve()
     evaluator_exec_skill = (repo_root / ".agents" / "skills" / "evaluator-exec" / "SKILL.md").resolve()
     evaluator_manual = (repo_root / "docs" / "contracts" / "LOOP_EVALUATOR_PROTOTYPE_PRODUCT_MANUAL.md").resolve()
@@ -436,6 +543,8 @@ def _render_child_prompt(
         slice_scope_guard_lines = [
             "This node is slice-scoped and does not own whole-paper terminal classification authority.",
             "If you emit `WHOLE_PAPER_STATUS.json`, keep it slice-local and do not claim whole-paper `TERMINAL` classifications such as `paper defect exposed`, `external dependency blocked`, or `whole-paper faithful complete formalization`.",
+            "If this is a whole-paper split child, the live root already contains a deterministic slice startup bundle (`README.md`, `TRACEABILITY.md`, `SLICE_STATUS.json`, `analysis/SLICE_BOUNDARY.json`). Extend that bundle instead of restarting from a blank workspace.",
+            "For a whole-paper split child, do not leave the next step implicit: write a machine-auditable `analysis/SLICE_EXECUTION_DECISION.json` or submit the next split decision before extended theorem search.",
         ]
     whole_paper_source_guard_lines: list[str] = []
     if (
@@ -448,6 +557,8 @@ def _render_child_prompt(
             "Its opening responsibility is to advance source control artifacts for extraction, dependency closure surfacing, partition drafting, and split submission.",
             "Do not read evaluator manuals or final-effects docs during the opening extraction/partition phase while the deterministic source control bundle is still the only materialized artifact set.",
             "Advance the source control bundle or submit split before spending cycles on whole-paper terminal-classification analysis.",
+            "The startup batch already materializes `split/SPLIT_REQUEST_PROPOSAL.json` and `split/SPLIT_REVIEW.json`; do not reinvent them from scratch.",
+            "After the startup control bundle is present, either submit the split through the exact split helper or write `split/SPLIT_DECLINE_REASON.md` with a concrete machine-auditable reason.",
         ]
     return "\n".join(
         [
@@ -479,7 +590,7 @@ def _render_child_prompt(
             "planned outputs, `pending` tables, TODO notes, or placeholder headings alone do not count as substantive staged progress.",
             "Do not spend the opening phase on broad repo scans when the exact frozen evaluator runner, evaluator submission, baseline refs, or helper refs are already named.",
             "Do not broad-search repo roots, `.loop/**` history, or unrelated evaluator workspaces for helper or template discovery when the exact frozen refs already name the required helper or baseline artifacts.",
-            "If you create or ship a fresh workspace-local Lean package, use any committed shared-cache helper named in the frozen handoff context refs before the first `lake build`.",
+            "If you create or ship a fresh workspace-local Lean package, call the exact shared-cache runner named below before the first `lake build`; do not invoke the generic helper path with guessed argv.",
             "Run Lean/package tooling only inside the exact live artifact root named below; do not hydrate package trees or build outputs inside the publish root.",
             "If the exact live artifact root named below is outside the workspace root, do not recreate a local `.tmp_primary_artifact`, root-level `.lake`, or other runtime-owned heavy tree inside the workspace; that is a runtime defect, not an acceptable fallback.",
             "Do not treat live `git clone`, `lake update`, or `lake exe cache get` as the normal first path for artifact-local `.lake/packages`; that path is fallback repair and must be reported as an environment defect.",
@@ -509,6 +620,7 @@ def _render_child_prompt(
             f"- `{loop_runner_skill}`",
             f"- `{evaluator_exec_skill}`",
             f"- `{evaluator_manual}`",
+            f"- shared-cache runner: `{shared_cache_runner_abs.resolve()}`",
             f"- split runner: `{split_runner_abs.resolve()}`",
             f"- activate runner: `{activate_runner_abs.resolve()}`",
             "",
@@ -638,7 +750,35 @@ def _materialize_publication_runner(*, workspace_root: Path, machine_handoff_ref
     return runner_path
 
 
-def _materialize_split_runner(*, workspace_root: Path, machine_handoff_ref: Path) -> Path:
+def _materialize_shared_cache_runner(
+    *,
+    workspace_root: Path,
+    workspace_live_artifact_root: Path,
+    node_id: str,
+) -> Path:
+    helper_ref = shared_cache_helper_ref().resolve()
+    runner_path = workspace_root / "ENSURE_SHARED_CACHE.sh"
+    purpose = f"{str(node_id).strip() or 'implementer'} live-root shared-cache hydration"
+    _write_executable_text(
+        runner_path,
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "set -euo pipefail",
+                f'exec "{helper_ref}" --workspace-root "{workspace_live_artifact_root.resolve()}" --purpose "{purpose}" "$@"',
+            ]
+        ),
+    )
+    return runner_path
+
+
+def _materialize_split_runner(
+    *,
+    workspace_root: Path,
+    machine_handoff_ref: Path,
+    proposal_ref: Path,
+    result_ref: Path,
+) -> Path:
     repo_runner = (product_repo_root().resolve() / "scripts" / "submit_split_request_from_handoff.sh").resolve()
     runner_path = workspace_root / "SUBMIT_SPLIT_REQUEST.sh"
     _write_executable_text(
@@ -647,14 +787,20 @@ def _materialize_split_runner(*, workspace_root: Path, machine_handoff_ref: Path
             [
                 "#!/usr/bin/env bash",
                 "set -euo pipefail",
-                f'exec "{repo_runner}" --handoff-ref "{machine_handoff_ref.resolve()}" "$@"',
+                f'exec "{repo_runner}" --handoff-ref "{machine_handoff_ref.resolve()}" --proposal-ref "{proposal_ref.resolve()}" --result-ref "{result_ref.resolve()}" "$@"',
             ]
         ),
     )
     return runner_path
 
 
-def _materialize_activate_runner(*, workspace_root: Path, machine_handoff_ref: Path) -> Path:
+def _materialize_activate_runner(
+    *,
+    workspace_root: Path,
+    machine_handoff_ref: Path,
+    proposal_ref: Path,
+    result_ref: Path,
+) -> Path:
     repo_runner = (product_repo_root().resolve() / "scripts" / "submit_activate_request_from_handoff.sh").resolve()
     runner_path = workspace_root / "SUBMIT_ACTIVATE_REQUEST.sh"
     _write_executable_text(
@@ -663,7 +809,7 @@ def _materialize_activate_runner(*, workspace_root: Path, machine_handoff_ref: P
             [
                 "#!/usr/bin/env bash",
                 "set -euo pipefail",
-                f'exec "{repo_runner}" --handoff-ref "{machine_handoff_ref.resolve()}" "$@"',
+                f'exec "{repo_runner}" --handoff-ref "{machine_handoff_ref.resolve()}" --proposal-ref "{proposal_ref.resolve()}" --result-ref "{result_ref.resolve()}" "$@"',
             ]
         ),
     )
@@ -671,7 +817,8 @@ def _materialize_activate_runner(*, workspace_root: Path, machine_handoff_ref: P
 
 
 def _persist_bootstrap_result(*, state_root: Path, request_payload: dict[str, Any], result_payload: dict[str, Any]) -> Path:
-    bootstrap_dir = state_root / "artifacts" / "bootstrap"
+    node_id = _nonempty(result_payload.get("node_id")) or _nonempty(request_payload.get("node_id")) or "bootstrap"
+    bootstrap_dir = state_root / "artifacts" / "bootstrap" / node_id
     request_path = bootstrap_dir / "FirstImplementerBootstrapRequest.json"
     result_path = bootstrap_dir / "FirstImplementerBootstrapResult.json"
     _write_json(request_path, request_payload)
@@ -693,6 +840,7 @@ def _fresh_result_payload(
     workspace_live_artifact_ref: Path,
     artifact_publication_receipt_ref: Path,
     artifact_publication_runner_ref: Path,
+    shared_cache_runner_ref: Path,
     workspace_result_sink_ref: Path,
     kernel_result_sink_ref: Path,
     evaluator_submission_ref: Path,
@@ -715,6 +863,7 @@ def _fresh_result_payload(
         "workspace_live_artifact_ref": str(workspace_live_artifact_ref.resolve()),
         "artifact_publication_receipt_ref": str(artifact_publication_receipt_ref.resolve()),
         "artifact_publication_runner_ref": str(artifact_publication_runner_ref.resolve()),
+        "shared_cache_runner_ref": str(shared_cache_runner_ref.resolve()),
         "workspace_result_sink_ref": str(workspace_result_sink_ref.resolve()),
         "kernel_result_sink_ref": str(kernel_result_sink_ref.resolve()),
         "evaluator_submission_ref": str(evaluator_submission_ref.resolve()),
@@ -725,17 +874,36 @@ def _fresh_result_payload(
 
 def _normalize_bootstrap_request(payload: dict[str, Any]) -> dict[str, Any]:
     workspace_mirror_relpath = _nonempty(payload.get("workspace_mirror_relpath"))
+    workflow_scope = normalize_machine_choice(payload.get("workflow_scope"), WORKFLOW_SCOPE_SPEC)
+    artifact_scope = normalize_machine_choice(payload.get("artifact_scope"), ARTIFACT_SCOPE_SPEC)
+    terminal_authority_scope = normalize_machine_choice(
+        payload.get("terminal_authority_scope"),
+        TERMINAL_AUTHORITY_SCOPE_SPEC,
+    )
+    startup_required_output_paths = [
+        str(item).strip() for item in (payload.get("startup_required_output_paths") or []) if str(item).strip()
+    ]
+    if not startup_required_output_paths:
+        startup_required_output_paths = _default_startup_required_output_paths(
+            workflow_scope=workflow_scope,
+            artifact_scope=artifact_scope,
+            terminal_authority_scope=terminal_authority_scope,
+        )
+    progress_checkpoints = normalize_progress_checkpoints(payload.get("progress_checkpoints") or [])
+    if not progress_checkpoints:
+        progress_checkpoints = _default_progress_checkpoints(
+            workflow_scope=workflow_scope,
+            artifact_scope=artifact_scope,
+            terminal_authority_scope=terminal_authority_scope,
+        )
     normalized = {
         "mode": _nonempty(payload.get("mode") or "fresh") or "fresh",
         "task_slug": _nonempty(payload.get("task_slug")),
         "root_goal": _nonempty(payload.get("root_goal")),
         "child_goal_slice": _nonempty(payload.get("child_goal_slice")),
-        "workflow_scope": normalize_machine_choice(payload.get("workflow_scope"), WORKFLOW_SCOPE_SPEC),
-        "artifact_scope": normalize_machine_choice(payload.get("artifact_scope"), ARTIFACT_SCOPE_SPEC),
-        "terminal_authority_scope": normalize_machine_choice(
-            payload.get("terminal_authority_scope"),
-            TERMINAL_AUTHORITY_SCOPE_SPEC,
-        ),
+        "workflow_scope": workflow_scope,
+        "artifact_scope": artifact_scope,
+        "terminal_authority_scope": terminal_authority_scope,
         "endpoint_artifact_ref": _nonempty(payload.get("endpoint_artifact_ref")),
         "workspace_root": _nonempty(payload.get("workspace_root")),
         "state_root": _nonempty(payload.get("state_root")),
@@ -747,9 +915,8 @@ def _normalize_bootstrap_request(payload: dict[str, Any]) -> dict[str, Any]:
         "external_publish_target": _nonempty(payload.get("external_publish_target")),
         "context_refs": [str(item) for item in (payload.get("context_refs") or [])],
         "required_output_paths": [str(item).strip() for item in (payload.get("required_output_paths") or []) if str(item).strip()],
-        "startup_required_output_paths": [
-            str(item).strip() for item in (payload.get("startup_required_output_paths") or []) if str(item).strip()
-        ],
+        "startup_required_output_paths": startup_required_output_paths,
+        "progress_checkpoints": progress_checkpoints,
         "result_sink_ref": _nonempty(payload.get("result_sink_ref")),
     }
     validate_repo_object("LoopFirstImplementerBootstrapRequest.schema.json", normalized)
@@ -824,28 +991,78 @@ def _default_workspace_live_artifact_relpath(workspace_mirror_relpath: str) -> s
 
 
 def _default_startup_required_output_paths(*, workflow_scope: str, artifact_scope: str, terminal_authority_scope: str) -> list[str]:
-    normalized_workflow = normalize_machine_choice(workflow_scope, WORKFLOW_SCOPE_SPEC)
-    normalized_artifact_scope = normalize_machine_choice(artifact_scope, ARTIFACT_SCOPE_SPEC)
-    normalized_terminal_scope = normalize_machine_choice(
-        terminal_authority_scope,
-        TERMINAL_AUTHORITY_SCOPE_SPEC,
+    return control_default_startup_required_output_paths(
+        workflow_scope=workflow_scope,
+        artifact_scope=artifact_scope,
+        terminal_authority_scope=terminal_authority_scope,
     )
-    if (
-        normalized_workflow == "whole_paper_formalization"
-        and normalized_artifact_scope == "task"
-        and normalized_terminal_scope == "whole_paper"
-    ):
-        return [
-            "README.md",
-            "TRACEABILITY.md",
-            "WHOLE_PAPER_STATUS.json",
-            "extraction/source_structure.json",
-            "extraction/theorem_inventory.json",
-            "analysis/internal_dependency_graph.json",
-            "analysis/block_partition_draft.json",
-            "external_dependencies/EXTERNAL_DEPENDENCY_LEDGER.json",
+
+
+def _default_progress_checkpoints(*, workflow_scope: str, artifact_scope: str, terminal_authority_scope: str) -> list[dict[str, Any]]:
+    return control_default_progress_checkpoints(
+        workflow_scope=workflow_scope,
+        artifact_scope=artifact_scope,
+        terminal_authority_scope=terminal_authority_scope,
+    )
+
+
+def _materialize_whole_paper_slice_startup_batch(
+    *,
+    live_root: Path,
+    node: NodeSpec,
+    source_tex_ref: Path | None,
+) -> None:
+    source_ref_text = str(source_tex_ref.resolve()) if source_tex_ref is not None else ""
+    status_payload = {
+        "workflow_scope": "whole_paper_formalization",
+        "artifact_scope": "slice",
+        "terminal_authority_scope": "local",
+        "node_id": node.node_id,
+        "round_id": node.round_id,
+        "status": "IN_PROGRESS",
+        "slice_startup_batch_materialized": True,
+        "goal_slice": str(node.goal_slice or ""),
+        "source_tex_ref": source_ref_text,
+    }
+    boundary_payload = {
+        "node_id": node.node_id,
+        "goal_slice": str(node.goal_slice or ""),
+        "workflow_scope": "whole_paper_formalization",
+        "artifact_scope": "slice",
+        "terminal_authority_scope": "local",
+        "source_tex_ref": source_ref_text,
+        "notes": [
+            "This deterministic startup bundle is slice-scoped.",
+            "The child still owes substantive formalization or dependency-closure progress after startup.",
+            "Whole-paper terminal classification authority remains outside this slice node.",
+        ],
+    }
+    readme_text = "\n".join(
+        [
+            "# Whole-Paper Slice Startup Bundle",
+            "",
+            f"- node_id: `{node.node_id}`",
+            f"- round_id: `{node.round_id}`",
+            f"- source_tex_ref: `{source_ref_text}`" if source_ref_text else "- source_tex_ref: `unresolved`",
+            "",
+            "This deterministic startup batch establishes the slice-local control surface before substantive formalization or dependency-closure work.",
         ]
-    return []
+    )
+    traceability_text = "\n".join(
+        [
+            "# Slice Startup Traceability",
+            "",
+            f"- node_id: `{node.node_id}`",
+            f"- goal_slice: `{str(node.goal_slice or '').strip()}`",
+            f"- source_tex_ref: `{source_ref_text}`" if source_ref_text else "- source_tex_ref: `unresolved`",
+            "",
+            "This slice is scoped to local closure only and must not claim whole-paper terminal authority.",
+        ]
+    )
+    _write_text(live_root / "README.md", readme_text)
+    _write_text(live_root / "TRACEABILITY.md", traceability_text)
+    _write_json(live_root / "SLICE_STATUS.json", status_payload)
+    _write_json(live_root / "analysis" / "SLICE_BOUNDARY.json", boundary_payload)
 
 
 def _first_existing_source_tex_ref(context_refs: list[str]) -> Path | None:
@@ -892,9 +1109,11 @@ def _parse_whole_paper_source_tex(source_tex_ref: Path) -> dict[str, Any]:
     sections: list[dict[str, Any]] = []
     theorem_items: list[dict[str, Any]] = []
     current_item: dict[str, Any] | None = None
+    whole_source_citation_keys: list[str] = []
 
     for line_no, line in enumerate(lines, start=1):
-        for match in _SECTION_RE.finditer(line):
+        stripped_line = _strip_latex_comment(line)
+        for match in _SECTION_RE.finditer(stripped_line):
             command = str(match.group(1) or "").strip()
             sections.append(
                 {
@@ -903,40 +1122,44 @@ def _parse_whole_paper_source_tex(source_tex_ref: Path) -> dict[str, Any]:
                     "line_start": line_no,
                 }
             )
+        for cite_match in _CITE_RE.finditer(stripped_line):
+            for cite_key in _split_latex_csv(str(cite_match.group(1) or "")):
+                if cite_key not in whole_source_citation_keys:
+                    whole_source_citation_keys.append(cite_key)
 
         if current_item is None:
-            begin_match = _BEGIN_ENV_RE.search(line)
+            begin_match = _BEGIN_ENV_RE.search(stripped_line)
             if begin_match:
                 env_name = str(begin_match.group(1) or "").strip()
-                if env_name in _THEOREM_LIKE_ENV_NAMES:
+                if env_name in _REFERENCE_STRUCTURED_ENV_NAMES:
                     current_item = {
                         "env_name": env_name,
                         "line_start": line_no,
                         "line_end": line_no,
-                        "statement_lines": [line],
+                        "statement_lines": [stripped_line],
                         "labels": [],
                         "internal_refs": [],
                         "citations": [],
                     }
         else:
             current_item["line_end"] = line_no
-            current_item["statement_lines"].append(line)
+            current_item["statement_lines"].append(stripped_line)
 
         if current_item is not None:
-            for label_match in _LABEL_RE.finditer(line):
+            for label_match in _LABEL_RE.finditer(stripped_line):
                 label = str(label_match.group(1) or "").strip()
                 if label and label not in current_item["labels"]:
                     current_item["labels"].append(label)
-            for ref_match in _REF_RE.finditer(line):
+            for ref_match in _REF_RE.finditer(stripped_line):
                 label = str(ref_match.group(1) or "").strip()
                 if label and label not in current_item["internal_refs"]:
                     current_item["internal_refs"].append(label)
-            for cite_match in _CITE_RE.finditer(line):
+            for cite_match in _CITE_RE.finditer(stripped_line):
                 for cite_key in _split_latex_csv(str(cite_match.group(1) or "")):
                     if cite_key not in current_item["citations"]:
                         current_item["citations"].append(cite_key)
 
-            end_match = _END_ENV_RE.search(line)
+            end_match = _END_ENV_RE.search(stripped_line)
             if end_match and str(end_match.group(1) or "").strip() == str(current_item["env_name"]):
                 labels = list(current_item["labels"])
                 node_id = labels[0] if labels else f"{current_item['env_name']}:{current_item['line_start']}"
@@ -998,7 +1221,11 @@ def _parse_whole_paper_source_tex(source_tex_ref: Path) -> dict[str, Any]:
                 }
             )
     citation_keys = sorted({str(cite) for item in theorem_items for cite in list(item["citations"]) if str(cite).strip()})
-    citation_count = sum(len(list(item["citations"])) for item in theorem_items)
+    if whole_source_citation_keys:
+        citation_keys = sorted({str(cite).strip() for cite in whole_source_citation_keys if str(cite).strip()})
+        citation_count = len(list(whole_source_citation_keys))
+    else:
+        citation_count = sum(len(list(item["citations"])) for item in theorem_items)
     return {
         "title": title,
         "sections": sections,
@@ -1071,6 +1298,87 @@ def _materialize_whole_paper_startup_batch(*, live_root: Path, source_tex_ref: P
             for key in list(parsed["citation_keys"])
         ],
     }
+    split_target_nodes: list[dict[str, Any]] = []
+    slice_startup_required_output_paths = _default_startup_required_output_paths(
+        workflow_scope="whole_paper_formalization",
+        artifact_scope="slice",
+        terminal_authority_scope="local",
+    )
+    slice_progress_checkpoints = _default_progress_checkpoints(
+        workflow_scope="whole_paper_formalization",
+        artifact_scope="slice",
+        terminal_authority_scope="local",
+    )
+    selected_blocks = list(block_partition_payload["blocks"])[:3]
+    for block in selected_blocks:
+        block_id = str(block.get("block_id") or "").strip() or safe_runtime_name(str(block.get("block_title") or "block"))
+        block_title = str(block.get("block_title") or block_id).strip() or block_id
+        split_target_nodes.append(
+            {
+                "node_id": safe_runtime_name(f"{block_id}_formalization"),
+                "goal_slice": (
+                    f"Faithfully formalize the whole-paper block `{block_title}` from the deterministic partition draft, "
+                    "preserving internal references and deferring proof-relevant external dependencies only via explicit closure artifacts."
+                ),
+                "workflow_scope": "whole_paper_formalization",
+                "artifact_scope": "slice",
+                "terminal_authority_scope": "local",
+                "startup_required_output_paths": list(slice_startup_required_output_paths),
+                "progress_checkpoints": list(slice_progress_checkpoints),
+            }
+        )
+    if int(external_dependency_payload["citation_key_count"]) > 0:
+        split_target_nodes.append(
+            {
+                "node_id": "external_dependency_closure",
+                "goal_slice": (
+                    "Resolve or honestly classify the proof-relevant external dependencies named in the deterministic external dependency ledger."
+                ),
+                "workflow_scope": "whole_paper_formalization",
+                "artifact_scope": "slice",
+                "terminal_authority_scope": "local",
+                "startup_required_output_paths": list(slice_startup_required_output_paths),
+                "progress_checkpoints": list(slice_progress_checkpoints),
+            }
+        )
+    while len(split_target_nodes) < 2:
+        split_target_nodes.append(
+            {
+                "node_id": safe_runtime_name(f"whole_paper_followup_{len(split_target_nodes) + 1}"),
+                "goal_slice": (
+                    "Faithfully continue the remaining whole-paper formalization work from the deterministic startup partition draft."
+                ),
+                "workflow_scope": "whole_paper_formalization",
+                "artifact_scope": "slice",
+                "terminal_authority_scope": "local",
+                "startup_required_output_paths": list(slice_startup_required_output_paths),
+                "progress_checkpoints": list(slice_progress_checkpoints),
+            }
+        )
+    split_request_payload = {
+        "split_mode": "parallel",
+        "reason": (
+            "Deterministic whole-paper startup analysis identified distinct formalization blocks and an explicit external-dependency lane."
+        ),
+        "completed_work": (
+            "The source startup control bundle, dependency graph, partition draft, and external dependency ledger were materialized deterministically."
+        ),
+        "remaining_work": (
+            "Review this staged split draft, then either submit it through the committed split helper or decline it explicitly."
+        ),
+        "target_nodes": split_target_nodes,
+    }
+    split_review_payload = {
+        "status": "DRAFT_REQUIRES_SOURCE_DECISION",
+        "source_tex_ref": str(source_tex_ref.resolve()),
+        "block_count": int(block_partition_payload["block_count"]),
+        "citation_key_count": int(external_dependency_payload["citation_key_count"]),
+        "expected_decision_artifacts": [
+            "split/SPLIT_REQUEST_SUBMISSION_RESULT.json",
+            "split/SPLIT_DECLINE_REASON.md",
+        ],
+        "next_step": "Submit the deterministic split proposal or decline it explicitly.",
+    }
     status_payload = {
         "workflow_scope": "whole_paper_formalization",
         "status": "IN_PROGRESS",
@@ -1082,6 +1390,8 @@ def _materialize_whole_paper_startup_batch(*, live_root: Path, source_tex_ref: P
         "internal_dependency_edge_count": int(dependency_graph_payload["edge_count"]),
         "block_count": int(block_partition_payload["block_count"]),
         "citation_count": int(parsed["citation_count"]),
+        "split_proposal_materialized": True,
+        "split_decision_checkpoint_pending": True,
     }
     readme_text = "\n".join(
         [
@@ -1112,7 +1422,7 @@ def _materialize_whole_paper_startup_batch(*, live_root: Path, source_tex_ref: P
             "Next source-phase responsibility:",
             "- refine the initial partition draft if needed,",
             "- advance traceability/external dependency evidence, and",
-            "- submit split once the staged fronts are ready.",
+            "- submit or explicitly decline the deterministic split proposal once the staged fronts are ready.",
         ]
     )
 
@@ -1124,6 +1434,8 @@ def _materialize_whole_paper_startup_batch(*, live_root: Path, source_tex_ref: P
     _write_json(live_root / "analysis" / "internal_dependency_graph.json", dependency_graph_payload)
     _write_json(live_root / "analysis" / "block_partition_draft.json", block_partition_payload)
     _write_json(live_root / "external_dependencies" / "EXTERNAL_DEPENDENCY_LEDGER.json", external_dependency_payload)
+    _write_json(live_root / "split" / "SPLIT_REQUEST_PROPOSAL.json", split_request_payload)
+    _write_json(live_root / "split" / "SPLIT_REVIEW.json", split_review_payload)
 
 
 def _render_task_scoped_evaluator_final_effects_text(*, artifact_payload: dict[str, Any], workspace_mirror_ref: str) -> str:
@@ -1172,8 +1484,13 @@ def _render_slice_scoped_evaluator_final_effects_text(
         "# Slice-Scoped Evaluator Final Effects",
         "",
         (
-            f"- The workspace mirror artifact at `{workspace_mirror_ref}` fulfills the narrowed split-child slice "
-            f"owned by `{node.node_id}`: {node.goal_slice}"
+            f"- The workspace mirror artifact at `{workspace_mirror_ref}` must either faithfully fulfill the narrowed "
+            f"split-child slice owned by `{node.node_id}` ({node.goal_slice}) or truthfully close this node locally "
+            "by publishing `WHOLE_PAPER_STATUS.json` as either "
+            "`classification=slice_local_formalization_complete` with "
+            "`status=LOCAL_SLICE_COMPLETE_PENDING_PARENT_INTEGRATION`, or `status=TERMINAL` with "
+            "`terminal_classification=SPLIT_ACCEPTED_CONTINUE_IMPLEMENTATION` plus accepted child lanes for the "
+            "released remaining work."
         ),
         "- This evaluator judges only the slice-local deliverable surface for this node.",
         "- It must not claim whole-paper terminal closure or whole-paper completion for unrelated nodes.",
@@ -1188,6 +1505,10 @@ def _render_slice_scoped_evaluator_final_effects_text(
             "## Evaluation Rules",
             "",
             "- Judge only this node's narrowed slice goal, deliverable artifact, and declared required outputs.",
+            "- If `WHOLE_PAPER_STATUS.json` truthfully records `classification=slice_local_formalization_complete` and `status=LOCAL_SLICE_COMPLETE_PENDING_PARENT_INTEGRATION`, treat that as a valid slice-local completion whose whole-paper closeout remains parent-owned.",
+            "- If `WHOLE_PAPER_STATUS.json` truthfully records `SPLIT_ACCEPTED_CONTINUE_IMPLEMENTATION`, treat that as a valid slice-local terminal split-continuation closeout rather than requiring full slice completion.",
+            "- In that split-continuation case, do not require the released remaining work to already be completed inside this node.",
+            "- A slice-local completion artifact must not be downgraded just because whole-paper terminal classification remains parent-owned.",
             "- Do not treat slice-local status files or README prose as whole-paper terminal evidence.",
             "- Whole-paper success or failure remains reserved for the dedicated whole-paper closeout surface.",
         ]
@@ -1252,6 +1573,8 @@ def _render_slice_scoped_evaluator_manual(
         "## Evaluation Rules",
         "",
         "- Judge only the slice-local artifact and reviewer-visible evidence for this node.",
+        "- A truthful local slice completion artifact is acceptable when `WHOLE_PAPER_STATUS.json` records `classification=slice_local_formalization_complete`, `status=LOCAL_SLICE_COMPLETE_PENDING_PARENT_INTEGRATION`, and whole-paper terminal classification remains parent-owned.",
+        "- A truthful local split-continuation artifact is acceptable when `WHOLE_PAPER_STATUS.json` records `SPLIT_ACCEPTED_CONTINUE_IMPLEMENTATION` and released remaining work into accepted child lanes.",
         "- Do not require unrelated whole-paper outputs from sibling or parent nodes.",
         "- Whole-paper closure remains reserved for the dedicated whole-paper integration/closeout surface.",
     ]
@@ -1297,6 +1620,7 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
             terminal_authority_scope=request["terminal_authority_scope"],
             required_output_paths=request["required_output_paths"],
             startup_required_output_paths=request["startup_required_output_paths"],
+            progress_checkpoints=request["progress_checkpoints"],
             workspace_root=workspace_root,
             result_sink_ref=result_sink_ref,
             authority=authority,
@@ -1307,11 +1631,11 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
         state_root = require_runtime_root(Path(request["state_root"]).expanduser().resolve())
         workspace_root = Path(request["workspace_root"]).expanduser().resolve()
         node_id = request["node_id"]
-        kernel_state = load_kernel_state(state_root)
-        node_path = state_root / "state" / f"{node_id}.json"
-        if not node_path.exists():
+        kernel_state = query_kernel_state_object(state_root, continue_deferred=False)
+        child_node_payload = dict(kernel_state.nodes.get(node_id) or {})
+        if not child_node_payload:
             raise ValueError(f"continue_exact node does not exist: {node_id}")
-        child_node = NodeSpec.from_dict(json.loads(node_path.read_text(encoding="utf-8")))
+        child_node = NodeSpec.from_dict(child_node_payload)
         if Path(str(child_node.workspace_root)).resolve() != workspace_root.resolve():
             raise ValueError("continue_exact workspace_root does not match the persisted node snapshot")
         child_node.workflow_scope = request["workflow_scope"]
@@ -1319,10 +1643,11 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
         child_node.terminal_authority_scope = request["terminal_authority_scope"]
         child_node.required_output_paths = list(request["required_output_paths"])
         child_node.startup_required_output_paths = list(request["startup_required_output_paths"])
+        child_node.progress_checkpoints = normalize_progress_checkpoints(request["progress_checkpoints"])
         kernel_state.register_node(child_node)
         persist_kernel_state(state_root, kernel_state, authority=authority)
         validate_repo_object("LoopSystemNodeSpec.schema.json", child_node.to_dict())
-        node_path.write_text(json.dumps(child_node.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        persist_node_snapshot(state_root, child_node, authority=authority)
         result_sink_ref = request["result_sink_ref"] or child_node.result_sink_ref
     else:
         raise ValueError(f"unsupported bootstrap mode: {mode!r}")
@@ -1359,10 +1684,30 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
         workspace_root=workspace_root,
         machine_handoff_ref=handoff_json_path,
     )
-    split_runner_path = _materialize_split_runner(workspace_root=workspace_root, machine_handoff_ref=handoff_json_path)
+    shared_cache_runner_path = _materialize_shared_cache_runner(
+        workspace_root=workspace_root,
+        workspace_live_artifact_root=workspace_live_artifact_abs,
+        node_id=child_node.node_id,
+    )
+    split_proposal_ref, split_result_ref = default_split_request_refs(
+        workspace_live_artifact_abs,
+        workspace_mirror_relpath=request["workspace_mirror_relpath"],
+    )
+    activate_proposal_ref, activate_result_ref = default_activate_request_refs(
+        workspace_live_artifact_abs,
+        workspace_mirror_relpath=request["workspace_mirror_relpath"],
+    )
+    split_runner_path = _materialize_split_runner(
+        workspace_root=workspace_root,
+        machine_handoff_ref=handoff_json_path,
+        proposal_ref=split_proposal_ref,
+        result_ref=split_result_ref,
+    )
     activate_runner_path = _materialize_activate_runner(
         workspace_root=workspace_root,
         machine_handoff_ref=handoff_json_path,
+        proposal_ref=activate_proposal_ref,
+        result_ref=activate_result_ref,
     )
     handoff_payload = _build_handoff_payload(
         node=child_node,
@@ -1379,6 +1724,7 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
         external_publish_target=request["external_publish_target"],
         required_output_paths=request["required_output_paths"],
         startup_required_output_paths=request["startup_required_output_paths"],
+        progress_checkpoints=request["progress_checkpoints"],
         context_refs=request["context_refs"],
         result_sink_ref=result_sink_ref,
         workspace_result_sink_relpath=workspace_result_sink_relpath,
@@ -1386,6 +1732,7 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
         kernel_result_sink_ref=str(kernel_result_sink_abs),
         artifact_publication_receipt_ref=str(artifact_publication_receipt_abs),
         artifact_publication_runner_ref=str(artifact_publication_runner_path.resolve()),
+        shared_cache_runner_ref=str(shared_cache_runner_path.resolve()),
         evaluator_submission_ref=str(evaluator_submission_path.resolve()),
         evaluator_runner_ref=str(evaluator_runner_path.resolve()),
     )
@@ -1400,6 +1747,7 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
             workspace_live_artifact_abs=workspace_live_artifact_abs,
             artifact_publication_receipt_abs=artifact_publication_receipt_abs,
             artifact_publication_runner_abs=artifact_publication_runner_path,
+            shared_cache_runner_abs=shared_cache_runner_path,
             split_runner_abs=split_runner_path,
             activate_runner_abs=activate_runner_path,
             workspace_result_sink_abs=workspace_result_sink_abs,
@@ -1408,12 +1756,52 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
             evaluator_runner_abs=evaluator_runner_path,
         ),
     )
+    if (
+        normalize_machine_choice(child_node.workflow_scope, WORKFLOW_SCOPE_SPEC) == "whole_paper_formalization"
+        and normalize_machine_choice(child_node.artifact_scope, ARTIFACT_SCOPE_SPEC) == "slice"
+        and normalize_machine_choice(child_node.terminal_authority_scope, TERMINAL_AUTHORITY_SCOPE_SPEC) == "local"
+        and list(request["startup_required_output_paths"] or [])
+        == _default_startup_required_output_paths(
+            workflow_scope="whole_paper_formalization",
+            artifact_scope="slice",
+            terminal_authority_scope="local",
+        )
+    ):
+        source_tex_ref = _resolve_whole_paper_source_tex_ref(
+            artifact_path=Path(request["endpoint_artifact_ref"]).expanduser().resolve(),
+            context_refs=[str(item) for item in list(request["context_refs"] or [])],
+        )
+        _materialize_whole_paper_slice_startup_batch(
+            live_root=workspace_live_artifact_abs,
+            node=child_node,
+            source_tex_ref=source_tex_ref,
+        )
+    if (
+        normalize_machine_choice(child_node.workflow_scope, WORKFLOW_SCOPE_SPEC) == "whole_paper_formalization"
+        or _context_refs_explicitly_request_shared_cache_mount(
+            context_refs=[str(item) for item in list(request.get("context_refs") or [])]
+        )
+    ):
+        preseed_purpose = (
+            f"whole-paper bootstrap preseed for {child_node.node_id}"
+            if normalize_machine_choice(child_node.workflow_scope, WORKFLOW_SCOPE_SPEC) == "whole_paper_formalization"
+            else f"explicit shared-cache bootstrap preseed for {child_node.node_id}"
+        )
+        _preseed_external_live_root_shared_cache_mount(
+            workspace_root=workspace_root,
+            live_root=workspace_live_artifact_abs,
+            purpose=preseed_purpose,
+        )
 
     launch_spec = build_codex_cli_child_launch(
         workspace_root=workspace_root,
         sandbox_mode=str(child_node.execution_policy.get("sandbox_mode") or "danger-full-access"),
         thinking_budget=str(child_node.reasoning_profile.get("thinking_budget") or "medium"),
         prompt_path=child_prompt_path,
+    )
+    launch_spec["env"] = merge_runtime_transport_env(
+        state_root=state_root,
+        env=dict(launch_spec.get("env") or {}),
     )
     result_payload = _fresh_result_payload(
         mode=mode,
@@ -1428,6 +1816,7 @@ def bootstrap_first_implementer_node(*, authority: KernelMutationAuthority, **pa
         workspace_live_artifact_ref=workspace_live_artifact_abs,
         artifact_publication_receipt_ref=artifact_publication_receipt_abs,
         artifact_publication_runner_ref=artifact_publication_runner_path,
+        shared_cache_runner_ref=shared_cache_runner_path,
         workspace_result_sink_ref=workspace_result_sink_abs,
         kernel_result_sink_ref=kernel_result_sink_abs,
         evaluator_submission_ref=evaluator_submission_path,
@@ -1504,6 +1893,11 @@ def bootstrap_first_implementer_from_endpoint(*, authority: KernelMutationAuthor
             artifact_scope="task",
             terminal_authority_scope="whole_paper" if workflow_scope == "whole_paper_formalization" else "local",
         ),
+        "progress_checkpoints": _default_progress_checkpoints(
+            workflow_scope=workflow_scope,
+            artifact_scope="task",
+            terminal_authority_scope="whole_paper" if workflow_scope == "whole_paper_formalization" else "local",
+        ),
         "result_sink_ref": _nonempty(payload.get("result_sink_ref")),
     }
     result_payload = bootstrap_first_implementer_node(authority=authority, **request)
@@ -1517,5 +1911,11 @@ def bootstrap_first_implementer_from_endpoint(*, authority: KernelMutationAuthor
             _materialize_whole_paper_startup_batch(
                 live_root=live_root,
                 source_tex_ref=whole_paper_source_tex_ref,
+            )
+            workspace_root = Path(str(result_payload.get("workspace_root") or "")).expanduser().resolve()
+            _preseed_external_live_root_shared_cache_mount(
+                workspace_root=workspace_root,
+                live_root=live_root,
+                purpose=f"whole-paper source bootstrap preseed for {result_payload.get('node_id') or 'source'}",
             )
     return result_payload

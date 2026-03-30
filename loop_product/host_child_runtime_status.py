@@ -9,15 +9,21 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from loop_product.state_io import write_json_read_only
+
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_json_read_only(path, payload)
+
+
+def _reap_request_dir(path: Path) -> None:
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def _now_token() -> str:
@@ -75,8 +81,11 @@ def request_host_child_runtime_status(
         if response_ref.exists():
             response_payload = json.loads(response_ref.read_text(encoding="utf-8"))
             if str(response_payload.get("status") or "") == "completed":
-                return dict(response_payload.get("child_runtime_status_result") or {})
+                child_runtime_status_result = dict(response_payload.get("child_runtime_status_result") or {})
+                _reap_request_dir(request_dir)
+                return child_runtime_status_result
             error_message = str(response_payload.get("error") or "host child runtime status failed").strip()
+            _reap_request_dir(request_dir)
             raise RuntimeError(error_message)
         time.sleep(max(0.05, float(poll_interval_s)))
     raise TimeoutError(

@@ -21,7 +21,14 @@ from jsonschema import Draft202012Validator, validate
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _fixture_role_agent_cmd(*, scenario: str, failing_role: str | None = None, failure_message: str | None = None) -> str:
+def _fixture_role_agent_cmd(
+    *,
+    scenario: str,
+    failing_role: str | None = None,
+    failure_message: str | None = None,
+    failure_exit_code: int | None = None,
+    failure_signal: str | None = None,
+) -> str:
     parts = [
         shlex.quote(sys.executable),
         "-m",
@@ -33,6 +40,10 @@ def _fixture_role_agent_cmd(*, scenario: str, failing_role: str | None = None, f
         parts.extend(["--failing-role", shlex.quote(failing_role)])
     if failure_message:
         parts.extend(["--failure-message", shlex.quote(failure_message)])
+    if failure_exit_code is not None:
+        parts.extend(["--failure-exit-code", shlex.quote(str(int(failure_exit_code)))])
+    if failure_signal:
+        parts.extend(["--failure-signal", shlex.quote(str(failure_signal))])
     return " ".join(parts)
 
 
@@ -265,6 +276,41 @@ def _write_fake_codex_cli(path: Path) -> None:
                 operation_log_raw = os.environ.get("LOOP_PRODUCT_EVAL_OPERATION_LOG_PATH", "").strip()
                 operation_log_path = Path(operation_log_raw) if operation_log_raw else None
                 test_designer_mode = str(os.environ.get("FAKE_CODEX_TEST_DESIGNER_MODE") or "").strip()
+                capture_dir_raw = str(os.environ.get("FAKE_CODEX_CAPTURE_TRANSPORT_ENV_DIR") or "").strip()
+                if capture_dir_raw:
+                    capture_dir = Path(capture_dir_raw)
+                    capture_dir.mkdir(parents=True, exist_ok=True)
+                    _write_json(
+                        capture_dir / f"{role}.json",
+                        {
+                            key: str(os.environ.get(key) or "")
+                            for key in (
+                                "HTTP_PROXY",
+                                "http_proxy",
+                                "ALL_PROXY",
+                                "all_proxy",
+                                "NO_PROXY",
+                                "no_proxy",
+                                "CODEX_HOME",
+                                "CODEX_THREAD_ID",
+                                "CODEX_SANDBOX_NETWORK_DISABLED",
+                                "TMUX",
+                            )
+                            if key in os.environ
+                        },
+                    )
+                if str(os.environ.get("FAKE_CODEX_FAIL_ON_INVALID_CODEX_HOME") or "").strip():
+                    codex_home = str(os.environ.get("CODEX_HOME") or "").strip()
+                    if codex_home and not Path(codex_home).exists():
+                        print(
+                            f'WARNING: proceeding, even though we could not update PATH: CODEX_HOME points to "{codex_home}", but that path does not exist',
+                            file=sys.stderr,
+                        )
+                        print(
+                            f'Error finding codex home: CODEX_HOME points to "{codex_home}", but that path does not exist',
+                            file=sys.stderr,
+                        )
+                        return 2
 
                 if role == "checker":
                     requirement = {
@@ -778,6 +824,7 @@ def main() -> int:
         from loop_product.kernel.authority import kernel_internal_authority
         from loop_product.kernel.state import ensure_runtime_tree, load_kernel_state, persist_kernel_state
         from loop_product.loop.evaluator_client import (
+            _parse_simple_reviewer_verdict,
             build_evaluator_submission_for_frozen_task,
             build_evaluator_submission_for_endpoint_clarification,
             run_evaluator_node,
@@ -1153,8 +1200,30 @@ def main() -> int:
             output_root=state_root / "artifacts" / "evaluator_node_lingering_runs",
         )
         previous_path = str(os.environ.get("PATH") or "")
+        previous_transport_env = {
+            key: os.environ.get(key)
+            for key in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy")
+        }
+        previous_codex_home = os.environ.get("CODEX_HOME")
+        previous_fail_on_invalid_codex_home = os.environ.get("FAKE_CODEX_FAIL_ON_INVALID_CODEX_HOME")
+        previous_codex_thread_id = os.environ.get("CODEX_THREAD_ID")
+        previous_codex_sandbox_disabled = os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED")
+        previous_tmux = os.environ.get("TMUX")
+        transport_capture_dir = temp_root / "fake_codex_transport_env"
         os.environ["PATH"] = str(fake_codex_root) + os.pathsep + previous_path if previous_path else str(fake_codex_root)
         os.environ["FAKE_CODEX_TEST_DESIGNER_MODE"] = "linger_after_response"
+        os.environ["FAKE_CODEX_CAPTURE_TRANSPORT_ENV_DIR"] = str(transport_capture_dir)
+        os.environ["FAKE_CODEX_FAIL_ON_INVALID_CODEX_HOME"] = "1"
+        os.environ["CODEX_HOME"] = str((temp_root / "stale_evaluator_codex_home").resolve())
+        os.environ["CODEX_THREAD_ID"] = "stale-evaluator-thread"
+        os.environ["CODEX_SANDBOX_NETWORK_DISABLED"] = "1"
+        os.environ["TMUX"] = "/tmp/stale-evaluator-tmux"
+        os.environ["HTTP_PROXY"] = "http://127.0.0.1:7890"
+        os.environ["http_proxy"] = "http://127.0.0.1:7890"
+        os.environ["ALL_PROXY"] = "socks5://127.0.0.1:7890"
+        os.environ["all_proxy"] = "socks5://127.0.0.1:7890"
+        os.environ["NO_PROXY"] = "localhost,127.0.0.1"
+        os.environ["no_proxy"] = "localhost,127.0.0.1"
         lingering_started = time.monotonic()
         try:
             lingering_result, lingering_refs = run_evaluator_node(
@@ -1164,11 +1233,40 @@ def main() -> int:
         finally:
             os.environ["PATH"] = previous_path
             os.environ.pop("FAKE_CODEX_TEST_DESIGNER_MODE", None)
+            os.environ.pop("FAKE_CODEX_CAPTURE_TRANSPORT_ENV_DIR", None)
+            if previous_fail_on_invalid_codex_home is None:
+                os.environ.pop("FAKE_CODEX_FAIL_ON_INVALID_CODEX_HOME", None)
+            else:
+                os.environ["FAKE_CODEX_FAIL_ON_INVALID_CODEX_HOME"] = previous_fail_on_invalid_codex_home
+            if previous_codex_home is None:
+                os.environ.pop("CODEX_HOME", None)
+            else:
+                os.environ["CODEX_HOME"] = previous_codex_home
+            if previous_codex_thread_id is None:
+                os.environ.pop("CODEX_THREAD_ID", None)
+            else:
+                os.environ["CODEX_THREAD_ID"] = previous_codex_thread_id
+            if previous_codex_sandbox_disabled is None:
+                os.environ.pop("CODEX_SANDBOX_NETWORK_DISABLED", None)
+            else:
+                os.environ["CODEX_SANDBOX_NETWORK_DISABLED"] = previous_codex_sandbox_disabled
+            if previous_tmux is None:
+                os.environ.pop("TMUX", None)
+            else:
+                os.environ["TMUX"] = previous_tmux
+            for key, value in previous_transport_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
         lingering_elapsed_s = time.monotonic() - lingering_started
         if lingering_result.verdict is not EvaluatorVerdict.PASS:
             return _fail("lingering delegated-response fixture must still translate to a terminal PASS")
         if lingering_elapsed_s >= 3.0:
-            return _fail("evaluator node runtime must not wait for the full lingering provider exit after a delegated terminal response artifact already exists")
+            return _fail(
+                "evaluator node runtime must not wait for the full lingering provider exit after a delegated terminal response artifact already exists, "
+                f"got lingering_elapsed_s={lingering_elapsed_s:.3f}"
+            )
         lingering_report = json.loads(Path(str(lingering_refs["evaluation_report_ref"])).read_text(encoding="utf-8"))
         lingering_lanes = list(lingering_report.get("lanes") or [])
         if len(lingering_lanes) != 1:
@@ -1183,6 +1281,54 @@ def main() -> int:
             return _fail("evaluator node delegated-role exec span must settle before the natural linger interval expires")
         if lingering_exec_span.get("terminal_success") is not True:
             return _fail("provider-backed lingering evaluator node lanes must record terminal_success in exec-span evidence")
+        checker_transport_env = json.loads((transport_capture_dir / "checker.json").read_text(encoding="utf-8"))
+        if checker_transport_env.get("HTTP_PROXY") != "http://127.0.0.1:7890" or checker_transport_env.get("http_proxy") != "http://127.0.0.1:7890":
+            return _fail("evaluator checker runtime must preserve parent HTTP proxy transport env for provider-backed roles")
+        if checker_transport_env.get("ALL_PROXY") != "socks5://127.0.0.1:7890" or checker_transport_env.get("all_proxy") != "socks5://127.0.0.1:7890":
+            return _fail("evaluator checker runtime must preserve parent ALL_PROXY transport env for provider-backed roles")
+        checker_codex_home = str(checker_transport_env.get("CODEX_HOME") or "").strip()
+        if not checker_codex_home:
+            return _fail("evaluator checker runtime must materialize a runtime-owned CODEX_HOME")
+        checker_codex_home_path = Path(checker_codex_home).resolve()
+        if checker_codex_home_path == (Path.home() / ".codex").resolve():
+            return _fail("evaluator checker runtime must not fall back to the host default CODEX_HOME")
+        if not checker_codex_home_path.exists():
+            return _fail("evaluator checker runtime must materialize its runtime-owned CODEX_HOME before launch")
+        if not (checker_codex_home_path / "auth.json").exists():
+            return _fail("evaluator checker runtime-owned CODEX_HOME must share host auth surface")
+        for relpath in ("config.toml", "plugins", "skills", "vendor_imports", "rules", "memories"):
+            if (checker_codex_home_path / relpath).exists():
+                return _fail(
+                    "evaluator checker runtime-owned CODEX_HOME must not inherit host desktop config/plugin surfaces"
+                )
+        if "CODEX_THREAD_ID" in checker_transport_env:
+            return _fail("evaluator checker runtime must fully unset stale parent CODEX thread/session env instead of forwarding an empty value")
+        if "CODEX_SANDBOX_NETWORK_DISABLED" in checker_transport_env:
+            return _fail("evaluator checker runtime must fully unset stale parent CODEX sandbox env instead of forwarding an empty value")
+        if str(checker_transport_env.get("TMUX") or "").strip():
+            return _fail("evaluator checker runtime must not inherit parent TMUX session env")
+        reviewer_transport_env = json.loads((transport_capture_dir / "reviewer.json").read_text(encoding="utf-8"))
+        if reviewer_transport_env.get("HTTP_PROXY") != "http://127.0.0.1:7890":
+            return _fail("evaluator reviewer runtime must preserve parent transport env for provider-backed roles")
+        reviewer_codex_home = str(reviewer_transport_env.get("CODEX_HOME") or "").strip()
+        if not reviewer_codex_home:
+            return _fail("evaluator reviewer runtime must materialize a runtime-owned CODEX_HOME")
+        reviewer_codex_home_path = Path(reviewer_codex_home).resolve()
+        if reviewer_codex_home_path == (Path.home() / ".codex").resolve():
+            return _fail("evaluator reviewer runtime must not fall back to the host default CODEX_HOME")
+        if not reviewer_codex_home_path.exists():
+            return _fail("evaluator reviewer runtime must materialize its runtime-owned CODEX_HOME before launch")
+        if not (reviewer_codex_home_path / "auth.json").exists():
+            return _fail("evaluator reviewer runtime-owned CODEX_HOME must share host auth surface")
+        for relpath in ("config.toml", "plugins", "skills", "vendor_imports", "rules", "memories"):
+            if (reviewer_codex_home_path / relpath).exists():
+                return _fail(
+                    "evaluator reviewer runtime-owned CODEX_HOME must not inherit host desktop config/plugin surfaces"
+                )
+        if "CODEX_THREAD_ID" in reviewer_transport_env:
+            return _fail("evaluator reviewer runtime must fully unset stale parent CODEX thread/session env instead of forwarding an empty value")
+        if str(reviewer_transport_env.get("TMUX") or "").strip():
+            return _fail("evaluator reviewer runtime must not inherit parent TMUX session env")
 
         pass_with_error_words_submission = build_evaluator_submission_for_endpoint_clarification(
             target_node=child_node,
@@ -1876,6 +2022,118 @@ def main() -> int:
         else:
             return _fail("non-final split children must fail closed before evaluator launch when they try to use whole-paper evaluator surfaces")
 
+        split_child_local_surface_state_root = temp_root / ".loop" / "split_child_local_surface_gate"
+        split_child_local_surface_workspace_root = temp_root / "split_child_local_surface_gate_workspace"
+        split_child_local_surface_artifact_root = split_child_local_surface_workspace_root / "deliverables" / "primary_artifact"
+        split_child_local_surface_artifact_root.mkdir(parents=True, exist_ok=True)
+        ensure_runtime_tree(split_child_local_surface_state_root)
+        split_child_local_surface_root_node = NodeSpec(
+            node_id="split-child-local-surface-gate-root",
+            node_kind="kernel",
+            goal_slice="allow slice-local whole-paper workflow children to bypass whole-paper closeout preflight",
+            parent_node_id=None,
+            generation=0,
+            round_id="R0",
+            execution_policy={"mode": "kernel"},
+            reasoning_profile={"role": "kernel", "thinking_budget": "medium"},
+            budget_profile={"max_rounds": 1},
+            allowed_actions=["dispatch", "submit", "audit"],
+            workflow_scope="whole_paper_formalization",
+            artifact_scope="task",
+            terminal_authority_scope="whole_paper",
+            delegation_ref="",
+            result_sink_ref="artifacts/split_child_local_surface_gate/root_summary.json",
+            lineage_ref="split-child-local-surface-gate-root",
+            status=NodeStatus.ACTIVE,
+        )
+        split_child_local_surface_node = NodeSpec(
+            node_id="split-child-local-surface-gate-child",
+            node_kind="implementer",
+            goal_slice="resolve a slice-local dependency bundle without claiming whole-paper closeout",
+            parent_node_id=split_child_local_surface_root_node.node_id,
+            generation=1,
+            round_id="R1.S1",
+            execution_policy={"sandbox_mode": "danger-full-access"},
+            reasoning_profile={"role": "implementer", "thinking_budget": "high"},
+            budget_profile={"max_rounds": 1},
+            allowed_actions=["evaluate", "report"],
+            workflow_scope="whole_paper_formalization",
+            artifact_scope="slice",
+            terminal_authority_scope="local",
+            delegation_ref="state/delegations/split-child-local-surface-gate-child.json",
+            result_sink_ref="artifacts/split_child_local_surface_gate/implementer_result.json",
+            lineage_ref="split-child-local-surface-gate-root->split-child-local-surface-gate-child",
+            status=NodeStatus.ACTIVE,
+        )
+        split_child_local_surface_kernel_state = KernelState(
+            task_id="split-child-local-surface-gate",
+            root_goal="allow local-authority split children to use the slice evaluator surface inside a whole-paper workflow",
+            root_node_id=split_child_local_surface_root_node.node_id,
+        )
+        split_child_local_surface_kernel_state.register_node(split_child_local_surface_root_node)
+        split_child_local_surface_kernel_state.register_node(split_child_local_surface_node)
+        persist_kernel_state(
+            split_child_local_surface_state_root,
+            split_child_local_surface_kernel_state,
+            authority=kernel_internal_authority(),
+        )
+        (split_child_local_surface_artifact_root / "WHOLE_PAPER_STATUS.json").write_text(
+            json.dumps(
+                {
+                    "artifact_scope": "slice",
+                    "status": "SLICE_COMPLETE",
+                    "slice_terminal_classification": "PROOF_RELEVANT_EXTERNAL_DEPENDENCIES_RESOLVED",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        split_child_local_surface_manual_ref = split_child_local_surface_workspace_root / "PRODUCT_MANUAL.md"
+        split_child_local_surface_manual_ref.write_text("# Manual\n\nSlice-local dependency closure child.\n", encoding="utf-8")
+        split_child_local_surface_final_effects_ref = split_child_local_surface_workspace_root / "FINAL_EFFECTS.md"
+        split_child_local_surface_final_effects_ref.write_text(
+            "\n".join(
+                [
+                    "# Final Effects",
+                    "",
+                    "- resolve the slice-local dependency closure deliverable",
+                    "- do not claim whole-paper terminal authority",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        split_child_local_surface_receipt_ref = _write_publication_receipt(
+            split_child_local_surface_state_root
+            / "artifacts"
+            / "publication"
+            / split_child_local_surface_node.node_id
+            / "WorkspaceArtifactPublicationReceipt.json",
+            node_id=split_child_local_surface_node.node_id,
+            live_artifact_ref=split_child_local_surface_artifact_root,
+            publish_artifact_ref=split_child_local_surface_artifact_root,
+        )
+        split_child_local_surface_submission = build_evaluator_submission_for_frozen_task(
+            target_node=split_child_local_surface_node,
+            workspace_root=split_child_local_surface_workspace_root,
+            output_root=split_child_local_surface_state_root / "artifacts" / "evaluator_split_child_local_surface_gate_runs",
+            implementation_package_ref=split_child_local_surface_artifact_root,
+            artifact_publication_receipt_ref=split_child_local_surface_receipt_ref,
+            product_manual_ref=split_child_local_surface_manual_ref,
+            final_effects_text_ref=split_child_local_surface_final_effects_ref,
+            required_output_paths=["WHOLE_PAPER_STATUS.json"],
+            role_agent_cmd=_fixture_role_agent_cmd(scenario="wave_sequence"),
+        )
+        try:
+            evaluator_client_module._enforce_whole_paper_preflight(split_child_local_surface_submission)
+        except ValueError as exc:
+            return _fail(
+                "slice-local whole-paper workflow children must bypass whole-paper closeout preflight: "
+                f"{exc}"
+            )
+
         publication_receipt_gate_state_root = temp_root / ".loop" / "publication_receipt_gate"
         publication_receipt_gate_workspace_root = temp_root / "publication_receipt_gate_workspace"
         publication_receipt_gate_artifact_root = publication_receipt_gate_workspace_root / "deliverables" / "primary_artifact"
@@ -2135,45 +2393,55 @@ def main() -> int:
                     run_evaluator_node,
                 )
                 from loop_product.protocols.node import NodeSpec
-                from loop_product.runtime import initialize_evaluator_runtime
+                from loop_product.runtime import cleanup_test_repo_services, initialize_evaluator_runtime
 
                 state_root = Path(sys.argv[1]).resolve()
                 fixture_cmd = str(sys.argv[2])
                 result_path = Path(sys.argv[3]).resolve()
+                repo_root = state_root.parent.parent.resolve()
 
-                bootstrap = initialize_evaluator_runtime(
-                    state_root=state_root,
-                    task_id="ordinary-evaluator-bootstrap",
-                    root_goal="bootstrap evaluator runtime for an ordinary caller",
-                    child_goal_slice="exercise evaluator quick path through the public runtime bootstrap surface",
-                    child_node_id="ordinary-child-001",
-                    round_id="R1",
-                )
-                runtime_context = load_child_runtime_context(state_root, "ordinary-child-001")
-                target_node = NodeSpec.from_dict(dict(runtime_context["node"]))
-                submission = build_evaluator_submission_for_endpoint_clarification(
-                    target_node=target_node,
-                    workspace_root=ROOT,
-                    output_root=state_root / "artifacts" / "ordinary_evaluator_runs",
-                    role_agent_cmd=fixture_cmd,
-                )
-                evaluator_result, runtime_refs = run_evaluator_node(
-                    state_root=state_root,
-                    submission=submission,
-                )
-                result_path.write_text(
-                    json.dumps(
-                        {{
-                            "bootstrap": bootstrap,
-                            "verdict": evaluator_result.verdict.value,
-                            "runtime_refs": runtime_refs,
-                        }},
-                        indent=2,
-                        sort_keys=True,
+                try:
+                    bootstrap = initialize_evaluator_runtime(
+                        state_root=state_root,
+                        task_id="ordinary-evaluator-bootstrap",
+                        root_goal="bootstrap evaluator runtime for an ordinary caller",
+                        child_goal_slice="exercise evaluator quick path through the public runtime bootstrap surface",
+                        child_node_id="ordinary-child-001",
+                        round_id="R1",
                     )
-                    + "\\n",
-                    encoding="utf-8",
-                )
+                    runtime_context = load_child_runtime_context(state_root, "ordinary-child-001")
+                    target_node = NodeSpec.from_dict(dict(runtime_context["node"]))
+                    submission = build_evaluator_submission_for_endpoint_clarification(
+                        target_node=target_node,
+                        workspace_root=ROOT,
+                        output_root=state_root / "artifacts" / "ordinary_evaluator_runs",
+                        role_agent_cmd=fixture_cmd,
+                    )
+                    evaluator_result, runtime_refs = run_evaluator_node(
+                        state_root=state_root,
+                        submission=submission,
+                    )
+                    result_path.write_text(
+                        json.dumps(
+                            {{
+                                "bootstrap": bootstrap,
+                                "verdict": evaluator_result.verdict.value,
+                                "runtime_refs": runtime_refs,
+                            }},
+                            indent=2,
+                            sort_keys=True,
+                        )
+                        + "\\n",
+                        encoding="utf-8",
+                    )
+                finally:
+                    cleanup_receipt = cleanup_test_repo_services(
+                        repo_root=repo_root,
+                        settle_timeout_s=4.0,
+                        poll_interval_s=0.05,
+                    )
+                    if not bool(cleanup_receipt.get("quiesced")):
+                        raise RuntimeError(f"repo-service cleanup did not quiesce: {{cleanup_receipt!r}}")
                 """
             ),
             encoding="utf-8",
@@ -2480,6 +2748,220 @@ def main() -> int:
                 "prompt-path mutator fixture must still mutate the staged evaluator-visible artifact copy so the regression proves path rewriting"
             )
 
+        external_publish_workspace_root = temp_root / "external_publish_workspace"
+        external_publish_workspace_root.mkdir(parents=True, exist_ok=True)
+        external_publish_root = temp_root / "external_publish_root"
+        external_live_root = external_publish_workspace_root / ".tmp_primary_artifact"
+        external_live_root.mkdir(parents=True, exist_ok=True)
+        (external_live_root / "lakefile.lean").write_text(
+            "import Lake\n"
+            "open Lake DSL\n\n"
+            "package ExternalPublishSurface where\n\n"
+            "require mathlib from git\n"
+            '  \"https://github.com/leanprover-community/mathlib4.git\" @ \"v4.28.0\"\n\n'
+            "@[default_target]\n"
+            "lean_lib ExternalPublishSurface where\n",
+            encoding="utf-8",
+        )
+        (external_live_root / "lean-toolchain").write_text(
+            "leanprover/lean4:v4.28.0\n",
+            encoding="utf-8",
+        )
+        (external_live_root / "ExternalPublishSurface.lean").write_text(
+            "import Mathlib\n",
+            encoding="utf-8",
+        )
+        (external_live_root / "README.md").write_text("# README\n", encoding="utf-8")
+        (external_live_root / "TRACEABILITY.md").write_text("# TRACEABILITY\n", encoding="utf-8")
+        (external_live_root / "Appendix").mkdir(parents=True, exist_ok=True)
+        (external_live_root / "Appendix" / "Claim.lean").write_text("def externalSurfaceProbe : Nat := 0\n", encoding="utf-8")
+        (external_live_root / "WHOLE_PAPER_STATUS.json").write_text(
+            json.dumps(
+                {
+                    "artifact_scope": "slice",
+                    "status": "LOCAL_SLICE_COMPLETE_PENDING_PARENT_INTEGRATION",
+                    "completion_classification": "slice_local_formalization_complete",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        external_live_manual_ref = external_live_root / "Guides" / "Manual.md"
+        external_live_manual_ref.parent.mkdir(parents=True, exist_ok=True)
+        (external_live_manual_ref.parent / "appendix_notes.md").write_text(
+            "Review `../Appendix/Claim.lean` from this staged guide.\n",
+            encoding="utf-8",
+        )
+        external_live_manual_ref.write_text(
+            textwrap.dedent(
+                f"""\
+                # Manual
+
+                Review the published artifact rooted at:
+                `{external_publish_root.resolve()}`
+
+                The staged evaluator workspace must instead expose:
+                `deliverables/primary_artifact`
+
+                See also `appendix_notes.md`.
+                """
+            ),
+            encoding="utf-8",
+        )
+        external_live_final_effects_ref = external_live_root / "Guides" / "FinalEffects.md"
+        external_live_final_effects_ref.write_text(
+            textwrap.dedent(
+                f"""\
+                # Final Effects
+
+                - Inspect the published artifact rooted at `{external_publish_root.resolve()}`.
+                - Preserve a reviewer-visible staged `deliverables/primary_artifact` surface instead of leaking the original publish root.
+                - Keep sibling guidance like `appendix_notes.md` reachable from this staged file.
+                """
+            ),
+            encoding="utf-8",
+        )
+        external_kernel_state = load_kernel_state(state_root)
+        external_child_node = NodeSpec(
+            node_id="child-external-publish-no-copy-001",
+            node_kind="implementer",
+            goal_slice="prove no-copy evaluator staging preserves one canonical deliverable surface even when publication lives outside workspace_root",
+            parent_node_id=root_node.node_id,
+            generation=1,
+            round_id="R1",
+            execution_policy={"sandbox_mode": "danger-full-access"},
+            reasoning_profile={"role": "implementer", "thinking_budget": "high"},
+            budget_profile={"max_rounds": 2},
+            allowed_actions=["evaluate", "report"],
+            delegation_ref="state/delegations/child-external-publish-no-copy-001.json",
+            result_sink_ref="artifacts/child-external-publish-no-copy-001/implementer_result.json",
+            lineage_ref="root-kernel->child-external-publish-no-copy-001",
+            status=NodeStatus.ACTIVE,
+        )
+        external_kernel_state.register_node(external_child_node)
+        persist_kernel_state(state_root, external_kernel_state, authority=kernel_internal_authority())
+        external_receipt_ref = (
+            state_root
+            / "artifacts"
+            / "publication"
+            / external_child_node.node_id
+            / "WorkspaceArtifactPublicationReceipt.json"
+        )
+        publish_workspace_artifact_snapshot(
+            node_id=external_child_node.node_id,
+            live_artifact_ref=external_live_root,
+            publish_artifact_ref=external_publish_root,
+            publication_receipt_ref=external_receipt_ref,
+        )
+        external_submission = build_evaluator_submission_for_frozen_task(
+            target_node=external_child_node,
+            workspace_root=external_publish_workspace_root,
+            output_root=state_root / "artifacts" / "evaluator_node_external_publish_no_copy_runs",
+            implementation_package_ref=ROOT / "loop_product" / "kernel" / "entry.py",
+            artifact_publication_receipt_ref=external_receipt_ref,
+            required_output_paths=["README.md", "TRACEABILITY.md", "Appendix/Claim.lean", "WHOLE_PAPER_STATUS.json"],
+            product_manual_ref=external_publish_root / "Guides" / "Manual.md",
+            final_effects_text_ref=external_publish_root / "Guides" / "FinalEffects.md",
+            role_agent_cmd=fixture_agent_cmd,
+        )
+        external_result, external_refs = run_evaluator_node(
+            state_root=state_root,
+            submission=external_submission,
+        )
+        if external_result.verdict is not EvaluatorVerdict.PASS:
+            return _fail(
+                "external publish-root no-copy fixture must still complete through evaluator-node runtime; "
+                f"got verdict={external_result.verdict.value} summary={external_result.summary!r}"
+            )
+        external_run_root = Path(str(external_refs["evaluation_report_ref"])).resolve().parent
+        staged_role_workspaces = {
+            "checker": external_run_root / ".loop" / "checker" / "workspaces" / "checker" / "workspace",
+            "test_ai": external_run_root / ".loop" / "test_ai" / "workspaces" / "test_ai__EU-001" / "workspace",
+            "ai_user": external_run_root / ".loop" / "ai_user" / "workspaces" / "ai_user__EU-001" / "workspace",
+            "reviewer": external_run_root / ".loop" / "reviewer" / "workspaces" / "reviewer" / "workspace",
+        }
+        for role_label, staged_workspace_root in staged_role_workspaces.items():
+            staged_artifact_root = staged_workspace_root / "deliverables" / "primary_artifact"
+            for reviewer_visible_relpath in (
+                Path("README.md"),
+                Path("TRACEABILITY.md"),
+                Path("Appendix") / "Claim.lean",
+                Path("WHOLE_PAPER_STATUS.json"),
+            ):
+                if not (staged_artifact_root / reviewer_visible_relpath).exists():
+                    return _fail(
+                        "no-copy evaluator staging must materialize the canonical published deliverable surface for every role "
+                        f"workspace; missing {reviewer_visible_relpath} in {role_label}"
+                    )
+            staged_manifest = staged_artifact_root / "lake-manifest.json"
+            if not staged_manifest.exists():
+                return _fail(
+                    "no-copy evaluator staging must seed lake-manifest.json into staged Lean deliverable surfaces "
+                    f"for every role workspace; missing in {role_label}"
+                )
+            repo_manifest = ROOT.parent / "lake-manifest.json"
+            if staged_manifest.read_text(encoding="utf-8") != repo_manifest.read_text(encoding="utf-8"):
+                return _fail(
+                    "no-copy evaluator staging must seed the repo-root lake-manifest.json into staged Lean deliverable "
+                    f"surfaces; mismatch in {role_label}"
+                )
+            for package_name in ("mathlib", "importGraph"):
+                if not (staged_artifact_root / ".lake" / "packages" / package_name).exists():
+                    return _fail(
+                        "no-copy evaluator staging must attach shared-cache packages into staged Lean deliverable "
+                        f"surfaces; missing {package_name} in {role_label}"
+                    )
+        checker_invocation_ref = external_run_root / ".loop" / "checker" / "runs" / "checker" / "invocation.json"
+        checker_context_ref = Path(
+            str(json.loads(checker_invocation_ref.read_text(encoding="utf-8")).get("context_ref") or "")
+        )
+        checker_context = json.loads(checker_context_ref.read_text(encoding="utf-8"))
+        staged_checker_final_effects_ref = Path(str(checker_context.get("final_effects_text_ref") or ""))
+        staged_checker_final_effects_text = staged_checker_final_effects_ref.read_text(encoding="utf-8")
+        staged_checker_artifact_root = staged_role_workspaces["checker"] / "deliverables" / "primary_artifact"
+        expected_staged_checker_final_effects_ref = staged_checker_artifact_root / "Guides" / "FinalEffects.md"
+        if staged_checker_final_effects_ref != expected_staged_checker_final_effects_ref:
+            return _fail(
+                "checker staged final-effects refs under an external publish root must resolve into the staged deliverable surface "
+                "instead of being copied into detached evaluator inputs"
+            )
+        if str(external_publish_root.resolve()) in staged_checker_final_effects_text:
+            return _fail(
+                "checker staged final-effects refs must rewrite external publish-root paths to the staged deliverable surface"
+            )
+        if str(staged_checker_artifact_root.resolve()) not in staged_checker_final_effects_text:
+            return _fail(
+                "checker staged final-effects refs must point at the staged deliverable surface for external publish-root fixtures"
+            )
+        reviewer_invocation_ref = external_run_root / ".loop" / "reviewer" / "runs" / "reviewer" / "invocation.json"
+        reviewer_context_ref = Path(
+            str(json.loads(reviewer_invocation_ref.read_text(encoding="utf-8")).get("context_ref") or "")
+        )
+        reviewer_context = json.loads(reviewer_context_ref.read_text(encoding="utf-8"))
+        staged_reviewer_manual_ref = Path(str(reviewer_context.get("product_manual_ref") or ""))
+        staged_reviewer_manual_text = staged_reviewer_manual_ref.read_text(encoding="utf-8")
+        staged_reviewer_artifact_root = staged_role_workspaces["reviewer"] / "deliverables" / "primary_artifact"
+        expected_staged_reviewer_manual_ref = staged_reviewer_artifact_root / "Guides" / "Manual.md"
+        if staged_reviewer_manual_ref != expected_staged_reviewer_manual_ref:
+            return _fail(
+                "reviewer staged manual refs under an external publish root must resolve into the staged deliverable surface "
+                "instead of being copied into detached evaluator inputs"
+            )
+        if not (staged_reviewer_manual_ref.parent / "appendix_notes.md").exists():
+            return _fail(
+                "reviewer staged manual refs under an external publish root must preserve sibling relative-reference files in the staged deliverable surface"
+            )
+        if str(external_publish_root.resolve()) in staged_reviewer_manual_text:
+            return _fail(
+                "reviewer staged manual refs must rewrite external publish-root paths out of delegated inputs"
+            )
+        if str(staged_reviewer_artifact_root.resolve()) not in staged_reviewer_manual_text:
+            return _fail(
+                "reviewer staged manual refs must point at the staged deliverable surface for external publish-root fixtures"
+            )
+
         failing_agent_cmd = _fixture_role_agent_cmd(scenario="lane_failure", failing_role="checker", failure_message="synthetic checker failure")
         bug_submission = build_evaluator_submission_for_endpoint_clarification(
             target_node=child_node,
@@ -2487,12 +2969,18 @@ def main() -> int:
             output_root=state_root / "artifacts" / "evaluator_node_bug_runs",
             role_agent_cmd=failing_agent_cmd,
         )
-        bug_result, _bug_refs = run_evaluator_node(
+        bug_result, bug_refs = run_evaluator_node(
             state_root=state_root,
             submission=bug_submission,
         )
         if bug_result.verdict is not EvaluatorVerdict.ERROR:
             return _fail(f"simple-evaluator delegated role failure must translate to ERROR, got {bug_result.verdict.value}")
+        bug_request_payload = json.loads(Path(str(bug_refs["request_ref"])).read_text(encoding="utf-8"))
+        if str(bug_request_payload.get("implementation_package_ref") or "") != bug_submission.implementation_package_ref:
+            return _fail(
+                "materialized evaluator requests must preserve implementation_package_ref so simple-evaluator "
+                "workspace staging can distinguish file-backed and artifact-root-backed implementations"
+            )
 
         composite_provider_capacity_failure = "\n".join(
             [
@@ -2505,91 +2993,140 @@ def main() -> int:
             ]
         )
         issue_agents = {
-            "uv": (
-                "uv run --project . started creating a virtual environment and failed before touching the product surface",
-                "uv",
-                "STRUCTURED_EXCEPTION",
-                False,
-                "evaluator_exec_uv",
-                "staged-workspace `python`",
-            ),
-            "path": (
-                "python: can't open file '/tmp/missing_product_entry.py': [Errno 2] No such file or directory",
-                "path",
-                "STRUCTURED_EXCEPTION",
-                False,
-                "evaluator_exec_path",
-                "correct the path",
-            ),
-            "repo_structure": (
-                "pyproject.toml not found from the current repo root; workspace layout assumption was wrong",
-                "repo_structure",
-                "STRUCTURED_EXCEPTION",
-                False,
-                "evaluator_exec_repo_structure",
-                "confirm the repo structure",
-            ),
-            "command_sequence": (
-                "zsh:1: parse error near `fi' while executing the generated command sequence",
-                "command_sequence",
-                "STRUCTURED_EXCEPTION",
-                False,
-                "evaluator_exec_command_sequence",
-                "repair the command sequence",
-            ),
-            "provider_transport": (
-                "failed to connect to websocket: IO error: Connection reset by peer (os error 54)\nstream disconnected before completion",
-                "provider_transport",
-                "STUCK",
-                True,
-                "evaluator_exec_provider_transport",
-                "retry the same evaluator lane with bounded backoff",
-            ),
-            "provider_capacity": (
-                "We're currently experiencing high demand, which may cause temporary errors.",
-                "provider_capacity",
-                "STUCK",
-                True,
-                "evaluator_exec_provider_capacity",
-                "retry the same evaluator lane after a short bounded backoff",
-            ),
-            "provider_quota": (
-                "ERROR: You've hit your usage limit. Please try again later.",
-                "provider_quota",
-                "STUCK",
-                True,
-                "evaluator_exec_provider_quota",
-                "retry after the provider quota window resets",
-            ),
-            "provider_runtime": (
-                "thread 'main' panicked at system-configuration dynamic_store.rs: Attempted to create a NULL object.",
-                "provider_runtime",
-                "STUCK",
-                True,
-                "evaluator_exec_provider_runtime",
-                "retry the same evaluator lane with bounded backoff",
-            ),
-            "provider_capacity_composite": (
-                composite_provider_capacity_failure,
-                "provider_capacity",
-                "STUCK",
-                True,
-                "evaluator_exec_provider_capacity",
-                "retry the same evaluator lane after a short bounded backoff",
-            ),
+            "uv": {
+                "cmd_kwargs": {
+                    "failure_message": "uv run --project . started creating a virtual environment and failed before touching the product surface",
+                },
+                "expected_issue_kind": "uv",
+                "expected_verdict": "STRUCTURED_EXCEPTION",
+                "expected_retryable": False,
+                "expected_self_attribution": "evaluator_exec_uv",
+                "expected_repair_snippet": "staged-workspace `python`",
+            },
+            "path": {
+                "cmd_kwargs": {
+                    "failure_message": "python: can't open file '/tmp/missing_product_entry.py': [Errno 2] No such file or directory",
+                },
+                "expected_issue_kind": "path",
+                "expected_verdict": "STRUCTURED_EXCEPTION",
+                "expected_retryable": False,
+                "expected_self_attribution": "evaluator_exec_path",
+                "expected_repair_snippet": "correct the path",
+            },
+            "repo_structure": {
+                "cmd_kwargs": {
+                    "failure_message": "pyproject.toml not found from the current repo root; workspace layout assumption was wrong",
+                },
+                "expected_issue_kind": "repo_structure",
+                "expected_verdict": "STRUCTURED_EXCEPTION",
+                "expected_retryable": False,
+                "expected_self_attribution": "evaluator_exec_repo_structure",
+                "expected_repair_snippet": "confirm the repo structure",
+            },
+            "command_sequence": {
+                "cmd_kwargs": {
+                    "failure_message": "zsh:1: parse error near `fi' while executing the generated command sequence",
+                },
+                "expected_issue_kind": "command_sequence",
+                "expected_verdict": "STRUCTURED_EXCEPTION",
+                "expected_retryable": False,
+                "expected_self_attribution": "evaluator_exec_command_sequence",
+                "expected_repair_snippet": "repair the command sequence",
+            },
+            "provider_transport": {
+                "cmd_kwargs": {
+                    "failure_message": "failed to connect to websocket: IO error: Connection reset by peer (os error 54)\nstream disconnected before completion",
+                },
+                "expected_issue_kind": "provider_transport",
+                "expected_verdict": "STUCK",
+                "expected_retryable": True,
+                "expected_self_attribution": "evaluator_exec_provider_transport",
+                "expected_repair_snippet": "retry the same evaluator lane with bounded backoff",
+            },
+            "provider_capacity": {
+                "cmd_kwargs": {
+                    "failure_message": "We're currently experiencing high demand, which may cause temporary errors.",
+                },
+                "expected_issue_kind": "provider_capacity",
+                "expected_verdict": "STUCK",
+                "expected_retryable": True,
+                "expected_self_attribution": "evaluator_exec_provider_capacity",
+                "expected_repair_snippet": "retry the same evaluator lane after a short bounded backoff",
+            },
+            "provider_quota": {
+                "cmd_kwargs": {
+                    "failure_message": "ERROR: You've hit your usage limit. Please try again later.",
+                },
+                "expected_issue_kind": "provider_quota",
+                "expected_verdict": "STUCK",
+                "expected_retryable": True,
+                "expected_self_attribution": "evaluator_exec_provider_quota",
+                "expected_repair_snippet": "retry after the provider quota window resets",
+            },
+            "provider_runtime": {
+                "cmd_kwargs": {
+                    "failure_message": "thread 'main' panicked at system-configuration dynamic_store.rs: Attempted to create a NULL object.",
+                },
+                "expected_issue_kind": "provider_runtime",
+                "expected_verdict": "STUCK",
+                "expected_retryable": True,
+                "expected_self_attribution": "evaluator_exec_provider_runtime",
+                "expected_repair_snippet": "retry the same evaluator lane with bounded backoff",
+            },
+            "provider_runtime_sigterm": {
+                "cmd_kwargs": {
+                    "failure_message": "synthetic evaluator lane interrupted before result emission",
+                    "failure_signal": "SIGTERM",
+                },
+                "expected_issue_kind": "provider_runtime",
+                "expected_verdict": "STUCK",
+                "expected_retryable": True,
+                "expected_self_attribution": "evaluator_exec_provider_runtime",
+                "expected_repair_snippet": "retry the same evaluator lane with bounded backoff",
+            },
+            "provider_runtime_exit_143": {
+                "cmd_kwargs": {
+                    "failure_message": "synthetic shell wrapper terminated the evaluator lane before result emission",
+                    "failure_exit_code": 143,
+                },
+                "expected_issue_kind": "provider_runtime",
+                "expected_verdict": "STUCK",
+                "expected_retryable": True,
+                "expected_self_attribution": "evaluator_exec_provider_runtime",
+                "expected_repair_snippet": "retry the same evaluator lane with bounded backoff",
+            },
+            "provider_runtime_exit_137": {
+                "cmd_kwargs": {
+                    "failure_message": "synthetic shell wrapper hard-killed the evaluator lane before result emission",
+                    "failure_exit_code": 137,
+                },
+                "expected_issue_kind": "provider_runtime",
+                "expected_verdict": "STUCK",
+                "expected_retryable": True,
+                "expected_self_attribution": "evaluator_exec_provider_runtime",
+                "expected_repair_snippet": "retry the same evaluator lane with bounded backoff",
+            },
+            "provider_capacity_composite": {
+                "cmd_kwargs": {
+                    "failure_message": composite_provider_capacity_failure,
+                },
+                "expected_issue_kind": "provider_capacity",
+                "expected_verdict": "STUCK",
+                "expected_retryable": True,
+                "expected_self_attribution": "evaluator_exec_provider_capacity",
+                "expected_repair_snippet": "retry the same evaluator lane after a short bounded backoff",
+            },
         }
-        for issue_name, (
-            failure_message,
-            expected_issue_kind,
-            expected_verdict,
-            expected_retryable,
-            expected_self_attribution,
-            expected_repair_snippet,
-        ) in issue_agents.items():
+        for issue_name, issue_spec in issue_agents.items():
+            expected_issue_kind = str(issue_spec["expected_issue_kind"])
+            expected_verdict = str(issue_spec["expected_verdict"])
+            expected_retryable = bool(issue_spec["expected_retryable"])
+            expected_self_attribution = str(issue_spec["expected_self_attribution"])
+            expected_repair_snippet = str(issue_spec["expected_repair_snippet"])
             issue_agent_cmd = _fixture_role_agent_cmd(
                 scenario="lane_failure",
                 failing_role="test_designer",
-                failure_message=failure_message,
+                **dict(issue_spec.get("cmd_kwargs") or {}),
             )
             issue_submission = build_evaluator_submission_for_endpoint_clarification(
                 target_node=child_node,
@@ -3014,6 +3551,10 @@ def main() -> int:
             output_root=state_root / "artifacts" / "evaluator_node_unknown_runs",
             role_agent_cmd=unknown_reviewer_agent_cmd,
         )
+        if _parse_simple_reviewer_verdict("Overall verdict: `FAIL`.") != "FAIL":
+            return _fail("markdown reviewer verdict with an Overall prefix must normalize to FAIL")
+        if _parse_simple_reviewer_verdict("Overall verdict: `PASS`.") != "PASS":
+            return _fail("markdown reviewer verdict with an Overall prefix must normalize to PASS")
         error_result, _error_refs = run_evaluator_node(
             state_root=state_root,
             submission=error_submission,

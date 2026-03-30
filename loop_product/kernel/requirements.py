@@ -7,7 +7,7 @@ from typing import Iterable
 
 from loop_product.kernel.authority import kernel_internal_authority
 from loop_product.kernel.audit import record_audit_event
-from loop_product.kernel.state import load_kernel_state, persist_kernel_state
+from loop_product.kernel.state import persist_kernel_state, query_kernel_state_object
 
 
 def route_user_requirements(state_root: Path, requirements: str | Iterable[str]) -> list[str]:
@@ -23,7 +23,7 @@ def route_user_requirements(state_root: Path, requirements: str | Iterable[str])
         return []
 
     authority = kernel_internal_authority()
-    kernel_state = load_kernel_state(state_root)
+    kernel_state = query_kernel_state_object(state_root, continue_deferred=False)
     routed: list[str] = []
     for requirement in normalized:
         if requirement not in kernel_state.active_requirements:

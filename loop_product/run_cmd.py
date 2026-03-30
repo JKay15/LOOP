@@ -32,6 +32,31 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Union
 
+_ENV_UNSET_SENTINEL = "__LEANATLAS_ENV_UNSET__"
+_DEFAULT_SEALED_PARENT_ENV_KEYS = (
+    "ALL_PROXY",
+    "HOME",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "NO_COLOR",
+    "NO_PROXY",
+    "PATH",
+    "SSH_AUTH_SOCK",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USER",
+    "UV_CACHE_DIR",
+    "all_proxy",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
+)
+
 
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -94,10 +119,55 @@ def _as_nonnegative_int(value: int) -> int:
     return max(0, int(value))
 
 
-def _prepare_env(cwd: Union[str, Path], env: Optional[Mapping[str, str]]) -> Dict[str, str]:
-    merged = dict(os.environ)
+def build_sealed_parent_env(
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    allowed_parent_env_keys: Optional[Sequence[str]] = None,
+) -> Dict[str, str]:
+    merged: Dict[str, str] = {}
+    for key in allowed_parent_env_keys or _DEFAULT_SEALED_PARENT_ENV_KEYS:
+        normalized_key = str(key)
+        inherited_value = os.environ.get(normalized_key)
+        if inherited_value is None or inherited_value == "":
+            continue
+        merged[normalized_key] = str(inherited_value)
+    for key, inherited_value in os.environ.items():
+        if not str(key).startswith("FAKE_CODEX_"):
+            continue
+        if inherited_value is None or inherited_value == "":
+            continue
+        merged[str(key)] = str(inherited_value)
     if env is not None:
-        merged.update({str(k): str(v) for k, v in env.items()})
+        for key, value in env.items():
+            normalized_key = str(key)
+            normalized_value = str(value)
+            if normalized_value == _ENV_UNSET_SENTINEL:
+                merged.pop(normalized_key, None)
+                continue
+            merged[normalized_key] = normalized_value
+    return merged
+
+
+def _prepare_env(
+    cwd: Union[str, Path],
+    env: Optional[Mapping[str, str]],
+    *,
+    inherit_parent_env: bool = True,
+    allowed_parent_env_keys: Optional[Sequence[str]] = None,
+) -> Dict[str, str]:
+    merged = (
+        dict(os.environ)
+        if inherit_parent_env
+        else build_sealed_parent_env(env=None, allowed_parent_env_keys=allowed_parent_env_keys)
+    )
+    if env is not None:
+        for key, value in env.items():
+            normalized_key = str(key)
+            normalized_value = str(value)
+            if normalized_value == _ENV_UNSET_SENTINEL:
+                merged.pop(normalized_key, None)
+                continue
+            merged[normalized_key] = normalized_value
 
     uv_cache_dir = str(merged.get("UV_CACHE_DIR") or "").strip()
     if uv_cache_dir:
@@ -221,6 +291,8 @@ def start_cmd(
     env: Optional[Mapping[str, str]] = None,
     stdin_path: Optional[Union[str, Path]] = None,
     start_new_session: bool = True,
+    inherit_parent_env: bool = True,
+    allowed_parent_env_keys: Optional[Sequence[str]] = None,
 ) -> RunningCmdHandle:
     """Start a command with run_cmd-compatible logging, but do not wait for it."""
 
@@ -243,7 +315,12 @@ def start_cmd(
         stdout=stdout_handle,
         stderr=stderr_handle,
         text=True,
-        env=_prepare_env(cwd, env),
+        env=_prepare_env(
+            cwd,
+            env,
+            inherit_parent_env=inherit_parent_env,
+            allowed_parent_env_keys=allowed_parent_env_keys,
+        ),
         start_new_session=start_new_session,
     )
     return RunningCmdHandle(
@@ -360,6 +437,8 @@ def run_cmd(
     stdin_path: Optional[Union[str, Path]] = None,
     capture_text: bool = False,
     max_capture_bytes: int = 2 * 1024 * 1024,
+    inherit_parent_env: bool = True,
+    allowed_parent_env_keys: Optional[Sequence[str]] = None,
 ) -> RunCmdResult:
     """Run a command and write stdout/stderr to files.
 
@@ -437,7 +516,12 @@ def run_cmd(
         reconnect_re = re.compile(reconnect_pattern, flags=re.IGNORECASE)
     timed_out = False
     timeout_kind: Optional[str] = None
-    cmd_env = _prepare_env(cwd, env)
+    cmd_env = _prepare_env(
+        cwd,
+        env,
+        inherit_parent_env=inherit_parent_env,
+        allowed_parent_env_keys=allowed_parent_env_keys,
+    )
     semantic_streams = {str(name).strip().lower() for name in (semantic_activity_streams or ()) if str(name).strip()}
     bad_streams = sorted(stream for stream in semantic_streams if stream not in {"stdout", "stderr"})
     if bad_streams:
