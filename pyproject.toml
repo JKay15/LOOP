@@ -1,0 +1,15 @@
+[project]
+name = "loop-system"
+version = "0.1.0"
+description = "Standalone router-based LOOP system."
+requires-python = ">=3.10"
+dependencies = [
+  "jsonschema>=4.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["loop*"]

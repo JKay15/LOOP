@@ -1,0 +1,11 @@
+.venv/
+.uv-cache/
+.cache/
+__pycache__/
+*.pyc
+*.egg-info/
+.DS_Store
+.loop/
+.router_runs/
+workspace/
+artifacts/
