@@ -92,19 +92,28 @@ def _write_completion(path: Path, payload: dict[str, object]) -> Path:
 
 def _write_checker_tasks(workspace_root: Path, task_ids: list[str]) -> Path:
     return _write_file(
-        workspace_root / "checker" / "tasks.json",
+        workspace_root / ".loop" / "router_runtime" / "nodes" / "node-1" / "checker" / "current" / "tasks.json",
         json.dumps(
             {
-                "version": 1,
+                "version": 2,
+                "snapshot_id": "",
+                "workspace_root": str(workspace_root.resolve()),
+                "authoritative_final_effects_path": str((workspace_root / "FINAL_EFFECTS.md").resolve()),
+                "obligations": [
+                    {
+                        "id": "req-1",
+                        "section": "Main",
+                        "requirement_text": (workspace_root / "FINAL_EFFECTS.md").read_text(encoding="utf-8").strip(),
+                    }
+                ],
                 "tasks": [
                     {
                         "task_id": task_id,
-                        "task_ref": str(
-                            _write_file(
-                                workspace_root / "checker" / f"{task_id}.md",
-                                f"{task_id}\n",
-                            )
-                        ),
+                        "covered_requirement_ids": ["req-1"],
+                        "goal": f"Validate {task_id}.",
+                        "blocking_condition": f"Block if {task_id} fails.",
+                        "task_instructions": f"Inspect the workspace and validate {task_id}.",
+                        "required_evidence": [],
                     }
                     for task_id in task_ids
                 ],
@@ -201,6 +210,12 @@ def main() -> int:
 
     try:
         from loop.completion import actor_completion_record_path
+        from loop.evaluator_runtime import (
+            ai_user_current_result_path,
+            checker_current_tasks_path,
+            reviewer_current_report_path,
+            tester_current_result_path,
+        )
         from loop.core import (
             ActorLaunchResult,
             RouterCore,
@@ -212,6 +227,17 @@ def main() -> int:
         from loop.store import RouterStore
     except Exception as exc:  # noqa: BLE001
         return _fail(f"router evaluator imports failed: {exc}")
+
+    def _current_snapshot_id(store, node_id: str) -> str:
+        record = store.load_node(node_id)
+        if record is None:
+            raise AssertionError(f"node {node_id} missing")
+        checker_tasks_ref = Path(str(record.checker_tasks_ref or "")).resolve()
+        payload = json.loads(checker_tasks_ref.read_text(encoding="utf-8"))
+        snapshot_id = str(payload.get("snapshot_id") or "").strip()
+        if not snapshot_id:
+            raise AssertionError(f"node {node_id} missing snapshot_id")
+        return snapshot_id
 
     now = datetime.now(timezone.utc)
 
@@ -307,13 +333,37 @@ def main() -> int:
                 return _fail("node record must still exist after implementer completion")
             checker_component = checker_record.components[component_key(actor_kind=ActorKind.EVALUATOR_CHECKER)]
             checker_tasks = _write_file(
-                workspace_root / "checker" / "tasks.json",
+                checker_current_tasks_path(workspace_root, "1"),
                 json.dumps(
                     {
-                        "version": 1,
+                        "version": 2,
+                        "snapshot_id": "",
+                        "workspace_root": str(workspace_root.resolve()),
+                        "authoritative_final_effects_path": str(final_effects),
+                        "obligations": [
+                            {
+                                "id": "req-1",
+                                "section": "Main",
+                                "requirement_text": final_effects.read_text(encoding="utf-8").strip(),
+                            }
+                        ],
                         "tasks": [
-                            {"task_id": "task-1", "task_ref": str(_write_file(workspace_root / "checker" / "task-1.md", "Check A\n"))},
-                            {"task_id": "task-2", "task_ref": str(_write_file(workspace_root / "checker" / "task-2.md", "Check B\n"))},
+                            {
+                                "task_id": "task-1",
+                                "covered_requirement_ids": ["req-1"],
+                                "goal": "Check A.",
+                                "blocking_condition": "Block if A fails.",
+                                "task_instructions": "Inspect A.",
+                                "required_evidence": [],
+                            },
+                            {
+                                "task_id": "task-2",
+                                "covered_requirement_ids": ["req-1"],
+                                "goal": "Check B.",
+                                "blocking_condition": "Block if B fails.",
+                                "task_instructions": "Inspect B.",
+                                "required_evidence": [],
+                            },
                         ],
                     },
                     indent=2,
@@ -321,7 +371,7 @@ def main() -> int:
                 ),
             )
             _write_completion(
-                actor_completion_record_path(workspace_root, ActorKind.EVALUATOR_CHECKER),
+                actor_completion_record_path(workspace_root, ActorKind.EVALUATOR_CHECKER, node_id="1"),
                 {
                     "version": 1,
                     "node_id": "1",
@@ -381,6 +431,8 @@ def main() -> int:
             }:
                 return _fail("tasks phase must retain tester plus all running AI-user lanes")
 
+            current_snapshot_id = _current_snapshot_id(store, "1")
+
             def _complete_current_tester_review(*, result_name: str) -> int:
                 record = store.load_node("1")
                 if record is None:
@@ -389,11 +441,19 @@ def main() -> int:
                 if component is None:
                     raise AssertionError("missing component for evaluator_tester")
                 result_ref = _write_file(
-                    workspace_root / "results" / f"{result_name}.md",
-                    "global tester review\n",
+                    tester_current_result_path(workspace_root, "1"),
+                    "\n".join(
+                        [
+                            "# Tester Result",
+                            f"Current dispatched snapshot id: {current_snapshot_id}",
+                            "Overall verdict: PASS",
+                            "Evidence: current evaluator batch completed.",
+                        ]
+                    )
+                    + "\n",
                 )
                 _write_completion(
-                    actor_completion_record_path(workspace_root, ActorKind.EVALUATOR_TESTER),
+                    actor_completion_record_path(workspace_root, ActorKind.EVALUATOR_TESTER, node_id="1"),
                     {
                         "version": 1,
                         "node_id": "1",
@@ -433,13 +493,23 @@ def main() -> int:
                 if component is None:
                     raise AssertionError("missing component for evaluator_ai_user")
                 result_ref = _write_file(
-                    workspace_root / "results" / f"{result_name}.md",
-                    f"{ActorKind.EVALUATOR_AI_USER.value} result for {task_id}\n",
+                    ai_user_current_result_path(workspace_root, "1", task_id=task_id),
+                    "\n".join(
+                        [
+                            f"Task id: {task_id}",
+                            f"Current dispatched snapshot id: {current_snapshot_id}",
+                            "Task verdict: PASS",
+                            f"Evidence: completed {result_name}.",
+                            "Task scope closure: sufficient.",
+                        ]
+                    )
+                    + "\n",
                 )
                 _write_completion(
                     actor_completion_record_path(
                         workspace_root,
                         ActorKind.EVALUATOR_AI_USER,
+                        node_id="1",
                         task_id=task_id,
                     ),
                     {
@@ -514,9 +584,19 @@ def main() -> int:
             if reviewer_record is None:
                 return _fail("node record missing before reviewer completion")
             reviewer_component = reviewer_record.components[component_key(actor_kind=ActorKind.EVALUATOR_REVIEWER)]
-            reviewer_report = _write_file(workspace_root / "reviewer" / "report.md", "needs fixes\n")
+            reviewer_report = _write_file(
+                reviewer_current_report_path(workspace_root, "1"),
+                "\n".join(
+                    [
+                        "# Reviewer Report",
+                        f"Current dispatched snapshot id: {current_snapshot_id}",
+                        "Implementer action required.",
+                    ]
+                )
+                + "\n",
+            )
             _write_completion(
-                actor_completion_record_path(workspace_root, ActorKind.EVALUATOR_REVIEWER),
+                actor_completion_record_path(workspace_root, ActorKind.EVALUATOR_REVIEWER, node_id="1"),
                 {
                     "version": 1,
                     "node_id": "1",

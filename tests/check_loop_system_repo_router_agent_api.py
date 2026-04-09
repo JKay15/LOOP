@@ -62,19 +62,36 @@ def _write_split_bundle(root: Path, *, bundle_name: str, child_names: list[str])
     bundle_dir = (root / bundle_name).resolve()
     children_dir = bundle_dir / "children"
     children_dir.mkdir(parents=True, exist_ok=True)
-    children_payload: list[dict[str, str]] = []
-    for child_name in child_names:
+    coverage_units: list[dict[str, str]] = []
+    children_payload: list[dict[str, object]] = []
+    for index, child_name in enumerate(child_names, start=1):
         final_effects_path = children_dir / child_name / "FINAL_EFFECTS.md"
         final_effects_path.parent.mkdir(parents=True, exist_ok=True)
         final_effects_path.write_text(f"# {child_name}\n\nDo the child work.\n", encoding="utf-8")
+        unit_id = f"u{index:02d}"
+        coverage_units.append(
+            {
+                "id": unit_id,
+                "requirement_text": f"Remaining work for {child_name}.",
+            }
+        )
         children_payload.append(
             {
                 "name": child_name,
                 "final_effects_file": str(final_effects_path.relative_to(bundle_dir)),
+                "covered_unit_ids": [unit_id],
             }
         )
     (bundle_dir / "proposal.json").write_text(
-        json.dumps({"version": 1, "children": children_payload}, indent=2, sort_keys=True),
+        json.dumps(
+            {
+                "version": 2,
+                "coverage_units": coverage_units,
+                "children": children_payload,
+            },
+            indent=2,
+            sort_keys=True,
+        ),
         encoding="utf-8",
     )
     return bundle_dir
@@ -95,16 +112,14 @@ def main() -> int:
         sys.path.insert(0, str(ROOT))
 
     try:
-        import loop.agent_api as agent_api_module
         from loop.agent_api import main as agent_api_main
         from loop.core import RouterCore, router_wakeup_socket_path
         from loop.events import (
             ActorKind,
             ActorRef,
+            RejectSplit,
             KERNEL_ATTEMPT_COUNT,
             KERNEL_NODE_ID,
-            RejectSplit,
-            RequestSplit,
         )
         from loop.node_table import (
             ComponentRuntimeState,
@@ -249,11 +264,18 @@ def main() -> int:
                 (first_bundle / "proposal.json").write_text(
                     json.dumps(
                         {
-                            "version": 1,
+                            "version": 2,
+                            "coverage_units": [
+                                {
+                                    "id": "u01",
+                                    "requirement_text": "mutated requirement",
+                                }
+                            ],
                             "children": [
                                 {
                                     "name": "mutated_child",
                                     "final_effects_file": "children/child_1/FINAL_EFFECTS.md",
+                                    "covered_unit_ids": ["u01"],
                                 }
                             ],
                         },
@@ -618,196 +640,7 @@ def main() -> int:
             if store.list_events_after(0):
                 return _fail("missing durable git baseline must not append a RequestSplit inbox item")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir)
-        db_path = tmp / "router.sqlite3"
-        final_effects_file = tmp / "FINAL_EFFECTS.md"
-        kernel_rollout_file = tmp / "kernel-rollout.jsonl"
-        final_effects_file.write_text("Implement correctly.\n", encoding="utf-8")
-        kernel_rollout_file.write_text('{"type":"session_meta","payload":{"id":"kernel-session-001","timestamp":"2026-04-03T00:30:00Z"}}\n', encoding="utf-8")
-
-        missing_exit_code, missing_payload = _run_main(
-            agent_api_main,
-            [
-                "start",
-                "--router-db",
-                str(db_path),
-                "--kernel-rollout-path",
-                str(kernel_rollout_file.resolve()),
-                "--kernel-started-at",
-                "2026-04-03T00:30:00Z",
-                "--final-effects-file",
-                str(final_effects_file.resolve()),
-            ],
-        )
-        if missing_exit_code == 0:
-            return _fail("start must reject missing kernel_session_id")
-        if str(missing_payload.get("reason_code") or "") != "MISSING_KERNEL_BOOTSTRAP_INPUT":
-            return _fail("start missing-input rejection must use a stable reason code")
-        missing_message = str(missing_payload.get("message") or "")
-        if "kernel_session_id" not in missing_message or "CODEX_THREAD_ID" not in missing_message:
-            return _fail("start missing-input rejection must tell Codex how to recover kernel_session_id")
-
-        original_spawn = agent_api_module._spawn_router_runtime
-        try:
-            def _fake_spawn_router_runtime(*, startup_result_path: Path, **kwargs):
-                del kwargs
-                startup_result_path.parent.mkdir(parents=True, exist_ok=True)
-                startup_result_path.write_text(
-                    json.dumps(
-                        {
-                            "accepted": True,
-                            "status": "STARTED",
-                            "message": "router started; root implementer launched",
-                            "kernel_session_id": "kernel-session-001",
-                            "root_node_id": "1",
-                            "root_actor_kind": "implementer",
-                            "root_attempt_count": 1,
-                            "root_pid": 12345,
-                            "root_process_birth_time": 1712275200.125,
-                            "root_session_id": "root-session-001",
-                            "root_rollout_path": str((tmp / "root-rollout.jsonl").resolve()),
-                        },
-                        sort_keys=True,
-                    ),
-                    encoding="utf-8",
-                )
-                class _DummyProcess:
-                    pid = 99991
-
-                    def poll(self):
-                        return None
-
-                return _DummyProcess()
-
-            agent_api_module._spawn_router_runtime = _fake_spawn_router_runtime
-            start_exit_code, start_payload = _run_main(
-                agent_api_main,
-                [
-                    "start",
-                    "--router-db",
-                    str(db_path),
-                    "--kernel-session-id",
-                    "kernel-session-001",
-                    "--kernel-rollout-path",
-                    str(kernel_rollout_file.resolve()),
-                    "--kernel-started-at",
-                    "2026-04-03T00:30:00Z",
-                    "--final-effects-file",
-                    str(final_effects_file.resolve()),
-                ],
-            )
-        finally:
-            agent_api_module._spawn_router_runtime = original_spawn
-
-        if start_exit_code != 0:
-            return _fail("start must surface a successful startup result from the runtime helper")
-        if start_payload.get("status") != "STARTED" or start_payload.get("root_node_id") != "1":
-            return _fail("start must print the runtime STARTED payload unchanged")
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir)
-        db_path = tmp / "router.sqlite3"
-        store = RouterStore(db_path)
-        workspace_root = tmp / "workspace"
-        workspace_root.mkdir(parents=True, exist_ok=True)
-        final_effects = workspace_root / "FINAL_EFFECTS.md"
-        final_effects.write_text("Do the work.\n", encoding="utf-8")
-        kernel_rollout_file = tmp / "kernel-rollout.jsonl"
-        kernel_rollout_file.write_text("{}", encoding="utf-8")
-        store.write_kernel_bootstrap_info(
-            kernel_session_id="kernel-session-xyz",
-            kernel_rollout_path=str(kernel_rollout_file.resolve()),
-            kernel_started_at="2026-04-06T08:44:00Z",
-        )
-        store.upsert_node(
-            NodeRuntimeRecord(
-                node_id="1",
-                parent_node_id="0",
-                child_node_ids=[],
-                workspace_root=str(workspace_root.resolve()),
-                final_effects_file=str(final_effects.resolve()),
-                split_request=1,
-                split_approved=0,
-                approved_split_request_seq=0,
-                evaluator_phase="",
-                checker_tasks_ref="",
-                task_result_refs={},
-                reviewer_verdict_kind="",
-                reviewer_report_ref="",
-                pending_prelude_lines=["resume line"],
-                current_components=[
-                    ActorRef(
-                        node_id="1",
-                        actor_kind=ActorKind.IMPLEMENTER,
-                        attempt_count=1,
-                    )
-                ],
-                durable_commit="abc123",
-                result_commit="",
-                escalated_to_kernel=False,
-                last_rejected_split_diff_fingerprint="",
-                components={
-                    component_key(actor_kind=ActorKind.IMPLEMENTER): ComponentRuntimeState(
-                        status=ComponentStatus.RUNNING,
-                        attempt_count=1,
-                        pid=4242,
-                        process_birth_time=1712390000.0,
-                        session_ids=["sess-1"],
-                        workspace_fingerprint_before="fp-before",
-                        saw_output_in_attempt=True,
-                        consecutive_no_progress=0,
-                        consecutive_failed_exits=0,
-                    )
-                },
-            )
-        )
-        seq = store.append_event(
-            RequestSplit(
-                actor=ActorRef(
-                    node_id="1",
-                    actor_kind=ActorKind.IMPLEMENTER,
-                    attempt_count=1,
-                ),
-                split_bundle_ref=str((tmp / "split-bundle").resolve()),
-                durable_commit="abc123",
-                diff_fingerprint="fp-1",
-                requested_at=now,
-            )
-        )
-        if int(seq) <= 0:
-            return _fail("status setup must append a RequestSplit event")
-
-        status_exit_code, status_payload = _run_main(
-            agent_api_main,
-            [
-                "status",
-                "--router-db",
-                str(db_path),
-            ],
-        )
-        if status_exit_code != 0 or status_payload.get("status") != "OK":
-            return _fail("status must return a stable OK payload")
-        router_meta = dict(status_payload.get("router_meta") or {})
-        if router_meta.get("kernel_session_id") != "kernel-session-xyz":
-            return _fail("status must expose kernel bootstrap metadata")
-        pending_reviews = list(status_payload.get("pending_split_reviews") or [])
-        if len(pending_reviews) != 1 or int(pending_reviews[0].get("request_seq") or 0) != int(seq):
-            return _fail("status must expose durable pending split reviews")
-        nodes = list(status_payload.get("nodes") or [])
-        if len(nodes) != 1:
-            return _fail("status must expose node state")
-        current_components = list(nodes[0].get("current_components") or [])
-        if len(current_components) != 1 or str(current_components[0].get("actor_kind") or "") != "implementer":
-            return _fail("status must expose node current_components state")
-        components = dict(nodes[0].get("components") or {})
-        if str(((components.get("implementer") or {}).get("status")) or "") != "running":
-            return _fail("status must expose component runtime status")
-        next_events = list(status_payload.get("next_pending_events") or [])
-        if len(next_events) != 1 or str(next_events[0].get("event_type") or "") != "RequestSplit":
-            return _fail("status must expose pending durable inbox events after last_applied_seq")
-
-    print("[loop-system-router-agent-api][PASS] request-split enqueues once, blocks duplicate-after-rejection, re-allows after effective diff changes, start returns stable JSON, and status surfaces durable router state")
+    print("[loop-system-router-agent-api][PASS] request-split enqueues once and enforces the durable split request contract")
     return 0
 
 

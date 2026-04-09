@@ -152,6 +152,8 @@ class RouterStore:
                     kernel_rollout_path TEXT NOT NULL,
                     kernel_started_at TEXT NOT NULL,
                     router_status TEXT NOT NULL DEFAULT '',
+                    router_paused_reason_json TEXT NOT NULL DEFAULT '',
+                    router_paused_at TEXT NOT NULL DEFAULT '',
                     router_terminal_reason_json TEXT NOT NULL DEFAULT '',
                     router_terminal_at TEXT NOT NULL DEFAULT '',
                     router_completed_result_commit TEXT NOT NULL DEFAULT '',
@@ -163,6 +165,16 @@ class RouterStore:
             self._ensure_router_meta_column(
                 conn,
                 "router_status",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_router_meta_column(
+                conn,
+                "router_paused_reason_json",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_router_meta_column(
+                conn,
+                "router_paused_at",
                 "TEXT NOT NULL DEFAULT ''",
             )
             self._ensure_router_meta_column(
@@ -199,13 +211,15 @@ class RouterStore:
                     kernel_rollout_path,
                     kernel_started_at,
                     router_status,
+                    router_paused_reason_json,
+                    router_paused_at,
                     router_terminal_reason_json,
                     router_terminal_at,
                     router_completed_result_commit,
                     router_completed_report_ref,
                     router_completed_at
                 )
-                VALUES (1, 0, '', '', '', '', '', '', '', '', '')
+                VALUES (1, 0, '', '', '', '', '', '', '', '', '', '', '')
                 """
             )
     def append_event(
@@ -614,6 +628,24 @@ class RouterStore:
             return ""
         return str(row["router_terminal_at"])
 
+    def read_router_paused_reason_json(self) -> str:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT router_paused_reason_json FROM router_meta WHERE singleton = 1"
+            ).fetchone()
+        if row is None:
+            return ""
+        return str(row["router_paused_reason_json"])
+
+    def read_router_paused_at(self) -> str:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT router_paused_at FROM router_meta WHERE singleton = 1"
+            ).fetchone()
+        if row is None:
+            return ""
+        return str(row["router_paused_at"])
+
     def read_router_completed_result_commit(self) -> str:
         with self._connect() as conn:
             row = conn.execute(
@@ -653,6 +685,8 @@ class RouterStore:
                 """
                 UPDATE router_meta
                 SET router_status = ?,
+                    router_paused_reason_json = '',
+                    router_paused_at = '',
                     router_terminal_reason_json = ?,
                     router_terminal_at = ?
                 WHERE singleton = 1
@@ -661,6 +695,34 @@ class RouterStore:
                     str(router_status),
                     str(router_terminal_reason_json),
                     str(router_terminal_at),
+                ),
+            )
+
+    def write_router_paused_state(
+        self,
+        *,
+        router_status: str,
+        router_paused_reason_json: str,
+        router_paused_at: str,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE router_meta
+                SET router_status = ?,
+                    router_paused_reason_json = ?,
+                    router_paused_at = ?,
+                    router_terminal_reason_json = '',
+                    router_terminal_at = '',
+                    router_completed_result_commit = '',
+                    router_completed_report_ref = '',
+                    router_completed_at = ''
+                WHERE singleton = 1
+                """,
+                (
+                    str(router_status),
+                    str(router_paused_reason_json),
+                    str(router_paused_at),
                 ),
             )
 
@@ -677,6 +739,8 @@ class RouterStore:
                 """
                 UPDATE router_meta
                 SET router_status = ?,
+                    router_paused_reason_json = '',
+                    router_paused_at = '',
                     router_terminal_reason_json = '',
                     router_terminal_at = '',
                     router_completed_result_commit = ?,
@@ -690,6 +754,35 @@ class RouterStore:
                     str(router_completed_report_ref),
                     str(router_completed_at),
                 ),
+            )
+
+    def clear_router_pause_state(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE router_meta
+                SET router_status = '',
+                    router_paused_reason_json = '',
+                    router_paused_at = ''
+                WHERE singleton = 1
+                """
+            )
+
+    def clear_router_outcome_state(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE router_meta
+                SET router_status = '',
+                    router_paused_reason_json = '',
+                    router_paused_at = '',
+                    router_terminal_reason_json = '',
+                    router_terminal_at = '',
+                    router_completed_result_commit = '',
+                    router_completed_report_ref = '',
+                    router_completed_at = ''
+                WHERE singleton = 1
+                """
             )
 
     def _connect(self) -> sqlite3.Connection:

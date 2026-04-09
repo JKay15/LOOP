@@ -31,7 +31,8 @@ The router persists durable state in `router.db`, tracks runtime actor state per
 ## Repository Layout
 
 - `loop/`: router core, runtime, launch, storage, feedback, and CLI API.
-- `scripts/routerctl.sh`: main operator entrypoint.
+- `scripts/routerapi.sh`: router/operator control entrypoint.
+- `scripts/routerctl.sh`: actor-facing completion and split entrypoint.
 - `tests/`: focused router/runtime/evaluator tests.
 
 ## Install
@@ -45,7 +46,19 @@ uv sync
 
 ## Main Control Surface
 
-The normal entrypoint is:
+Router/operator control goes through:
+
+```bash
+./scripts/routerapi.sh --help
+```
+
+`routerapi.sh` is a thin wrapper around:
+
+```bash
+uv run --project . --locked python -m loop.router_api
+```
+
+Actor completions and split requests still go through:
 
 ```bash
 ./scripts/routerctl.sh --help
@@ -57,7 +70,7 @@ The normal entrypoint is:
 uv run --project . --locked python -m loop.agent_api
 ```
 
-The router API is intentionally workspace-oriented: actor completions, reviewer reports, feedback ledgers, and runtime artifacts all live under the active workspace.
+The router API remains workspace-oriented: actor completions, reviewer reports, feedback ledgers, and runtime artifacts all live under the active workspace.
 
 ## Runtime Model
 
@@ -104,6 +117,7 @@ Useful checks:
 
 ```bash
 python3 -m py_compile loop/*.py tests/*.py
+python3 tests/check_loop_system_repo_router_api.py
 python3 tests/check_loop_system_repo_router_agent_api.py
 python3 tests/check_loop_system_repo_router_agent_api_evaluator.py
 python3 tests/check_loop_system_repo_router_core.py

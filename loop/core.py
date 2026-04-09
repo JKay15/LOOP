@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import socket
@@ -23,6 +24,22 @@ from loop.completion import (
     is_router_runtime_metadata_path,
     workspace_output_fingerprint,
 )
+from loop.evaluator_runtime import (
+    active_feedback_path as node_active_feedback_path,
+    ai_user_accepted_result_path,
+    ai_user_artifacts_dir,
+    ai_user_current_result_path,
+    checker_accepted_tasks_path,
+    checker_current_tasks_path,
+    feedback_history_path as node_feedback_history_path,
+    reviewer_accepted_feedback_path,
+    reviewer_accepted_report_path,
+    reviewer_current_feedback_path,
+    reviewer_current_report_path,
+    reviewer_feedback_submission_snapshot_path as reviewer_submission_snapshot_path,
+    tester_accepted_result_path,
+    tester_current_result_path,
+)
 from loop.events import (
     ActorKind,
     ApproveSplit,
@@ -30,11 +47,7 @@ from loop.events import (
     RejectSplit,
     TakeoverResolved,
 )
-from loop.feedback import (
-    active_feedback_path,
-    feedback_history_path,
-    reviewer_feedback_submission_snapshot_path,
-)
+from loop.feedback import active_feedback_path, feedback_history_path
 from loop.node_table import (
     ComponentStatus,
     NodeRuntimeRecord,
@@ -43,8 +56,9 @@ from loop.node_table import (
     component_keys_for_kind,
 )
 from loop.proc import ProcSupervisor
+from loop.split_contract import SplitProposal, parse_split_bundle
 from loop.store import PendingSplitReview, RouterStore, StoredRouterInboxItem
-from loop.runtime_noise import is_runtime_noise_path
+from loop.runtime_noise import is_non_substantive_workspace_path
 
 ACTOR_MAX_NO_PROGRESS_WINDOWS = 5
 ACTOR_MAX_FAILED_EXITS = 3
@@ -68,6 +82,26 @@ def _resolve_workspace_durable_commit(workspace_root: Path) -> str:
     if proc.returncode != 0:
         return ""
     return str(proc.stdout or "").strip()
+
+
+def _create_workspace_result_commit(
+    workspace_root: Path,
+    *,
+    paths: list[str],
+) -> str:
+    resolved = Path(workspace_root).expanduser().resolve()
+    if not paths:
+        return _resolve_workspace_durable_commit(resolved)
+    _run_git(resolved, "add", "-A", "--", *paths)
+    _run_git(
+        resolved,
+        "commit",
+        "-m",
+        "LOOP result commit",
+        "--",
+        *paths,
+    )
+    return _resolve_workspace_durable_commit(resolved)
 
 
 def _run_git(
@@ -115,7 +149,7 @@ def _substantive_git_dirty_paths(workspace_root: Path) -> list[str]:
             relpath = str(raw_line or "").strip()
             if not relpath:
                 continue
-            if is_runtime_noise_path(relpath) or is_router_runtime_metadata_path(relpath):
+            if is_non_substantive_workspace_path(relpath) or is_router_runtime_metadata_path(relpath):
                 continue
             paths.add(relpath)
     return sorted(paths)
@@ -125,6 +159,20 @@ def _relative_path_within_workspace(*, workspace_root: Path, file_path: Path) ->
     resolved_workspace = Path(workspace_root).expanduser().resolve()
     resolved_file = Path(file_path).expanduser().resolve()
     return resolved_file.relative_to(resolved_workspace)
+
+
+def _materialize_workspace_file_into_worktree(
+    *,
+    source_file: Path,
+    target_file: Path,
+    missing_error: str,
+) -> None:
+    source_resolved = Path(source_file).expanduser().resolve()
+    if not source_resolved.exists() or not source_resolved.is_file():
+        raise InvalidSplitBundleError(missing_error)
+    target_resolved = Path(target_file).expanduser().resolve()
+    target_resolved.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_resolved, target_resolved)
 
 
 class RouterBusinessError(Exception):
@@ -141,6 +189,30 @@ class RouterBusinessError(Exception):
 
 class RouterStartError(RouterBusinessError):
     """Stable router start rejection."""
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "accepted": False,
+            "status": "REJECTED",
+            "reason_code": self.reason_code,
+            "message": self.message,
+        }
+
+
+class RouterResumeError(RouterBusinessError):
+    """Stable router resume rejection."""
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "accepted": False,
+            "status": "REJECTED",
+            "reason_code": self.reason_code,
+            "message": self.message,
+        }
+
+
+class RouterPauseError(RouterBusinessError):
+    """Stable router pause rejection."""
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -379,6 +451,7 @@ class RouterCore:
             self._split_approved_output_counts.clear()
             self._ensure_proc_supervisor().start()
             request_terminal_shutdown = str(self._store.read_router_status() or "").strip() in {
+                "paused",
                 "terminal_failed",
                 "completed",
             }
@@ -499,6 +572,241 @@ class RouterCore:
             ),
         }
 
+    def prepare_resume(
+        self,
+        *,
+        append_final_effects_ref: str | Path | None = None,
+    ) -> dict[str, object]:
+        router_status = str(self._store.read_router_status() or "").strip()
+        append_ref = (
+            None
+            if append_final_effects_ref is None
+            else Path(append_final_effects_ref).expanduser().resolve()
+        )
+        if append_ref is None:
+            if router_status == "paused":
+                self._store.clear_router_pause_state()
+                return {
+                    "accepted": True,
+                    "status": "RESUME_PREPARED",
+                    "resume_mode": "paused",
+                }
+            if router_status != "terminal_failed":
+                raise RouterResumeError(
+                    reason_code="INVALID_RESUME_STATE",
+                    message=(
+                        "router resume rejected: recovery without appended final effects requires "
+                        "router_status=paused or router_status=terminal_failed."
+                    ),
+                )
+            recovered_components = 0
+            updated_records: list[NodeRuntimeRecord] = []
+            for record in self._store.list_nodes():
+                updated_record, recovered_count = self._prepare_terminal_failed_record_resume(record)
+                if recovered_count <= 0:
+                    continue
+                recovered_components += int(recovered_count)
+                updated_records.append(updated_record)
+            if recovered_components <= 0:
+                raise RouterResumeError(
+                    reason_code="NOTHING_TO_RESUME",
+                    message=(
+                        "router resume rejected: terminal_failed run has no recoverable unfinished frontier components."
+                    ),
+                )
+            self._store.clear_router_outcome_state()
+            if updated_records:
+                self._store.upsert_nodes(updated_records)
+            return {
+                "accepted": True,
+                "status": "RESUME_PREPARED",
+                "resume_mode": "terminal_failed",
+                "recovered_components": int(recovered_components),
+            }
+
+        if not append_ref.exists() or not append_ref.is_file():
+            raise RouterResumeError(
+                reason_code="INVALID_APPEND_FINAL_EFFECTS",
+                message="router resume rejected: append-final-effects-ref must exist and be a regular file.",
+            )
+        appended_text = append_ref.read_text(encoding="utf-8").strip()
+        if not appended_text:
+            raise RouterResumeError(
+                reason_code="INVALID_APPEND_FINAL_EFFECTS",
+                message="router resume rejected: append-final-effects-ref must be non-empty.",
+            )
+        if router_status == "paused":
+            _root_record, final_effects_path = self._resolve_root_append_final_effects_target()
+            self._append_final_effects(final_effects_path, append_ref)
+            self._store.clear_router_pause_state()
+            return {
+                "accepted": True,
+                "status": "RESUME_PREPARED",
+                "resume_mode": "paused_append",
+                "final_effects_file": str(final_effects_path),
+            }
+        if router_status == "terminal_failed":
+            recovered_components = 0
+            updated_records: list[NodeRuntimeRecord] = []
+            for record in self._store.list_nodes():
+                updated_record, recovered_count = self._prepare_terminal_failed_record_resume(record)
+                if recovered_count <= 0:
+                    continue
+                recovered_components += int(recovered_count)
+                updated_records.append(updated_record)
+            if recovered_components <= 0:
+                raise RouterResumeError(
+                    reason_code="NOTHING_TO_RESUME",
+                    message=(
+                        "router resume rejected: terminal_failed run has no recoverable unfinished frontier components."
+                    ),
+                )
+            _root_record, final_effects_path = self._resolve_root_append_final_effects_target()
+            self._append_final_effects(final_effects_path, append_ref)
+            self._store.clear_router_outcome_state()
+            if updated_records:
+                self._store.upsert_nodes(updated_records)
+            return {
+                "accepted": True,
+                "status": "RESUME_PREPARED",
+                "resume_mode": "terminal_failed_append",
+                "recovered_components": int(recovered_components),
+                "final_effects_file": str(final_effects_path),
+            }
+        if router_status != "completed":
+            raise RouterResumeError(
+                reason_code="INVALID_RESUME_STATE",
+                message=(
+                    "router resume rejected: append-final-effects recovery requires "
+                    "router_status=paused, router_status=terminal_failed, or router_status=completed."
+                ),
+            )
+        completed_source = self._resolve_completed_resume_source_record()
+        root_record = self._store.load_node(ROOT_NODE_ID)
+        if root_record is None:
+            raise RouterResumeError(
+                reason_code="MISSING_ROOT_NODE",
+                message="router resume rejected: completed run has no durable root node.",
+            )
+        prior_result_commit = str(completed_source.result_commit or "").strip()
+        if not prior_result_commit:
+            raise RouterResumeError(
+                reason_code="MISSING_RESULT_COMMIT",
+                message="router resume rejected: completed run has no durable result_commit to extend from.",
+            )
+        final_effects_path = Path(completed_source.final_effects_file).expanduser().resolve()
+        self._append_final_effects(final_effects_path, append_ref)
+        resumed_root = self._prepare_completed_root_resume(
+            root_record=root_record,
+            completed_source=completed_source,
+            final_effects_path=final_effects_path,
+        )
+        updated_records = [resumed_root]
+        kernel_record = self._store.load_node(KERNEL_NODE_ID)
+        if kernel_record is not None:
+            updated_records.append(self._prepare_completed_kernel_resume(kernel_record))
+        self._store.clear_router_outcome_state()
+        self._store.upsert_nodes(updated_records)
+        return {
+            "accepted": True,
+            "status": "RESUME_PREPARED",
+            "resume_mode": "completed_append",
+            "final_effects_file": str(final_effects_path),
+            "base_result_commit": prior_result_commit,
+        }
+
+    def prepare_pause(
+        self,
+        *,
+        reason: str | None = None,
+    ) -> dict[str, object]:
+        router_status = str(self._store.read_router_status() or "").strip()
+        if router_status == "paused":
+            raise RouterPauseError(
+                reason_code="INVALID_PAUSE_STATE",
+                message="router pause rejected: router_status=paused already.",
+            )
+        if router_status in {"terminal_failed", "completed"}:
+            raise RouterPauseError(
+                reason_code="INVALID_PAUSE_STATE",
+                message=(
+                    "router pause rejected: only active runs can be paused; "
+                    "router_status must not be terminal_failed or completed."
+                ),
+            )
+        if not self._store.list_nodes():
+            raise RouterPauseError(
+                reason_code="NOTHING_TO_PAUSE",
+                message="router pause rejected: no durable run state exists yet.",
+            )
+        reason_payload = {
+            "reason": str(reason or "").strip(),
+        }
+        self._store.write_router_paused_state(
+            router_status="paused",
+            router_paused_reason_json=json.dumps(reason_payload, sort_keys=True),
+            router_paused_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return {
+            "accepted": True,
+            "status": "PAUSE_PREPARED",
+            "pause_mode": "paused",
+        }
+
+    def _resolve_completed_resume_source_record(self) -> NodeRuntimeRecord:
+        completed_result_commit = str(self._store.read_router_completed_result_commit() or "").strip()
+        completed_report_ref = self._normalize_ref_path(
+            str(self._store.read_router_completed_report_ref() or "").strip()
+        )
+        if not completed_result_commit:
+            raise RouterResumeError(
+                reason_code="MISSING_RESULT_COMMIT",
+                message="router resume rejected: completed run has no durable result_commit to extend from.",
+            )
+        commit_matches = [
+            record
+            for record in self._store.list_nodes()
+            if str(record.result_commit or "").strip() == completed_result_commit
+        ]
+        if not commit_matches:
+            raise RouterResumeError(
+                reason_code="MISSING_COMPLETED_SOURCE",
+                message=(
+                    "router resume rejected: completed run has no durable node carrying the completed result_commit."
+                ),
+            )
+        if completed_report_ref:
+            matched = [
+                record
+                for record in commit_matches
+                if self._normalize_ref_path(str(record.reviewer_report_ref or "").strip())
+                == completed_report_ref
+            ]
+            if len(matched) == 1:
+                return matched[0]
+            if len(matched) > 1:
+                raise RouterResumeError(
+                    reason_code="AMBIGUOUS_COMPLETED_SOURCE",
+                    message=(
+                        "router resume rejected: multiple durable nodes match the completed result/report pair."
+                    ),
+                )
+        if len(commit_matches) == 1:
+            return commit_matches[0]
+        raise RouterResumeError(
+            reason_code="AMBIGUOUS_COMPLETED_SOURCE",
+            message=(
+                "router resume rejected: multiple durable nodes share the completed result_commit; "
+                "cannot determine the final completed source node."
+            ),
+        )
+
+    def _normalize_ref_path(self, raw_ref: str) -> str:
+        raw = str(raw_ref or "").strip()
+        if not raw:
+            return ""
+        return str(Path(raw).expanduser().resolve())
+
     def _ensure_proc_supervisor(self) -> ProcSupervisor:
         if self._proc_supervisor is None:
             self._proc_supervisor = ProcSupervisor(
@@ -506,6 +814,150 @@ class RouterCore:
                 event_notifier=lambda: notify_router_wakeup(self._wakeup_socket_path),
             )
         return self._proc_supervisor
+
+    def _append_final_effects(self, final_effects_path: Path, append_ref: Path) -> None:
+        original_text = final_effects_path.read_text(encoding="utf-8").rstrip()
+        appended_text = append_ref.read_text(encoding="utf-8").strip()
+        merged = (
+            f"{original_text}\n\n"
+            "## Appended Final Effects\n\n"
+            f"{appended_text}\n"
+        )
+        final_effects_path.write_text(merged, encoding="utf-8")
+
+    def _resolve_root_append_final_effects_target(self) -> tuple[NodeRuntimeRecord, Path]:
+        root_record = self._store.load_node(ROOT_NODE_ID)
+        if root_record is None:
+            raise RouterResumeError(
+                reason_code="MISSING_ROOT_NODE",
+                message="router resume rejected: run has no durable root node.",
+            )
+        final_effects_raw = str(root_record.final_effects_file or "").strip()
+        if not final_effects_raw:
+            raise RouterResumeError(
+                reason_code="INVALID_FINAL_EFFECTS_TARGET",
+                message="router resume rejected: root FINAL_EFFECTS target is missing.",
+            )
+        final_effects_path = Path(final_effects_raw).expanduser().resolve()
+        if not final_effects_path.exists() or not final_effects_path.is_file():
+            raise RouterResumeError(
+                reason_code="INVALID_FINAL_EFFECTS_TARGET",
+                message=(
+                    "router resume rejected: root FINAL_EFFECTS target must exist and be a regular file."
+                ),
+            )
+        return root_record, final_effects_path
+
+    def _prepare_terminal_failed_record_resume(
+        self,
+        record: NodeRuntimeRecord,
+    ) -> tuple[NodeRuntimeRecord, int]:
+        if not self._record_is_unfinished_frontier(record):
+            return record, 0
+        updated_components = dict(record.components)
+        recovered_keys: list[str] = []
+        for key, component in record.components.items():
+            if component.status is not ComponentStatus.TERMINAL_FAILED:
+                continue
+            updated_components[key] = replace(
+                component,
+                status=ComponentStatus.INACTIVE,
+                consecutive_failed_exits=0,
+                consecutive_no_progress=0,
+            )
+            recovered_keys.append(key)
+        if not recovered_keys:
+            return record, 0
+        next_current_components = [
+            actor_ref
+            for actor_ref in record.current_components
+            if component_key_for_actor(actor_ref) not in set(recovered_keys)
+        ]
+        return (
+            replace(
+                record,
+                components=updated_components,
+                current_components=next_current_components,
+                pending_prelude_lines=[
+                    "Router resume after manual terminal-failure recovery.",
+                ],
+            ),
+            len(recovered_keys),
+        )
+
+    def _prepare_completed_root_resume(
+        self,
+        *,
+        root_record: NodeRuntimeRecord,
+        completed_source: NodeRuntimeRecord,
+        final_effects_path: Path,
+    ) -> NodeRuntimeRecord:
+        updated_components = dict(root_record.components)
+        implementer_key = component_key(actor_kind=ActorKind.IMPLEMENTER)
+        implementer_component = updated_components.get(implementer_key)
+        if implementer_component is not None:
+            updated_components[implementer_key] = replace(
+                implementer_component,
+                status=ComponentStatus.INACTIVE,
+                consecutive_failed_exits=0,
+                consecutive_no_progress=0,
+            )
+        return replace(
+            root_record,
+            child_node_ids=[],
+            workspace_root=str(Path(completed_source.workspace_root).expanduser().resolve()),
+            final_effects_file=str(final_effects_path),
+            split_request=0,
+            split_approved=0,
+            approved_split_request_seq=0,
+            durable_commit=str(completed_source.result_commit or "").strip(),
+            result_commit="",
+            evaluator_phase="",
+            checker_tasks_ref="",
+            task_result_refs={},
+            reviewer_verdict_kind="",
+            reviewer_report_ref="",
+            escalated_to_kernel=False,
+            last_rejected_split_diff_fingerprint="",
+            pending_prelude_lines=[
+                "Router resume after completed run extension.",
+                "This node resumes from a previously completed root result.",
+                "The current FINAL_EFFECTS.md contains both previously completed obligations and newly appended obligations.",
+                "Preserve the previously completed obligations while implementing the newly appended obligations.",
+                "If new obligations conflict with previously completed obligations, report the conflict concretely and implement the maximally compatible result honestly.",
+            ],
+            current_components=[],
+            components=updated_components,
+        )
+
+    def _prepare_completed_kernel_resume(self, kernel_record: NodeRuntimeRecord) -> NodeRuntimeRecord:
+        updated_components = {
+            key: replace(
+                component,
+                status=ComponentStatus.INACTIVE,
+                consecutive_failed_exits=0,
+                consecutive_no_progress=0,
+            )
+            for key, component in kernel_record.components.items()
+        }
+        return replace(
+            kernel_record,
+            child_node_ids=[],
+            split_request=0,
+            split_approved=0,
+            approved_split_request_seq=0,
+            evaluator_phase="",
+            checker_tasks_ref="",
+            task_result_refs={},
+            reviewer_verdict_kind="",
+            reviewer_report_ref="",
+            pending_prelude_lines=[],
+            current_components=[],
+            result_commit="",
+            escalated_to_kernel=False,
+            last_rejected_split_diff_fingerprint="",
+            components=updated_components,
+        )
 
     def _terminate_process_best_effort(self, process: Any) -> None:
         terminate = getattr(process, "terminate", None)
@@ -559,22 +1011,22 @@ class RouterCore:
             return lines
         if actor_kind is ActorKind.EVALUATOR_CHECKER:
             lines.append(
-                f"- Write the checker task manifest, then use: {routerctl} complete --tasks-ref <path>"
+                f"- Write the canonical checker manifest path injected by router, then use: {routerctl} complete --tasks-ref <path>"
             )
             return lines
         if actor_kind is ActorKind.EVALUATOR_TESTER:
             lines.append(
-                f"- Write the global test-AI review report, then use: {routerctl} complete --result-ref <path>"
+                f"- Write the canonical tester result path injected by router, then use: {routerctl} complete --result-ref <path>"
             )
             return lines
         if actor_kind is ActorKind.EVALUATOR_AI_USER:
             lines.append(
-                f"- Write this AI-user task result, then use: {routerctl} complete --result-ref <path>"
+                f"- Write the canonical AI-user lane result path injected by router, then use: {routerctl} complete --result-ref <path>"
             )
             return lines
         if actor_kind is ActorKind.EVALUATOR_REVIEWER:
             lines.append(
-                f"- Write feedback.json first, then reviewer_report.md, then use: {routerctl} complete --verdict-kind <OK|IMPLEMENTER_ACTION_REQUIRED|EVALUATOR_FAULT> --report-ref <path> --feedback-ref <path>"
+                f"- Write the canonical reviewer feedback.json first, then the canonical reviewer report path, then use: {routerctl} complete --verdict-kind <OK|IMPLEMENTER_ACTION_REQUIRED|EVALUATOR_FAULT> --report-ref <path> --feedback-ref <path>"
             )
             return lines
         if actor_kind is ActorKind.KERNEL:
@@ -588,6 +1040,156 @@ class RouterCore:
             return lines
         return lines
 
+    def _build_implementer_prompt_lines(
+        self,
+        *,
+        routerctl: Path,
+    ) -> list[str]:
+        split_guide = (Path(__file__).resolve().parents[1] / "IMPLEMENTER_SPLIT_GUIDE.md").resolve()
+        return [
+            "Implementer role:",
+            "- Your job is to satisfy FINAL_EFFECTS.md in the current workspace.",
+            "- The implementation you leave behind must itself be the finished deliverable, not merely a path toward one.",
+            "- Do not treat helper materials, cached references, fetched examples, temporary scaffolds, or copied comparison artifacts as the finished result unless FINAL_EFFECTS.md explicitly allows that.",
+            "",
+            "Authority order:",
+            "1. FINAL_EFFECTS.md defines the actual target.",
+            "2. Reviewer feedback and router feedback history provide correction context.",
+            "3. Helper/reference material is supporting evidence only; it does not replace FINAL_EFFECTS.md.",
+            "",
+            "Implementation integrity:",
+            "- Before declaring completion, check the cheapest concrete way the work could still be falsely 'done'.",
+            "- If that cheap failure mode is still live, do not complete yet.",
+            "- The completion claim you submit must match the current workspace state directly.",
+            "- Do not rely on hidden manual steps, temporary runtime conditions, or uncommitted follow-up cleanup to make the result seem complete.",
+            "",
+            "Ground-truth rule:",
+            "- If FINAL_EFFECTS.md names a real comparison target, required behavior, or required deliverable form, validate against that target directly.",
+            "- Do not substitute helper/reference material for the real target unless FINAL_EFFECTS.md explicitly says it is authoritative.",
+            "",
+            "Split interface:",
+            "- `split` means proposing to kernel that the remaining unfinished scope of the parent FINAL_EFFECTS.md should be decomposed into multiple child nodes, with optional explicit `parent_after_merge` residual work.",
+            f"- To request split, write a split bundle directory and call: `{routerctl} request-split --split-bundle-ref <bundle_dir>`",
+            "- A split bundle must contain:",
+            "  - `proposal.json` with `version = 2`",
+            "  - one child FINAL_EFFECTS file for each proposed child",
+            "  - optional `parent_after_merge/FINAL_EFFECTS.md` if explicit residual parent work must remain after child merge",
+            "- Do not request split for confusion, partial progress, or vague planning.",
+            "",
+            "Split gate:",
+            "- Consider split only after you have already made real implementation progress in the current workspace.",
+            "- Split is allowed when the remaining unfinished scope can be partitioned with zero semantic omission into multiple concrete child scopes that can each make meaningful parallel progress before final merge.",
+            "- Do not require near-total independence: shared later integration boundaries or a shared central theorem target do not by themselves make split inappropriate.",
+            "- Prefer split whenever parallel child progress is reasonably likely to reduce time-to-truth, expose decisive evidence faster, or outperform purely serial continuation.",
+            "- If child merge would still leave explicit parent residual work, do not call `complete` until that residual is finished in the merged workspace.",
+            f"- Before calling `{routerctl} request-split --split-bundle-ref <bundle_dir>`, you must read the shared split guide at `{split_guide}` because it contains the full split contract and complete `proposal.json v2` schema.",
+            "",
+            "Post-split behavior:",
+            f"- After `{routerctl} request-split --split-bundle-ref <bundle_dir>` succeeds, stop the current attempt. Router and kernel now own the split decision.",
+            "- If the split is rejected and you are relaunched on this same node, continue implementing this node instead of trying to re-argue the same split immediately.",
+            "- Do not submit another split request after rejection unless there is new effective implementation progress and a materially improved split case.",
+            "- If the split is approved, child nodes run first.",
+            "- After child work returns, your responsibility is the merged parent workspace, not just the pre-split parent workspace.",
+            "- If you are resumed after child completion, finish the merge closeout for the parent node:",
+            "  - resolve merge conflicts if needed,",
+            "  - incorporate merged child outputs,",
+            "  - finish any explicit `parent_after_merge` residual work,",
+            f"  - and only then call `{routerctl} complete`.",
+            "- Parent completion after a split still means the merged parent workspace honestly satisfies the original parent FINAL_EFFECTS.md.",
+            "",
+            "Authority-grounded rebuttal rule:",
+            "- Active feedback, checker-derived tasks, and reviewer findings are routing inputs, not higher authority than FINAL_EFFECTS.md.",
+            "- If a checker-derived task, active finding, or reviewer instruction appears to narrow FINAL_EFFECTS.md beyond what its text actually supports, do not silently comply.",
+            "",
+            "Required rebuttal behavior:",
+            "- Cite the controlling FINAL_EFFECTS.md text.",
+            "- State what stronger interpretation is being imposed.",
+            "- Explain why that interpretation is a semantic narrowing rather than a necessary operational clarification.",
+            "- State the more faithful interpretation you are following.",
+            "",
+            "Execution rule:",
+            "- After an authority-grounded rebuttal, continue with the most faithful implementation allowed by FINAL_EFFECTS.md and current evidence.",
+            "- If there is a real conflict between old obligations and new instructions, report the conflict explicitly and implement the maximally compatible result honestly.",
+            "- Do not treat checker/task self-consistency as sufficient when it conflicts with the authoritative requirement text.",
+        ]
+
+    def _build_kernel_split_review_prompt_lines(self) -> list[str]:
+        return [
+            "Kernel split-review role:",
+            "- You are reviewing one pending implementer split request.",
+            "- Approve only when the proposal is both coverage-complete and operationally worthwhile.",
+            "- Reject when the proposal is incomplete, ambiguous, structurally unsound, or not worth the extra orchestration cost.",
+            "",
+            "Authority order:",
+            "1. The parent node's FINAL_EFFECTS.md defines the parent's true target.",
+            "2. The frozen split bundle's proposal.json is the sole truth of the split proposal.",
+            "3. The frozen child FINAL_EFFECTS files and optional parent_after_merge FINAL_EFFECTS file define the proposed delegated/residual scopes.",
+            "4. The current parent workspace and current parent git diff provide evidence for whether this split is worth approving now.",
+            "",
+            "Zero-omission rule:",
+            "- Treat the parent FINAL_EFFECTS.md as the authoritative scope.",
+            "- coverage_units must account for every still-unfinished requirement, constraint, acceptance condition, and integration dependency from the parent FINAL_EFFECTS.md that matters to honest completion.",
+            "- It is not enough to cover the obvious headline tasks; layout constraints, interaction requirements, deliverable-form requirements, and cross-part integration constraints must also be preserved if they remain unfinished.",
+            "- Every still-unfinished piece of parent scope must appear in at least one coverage unit.",
+            "- If a parent requirement is only partially delegated, the undelegated remainder must be made explicit in parent_after_merge.",
+            "- The union of all child FINAL_EFFECTS scopes, plus parent_after_merge scope if present, must preserve the full remaining unfinished meaning of the parent FINAL_EFFECTS.md.",
+            "- If any remaining requirement could disappear, become weaker, or become ownerless under the proposal, reject the split.",
+            "",
+            "Parallelism rules:",
+            "- Children must be independently implementable enough that parallel work is likely to produce meaningful progress before final merge; perfect independence is not required.",
+            "- Children must not have overlapping ownership of the same coverage unit.",
+            "- Children must not be defined so that their normal success path requires repeated simultaneous ownership of the same integration boundary.",
+            "- Shared later integration boundaries or a shared central theorem target do not by themselves make a split invalid.",
+            "- If two children are expected to make normal, repeated changes across the same tightly shared implementation surface, approval should turn on whether substantial parallel progress still exists before that merge point.",
+            "- Reject splits only when overlap or cross-child blocking dominates the normal success path strongly enough that likely integration cost outweighs the benefit of parallel progress.",
+            "",
+            "System-pressure thresholds:",
+            "- If active system node count is below 20, use the normal approval bar.",
+            "- If active system node count is 20-49, require clearly independent child scopes.",
+            "- If active system node count is 50-99, approve only if the split is unusually clean and likely to reduce a real bottleneck.",
+            "- If active system node count is 100 or higher, reject by default.",
+            "- As open split-approved node count increases, tighten the approval bar further.",
+            "",
+            "Parent implementation rule:",
+            "- Reject splits that appear to push essentially all real implementation downward while the parent contributes little beyond decomposition.",
+            "- Inspect the current parent workspace and current parent git diff against the durable commit baseline.",
+            "- If the parent has not made real implementation progress in the current workspace, the approval bar should be much higher.",
+            "",
+            "Parent-after-merge rule:",
+            "- parent_after_merge is allowed only for explicit residual work that truly remains after child outputs are merged.",
+            "- parent_after_merge must not be used as a vague catch-all bucket.",
+            "- If parent_after_merge exists, its FINAL_EFFECTS file must make that residual scope concrete enough for later implementation and evaluation.",
+            "",
+            "Required review steps:",
+            "1. Read the parent FINAL_EFFECTS.md.",
+            "2. Read the frozen proposal.json.",
+            "3. Read every child FINAL_EFFECTS file in the frozen bundle.",
+            "4. If parent_after_merge exists, read its FINAL_EFFECTS file.",
+            "5. Inspect the current parent workspace and the current parent git diff against the durable baseline.",
+            "6. Decide whether the proposal is coverage-complete, non-overlapping, actually parallelizable, worth approving now, and still justified under current system pressure.",
+            "",
+            "Decision rule:",
+            "- APPROVE only if both are true:",
+            "  1. the proposal is zero-omission and structurally sound;",
+            "  2. the split is worth the added orchestration overhead at the current subtree scale.",
+            "- Otherwise REJECT.",
+        ]
+
+    def _build_kernel_takeover_prompt_lines(self) -> list[str]:
+        return [
+            "Kernel final-closeout role:",
+            "- You are taking over final closeout for the entire LOOP subtree from the current merged workspace state.",
+            "- This is not a split-review task.",
+            "- Treat the current workspace and FINAL_EFFECTS.md as the authoritative closeout target.",
+            "- Make any final integrated implementation changes needed before the closing evaluator wave.",
+            "",
+            "Closeout rules:",
+            "- Do not look for split proposal artifacts unless router explicitly injects LOOP_REQUEST_SEQ.",
+            "- Do not widen scope beyond the current FINAL_EFFECTS.md and explicit router prelude instructions.",
+            "- Preserve already-working behavior unless a final integrated fix is actually needed.",
+            "- Use routerctl complete only when the current workspace itself is your honest final-closeout claim for the full target.",
+        ]
+
     def _build_checker_prompt_lines(
         self,
         *,
@@ -598,130 +1200,93 @@ class RouterCore:
             "Router actor identity is provided by the environment.",
             "",
             "Checker role:",
-            "- Translate the authoritative FINAL_EFFECTS.md into checker artifacts with zero semantic omission.",
-            "- You are not adjudicating the whole paper from scratch.",
+            "- Translate the authoritative FINAL_EFFECTS.md into a checker task graph with zero semantic omission.",
             "- You are planning later evaluator work; you are not performing the substantive audit now.",
             "- Prefer the first complete manifest over prolonged refinement.",
             "- This is a single-pass artifact-writing task. Do not use planning tools, todo tools, or progress-commentary updates.",
             "",
-            "Checker input pack:",
-            "- Read FINAL_EFFECTS.md first.",
-            "- Immediately write checker/final_effects_obligations.json from FINAL_EFFECTS.md before reading any other file.",
-            "- Read extraction/theorem_inventory.json if it exists.",
-            "- Read WHOLE_PAPER_STATUS.json if it exists.",
-            "- Read external_dependencies/EXTERNAL_DEPENDENCY_LEDGER.json if it exists.",
-            "- Read split/SPLIT_DECLINE_REASON.md if it exists.",
-            "- Stay inside the current workspace root.",
-            "- Do not inspect previous harness runs or any checker artifacts outside the current workspace root.",
-            "- Historical checker artifacts under checker/ are evidence only; they are not authoritative for this run.",
-            "- Do not broad-scan README.md, TRACEABILITY.md, analysis/, source TeX, or historical checker outputs unless one input-pack file is missing or internally inconsistent.",
-            "- If uncertainty remains after the input pack, record it as unknown instead of broadening the scan.",
-            "- If the input pack already exposes a current terminal trend, accept that trend provisionally and schedule a sufficiency audit task instead of re-deriving the verdict from scratch.",
+            "Single-source-of-truth rule:",
+            "- checker/tasks.json is the sole durable evaluator task truth for this wave.",
+            "- Do not create parallel authoritative files for obligations, coverage, routing, disposition, manifests, checklists, summaries, certifications, or per-task markdown.",
+            "- Do not use task_ref indirection. The task graph itself must contain the full routed task specification.",
+            "- Historical checker artifacts are evidence only; they are not authoritative for this wave.",
+            "- If router prelude says the previous evaluator wave ended in EVALUATOR_FAULT, treat the injected reviewer report and feedback as explicit correction targets for this checker pass.",
+            "- In that case, do not reproduce the prior checker manifest blindly; correct the evaluator-side faults first, then emit the new manifest.",
+            "",
+            "Checker scope boundary:",
+            "- Your job is to operationalize FINAL_EFFECTS.md into a truthful, testable task manifest.",
+            "- You may clarify how a requirement should be checked, evidenced, or partitioned into evaluator tasks.",
+            "- You may add concrete verification structure, evidence expectations, and execution-level checks when they help evaluators test the authoritative requirement honestly.",
+            "- But do not silently narrow or strengthen the meaning of FINAL_EFFECTS.md.",
+            "- In particular, do not convert an open-text allowance into a stricter hard cap, exclusive path, or smaller permission set unless that stronger restriction is already clearly supported by the authoritative text.",
+            "- Do not reduce a requirement's allowable solution space just because a narrower formulation seems easier to evaluate.",
+            "- If a requirement remains genuinely ambiguous after good-faith operational clarification, preserve that ambiguity in the task framing rather than resolving it by silently choosing the stricter interpretation.",
+            "",
+            "Implementer rebuttal handling:",
+            "- The implementer may explicitly argue that a checker-derived task interpretation over-tightens FINAL_EFFECTS.md.",
+            "- If such an authority-grounded rebuttal exists in the current workspace or completion materials, do not ignore it.",
+            "- Make the task manifest faithful to FINAL_EFFECTS.md, not merely self-consistent with a prior over-tightened checker interpretation.",
             "",
             "Non-negotiable rules:",
             "- Every concrete requirement in FINAL_EFFECTS.md must be covered by at least one checker task.",
-            "- Use the smallest obligation list that still preserves zero semantic omission.",
+            "- Use the smallest task graph that still preserves zero semantic omission.",
             "- Obligation extraction rule: each bullet or numbered item becomes one obligation; each prose paragraph outside lists becomes one obligation.",
             "- Do not subdivide a bullet or paragraph further unless it clearly contains multiple independent required outcomes.",
             "- Grouping is allowed, but semantic omission is not allowed.",
             "- If multiple requirements are grouped into one task, covered_requirement_ids must still name them explicitly.",
             "- If any requirement is only partially covered, the uncovered remainder must be made explicit and assigned to a task.",
-            "- If any theorem-inventory item remains still_formalizable, at least one checker task must explicitly advance it.",
-            "- If the workspace trends toward paper defect exposed or external dependency blocked, a terminal-verdict sufficiency task is mandatory.",
-            "- If evidence is incomplete, encode the uncertainty inside a task goal or blocking_condition instead of investigating further.",
+            "- If honest closure still depends on unresolved implementation work or unresolved evidence, assign that dependency to a concrete task.",
+            "- If evidence is incomplete, encode the uncertainty inside a task goal or blocking_condition instead of broadening the scan.",
             "",
-            f"Completion interface: write checker artifacts, then use {routerctl} complete --tasks-ref <path>",
+            "Artifact gate policy:",
+            "- Distinguish between strong-gate required evidence and weak-gate mirrored paperwork.",
+            "- A required evidence item is allowed only if at least one is true:",
+            "  1. FINAL_EFFECTS.md directly requires that deliverable;",
+            "  2. router or a later actor actually consumes it as durable input;",
+            "  3. without it, later actors would lack the sole minimal non-redundant evidence needed for honest pass/fail or honest closeout.",
+            "- If none of the above is true, it is weak-gate by default and must not become blocking paperwork.",
+            "- Do not require an md/json pair by default.",
+            "- Prefer one durable artifact over multiple mirrored artifacts.",
+            "- If evidence can be consumed directly from the task graph or later lane result, do not manufacture sidecar truth.",
             "",
-            "Write exactly these checker artifacts with exactly these top-level keys:",
+            f"Completion interface: write the canonical checker manifest, then use {routerctl} complete --tasks-ref <path>",
             "",
-            "1. checker/final_effects_obligations.json",
+            "Write exactly one durable checker artifact:",
+            "1. checker/tasks.json",
             "- Top-level keys exactly:",
+            "  - version",
+            "  - snapshot_id",
             "  - workspace_root",
             "  - authoritative_final_effects_path",
-            "  - obligation_count",
             "  - obligations",
+            "  - tasks",
+            "- version must be exactly 2.",
+            "- snapshot_id may be empty in the current file; router assigns the accepted dispatched snapshot id.",
             "- obligations must be a list of objects with keys exactly:",
             "  - id",
             "  - section",
-            "  - source_excerpt",
             "  - requirement_text",
-            "",
-            "2. checker/final_effects_coverage.json",
-            "- Top-level keys exactly:",
-            "  - workspace_root",
-            "  - authoritative_final_effects_path",
-            "  - coverage_count",
-            "  - coverage",
-            "- coverage must be a list of objects with keys exactly:",
-            "  - obligation_id",
-            "  - covered_by_task_ids",
-            "  - coverage_kind",
-            "  - notes",
-            "- coverage_kind must be exactly one of:",
-            "  - direct",
-            "  - partial",
-            "",
-            "3. checker/tasks.json",
-            "- Top-level keys exactly:",
-            "  - version",
-            "  - workspace_root",
-            "  - authoritative_final_effects_path",
-            "  - current_terminal_trend",
-            "  - tasks",
-            "- current_terminal_trend must be exactly one of:",
-            "  - whole_paper_faithful_complete_formalization",
-            "  - paper_defect_exposed",
-            "  - external_dependency_blocked",
-            "  - unknown",
             "- tasks must be a list of objects with keys exactly:",
             "  - task_id",
-            "  - task_ref",
             "  - covered_requirement_ids",
             "  - goal",
             "  - blocking_condition",
-            "  - expected_artifacts",
-            "- Write one markdown task file per task directly under checker/ named task-*.md.",
-            "- task_ref must point directly to one of those checker/task-*.md files.",
-            "- task_ref must never point to checker/tasks.json.",
-            "- task_ref must never point under checker/tasks/.",
-            "",
-            "Whole-paper closure rule:",
-            "- Read extraction/theorem_inventory.json.",
-            "- Every theorem-like / assumption / optimization_program / derived_claim item must be forced into one of:",
-            "  - formalized",
-            "  - blocked_by_internal_defect",
-            "  - blocked_by_external_dependency",
-            "  - still_formalizable",
-            "- The checker task set must make those disposition paths executable.",
-            "",
-            "Default task skeleton: start from these task families before inventing anything more:",
-            "- inventory_disposition_audit",
-            "- still_formalizable_advancement",
-            "- terminal_verdict_sufficiency_audit",
-            "- external_dependency_closure_audit",
-            "- working_outputs_integrity",
-            "- closeout_disclosure_integrity",
-            "- Merge adjacent skeleton tasks only if their goal, blocking_condition, and expected_artifacts stay concrete.",
+            "  - task_instructions",
+            "  - required_evidence",
+            "- task_instructions must contain the full routed task specification needed by the assigned lane.",
+            "- required_evidence must stay minimal and strong-gate only.",
             "",
             "Task quality rule:",
-            "- Do not collapse the whole paper into 2-3 vague umbrella tasks.",
+            "- Do not collapse the job into 2-3 vague umbrella tasks.",
             "- Task count may vary, but every task must remain concrete and executable.",
             "- Prefer 4-12 tasks unless more are required to avoid semantic omission.",
             "",
             "Finish gate: do not complete until all of the following are true:",
-            "- obligation_count matches the number of obligation records.",
-            "- coverage_count matches the number of coverage records.",
-            "- Every obligation_id appears exactly once in coverage.",
-            "- Every coverage record has at least one covered_by_task_id.",
-            "- Every coverage_kind is exactly direct or partial.",
-            "- Every task_ref is unique.",
-            "- Every task_ref points to an existing checker/task-*.md file directly under checker/.",
-            "- No task_ref points to checker/tasks.json.",
-            "- No task_ref points under checker/tasks/.",
-            "- Every still_formalizable theorem-inventory item has an explicit advancement task.",
-            "- The terminal-verdict sufficiency task exists whenever the workspace trends toward paper defect exposed or external dependency blocked.",
-            "- If all finish-gate conditions hold, stop immediately. Do not reopen the manifest for more refinement.",
-            "- Once the finish gate passes, stop immediately. Do not continue open-ended analysis.",
+            "- obligations cover FINAL_EFFECTS with zero semantic omission.",
+            "- Every obligation_id is covered by at least one task.",
+            "- Every task entry is concrete and self-sufficient without task_ref indirection.",
+            "- If unresolved implementation or unresolved evidence still blocks honest closure, at least one task explicitly owns that work.",
+            "- If all finish-gate conditions hold, stop immediately.",
         ]
 
     def _build_tester_prompt_lines(self) -> list[str]:
@@ -734,9 +1299,14 @@ class RouterCore:
             "",
             "Authority order:",
             "1. FINAL_EFFECTS.md defines the true goal.",
-            "2. The current checker task manifest defines the current evaluator task split.",
-            "3. Workspace code, runtime artifacts, lane results, and closeout artifacts provide evidence.",
+            "2. checker/tasks.json is the sole evaluator task truth for the current wave.",
+            "3. Each lane result file is the sole durable truth for that lane.",
             "4. Local helper/reference files are supporting evidence only; they do not override FINAL_EFFECTS.",
+            "",
+            "Single-source-of-truth rule:",
+            "- Do not treat mirrored checker sidecar docs as parallel truth sources.",
+            "- If duplicate sidecar files disagree with checker/tasks.json or lane results, the durable source wins.",
+            "- Write one global tester report and no additional authoritative evaluator sidecar docs.",
             "",
             "Required workflow:",
             "1. Partition the current review surface into small review blocks before judging the run.",
@@ -745,15 +1315,12 @@ class RouterCore:
             "  - at most 3 files,",
             "  - at most 200 changed lines,",
             "  - at most 3 closely related functions/components.",
-            "- Artifact block limits:",
-            "  - at most 4 directly related files,",
-            "  - only one artifact family at a time.",
             "- If any limit is exceeded, split the block further.",
             "- If you cannot summarize a block as one sentence of the form \"this block verifies whether X is true\", the block is still too large.",
             "",
             "2. Review each block with this fixed sequence:",
             "- State the honest pass condition for the block.",
-            "- Inspect the primary files/artifacts in the block.",
+            "- Inspect the primary evidence in the block.",
             "- Inspect only the minimum adjacent context needed.",
             "- Ask: what is the cheapest concrete way this block could still be failing?",
             "- Run the minimum validation needed to check that failure mode.",
@@ -766,13 +1333,12 @@ class RouterCore:
             "  - behavior bugs,",
             "  - fidelity failures,",
             "  - checker decomposition defects,",
-            "  - stale or inconsistent downstream artifacts,",
+            "  - stale or inconsistent durable truth,",
             "  - closeout-readiness failures.",
             "- Do not force irrelevant review categories onto the run.",
             "",
             "4. Synthesize globally after block review.",
             "- Check whether findings from different blocks combine into a larger failure.",
-            "- Check whether the current checker manifest, lane outputs, and closeout artifacts still agree with each other.",
             "- Check whether the run is honestly ready for approval.",
             "",
             "5. Tag ownership for every finding.",
@@ -793,6 +1359,21 @@ class RouterCore:
             "  3. you have concrete evidence for it;",
             "  4. it is actionable by a specific owner.",
             "",
+            "Artifact gate policy:",
+            "- Distinguish between strong-gate evidence and weak-gate mirrored paperwork.",
+            "- A strong-gate item is blocking only if at least one is true:",
+            "  1. FINAL_EFFECTS.md directly requires it as a primary deliverable;",
+            "  2. router or a later actor actually consumes it as durable input;",
+            "  3. it is the sole minimal non-redundant evidence needed for honest pass/fail or honest closeout.",
+            "- If none of the above is true, it is weak-gate by default.",
+            "- Missing weak-gate artifacts must not block by themselves.",
+            "- Missing weak-gate mirrored paperwork must not block by itself.",
+            "- If a checker contract overweights low-value paperwork, report that as a checker-side contract problem.",
+            "",
+            "Snapshot-writing rule:",
+            "- When you write the current tester result, use the exact current dispatched snapshot id injected by router.",
+            "- If you mention any older snapshot id, label it explicitly as historical, stale, or superseded.",
+            "",
             "Output requirements:",
             "- Write one global tester report.",
             "- Include:",
@@ -810,21 +1391,42 @@ class RouterCore:
             "Your job is to determine whether this task can honestly pass.",
             "You are not the global reviewer.",
             "You are not responsible for judging the whole run.",
-            "You are not a checklist robot: task_ref is your starting scope, not an excuse to ignore obvious implied checks.",
+            "You are not a checklist robot: the routed task entry is your starting scope, not an excuse to ignore obvious implied checks.",
             "",
             "Authority order:",
             "1. FINAL_EFFECTS.md defines the true goal.",
-            "2. The current task_ref defines your direct assignment.",
+            "2. The routed task entry from checker/tasks.json defines your direct assignment.",
             "3. Workspace code, runtime behavior, and task-local artifacts provide evidence.",
             "4. Local helper/reference files are supporting evidence only; they do not override FINAL_EFFECTS.",
             "",
+            "Single-source-of-truth rule:",
+            "- The routed task entry is the only task truth for this lane.",
+            "- Your only durable evaluator output is one lane result file.",
+            "- Do not create auxiliary manifests, checklists, certification files, mirrored summaries, or sidecar routing notes unless FINAL_EFFECTS directly requires them or router/later actors truly consume them.",
+            "",
+            "Split-lifecycle rule:",
+            "- Use the current node split truth injected by router as the primary split-lifecycle evidence for this node.",
+            "- Do not treat historical nodes, historical `parent_node_id` ancestry rows, or the mere presence of other nodes in router.db as proof that the current node split.",
+            "- A split or no-split claim for this node must be grounded in current-node split lifecycle evidence, not historical topology alone.",
+            "",
+            "Artifact gate policy:",
+            "- Evaluate the lane using the task's required evidence, not duplicate paperwork.",
+            "- A required evidence item is blocking only if at least one is true:",
+            "  1. FINAL_EFFECTS.md directly requires it as a primary deliverable;",
+            "  2. router or a later actor actually consumes it as durable input;",
+            "  3. it is the sole minimal non-redundant evidence needed for honest pass/fail or honest closeout.",
+            "- If none of the above is true, it is weak-gate by default.",
+            "- Missing weak-gate artifacts must not block by themselves.",
+            "- Missing mirrored sidecar paperwork is non-blocking by default unless it is the sole remaining non-redundant evidence needed for an honest verdict.",
+            "- If the routed task labels low-value repackaged paperwork as blocking, report that as a checker-side contract problem.",
+            "",
             "Required workflow:",
-            "1. Read task_ref and restate the honest pass condition for this lane.",
+            "1. Read the routed task entry and restate the honest pass condition for this lane.",
             "- State in 1-3 sentences what must be true for this task to pass honestly.",
             "",
             "2. Extract the direct checks explicitly required by the task.",
             "- Write a short direct-check list.",
-            "- This list should contain only checks clearly demanded by task_ref.",
+            "- This list should contain only checks clearly demanded by the routed task entry.",
             "",
             "3. Run the direct checks.",
             "- If the task is about controls or behavior, prefer real interaction.",
@@ -844,14 +1446,18 @@ class RouterCore:
             "- Check that failure mode directly first.",
             "- If you cannot falsify it, explain what evidence proves pass.",
             "",
-            "6. If the task itself is under-scoped or misowned, report that explicitly.",
+            "6. Evaluate closure.",
+            "- State whether the lane produced enough concrete, non-redundant evidence for an honest verdict.",
+            "- Do not fail the task solely because mirrored sidecar paperwork is absent, stale, or cosmetically imperfect.",
+            "",
+            "7. If the task itself is under-scoped or misowned, report that explicitly.",
             "- If the implementation is bad, say so.",
             "- If checker assigned the task too narrowly or left a coverage gap, say so.",
             "- Distinguish:",
             "  - task failed because implementation failed",
             "  - task cannot honestly close because checker ownership/scope is wrong",
             "",
-            "7. Tag ownership for every finding.",
+            "8. Tag ownership for every finding.",
             "- owner must be one of:",
             "  - implementer",
             "  - checker",
@@ -868,9 +1474,16 @@ class RouterCore:
             "  3. you have concrete evidence for it;",
             "  4. it is actionable by a specific owner.",
             "",
+            "Snapshot-writing rule:",
+            "- When you write the current lane result, use the exact current dispatched snapshot id injected by router.",
+            "- Do not copy snapshot ids from history into current-pass claims.",
+            "- If you mention any older snapshot id, label it explicitly as historical, stale, or superseded.",
+            "",
             "Output requirements:",
             "- Write one task result.",
             "- Include:",
+            "  - Task id: <current task id>,",
+            "  - Current dispatched snapshot id: <current snapshot id>,",
             "  - task verdict,",
             "  - direct checks performed,",
             "  - any implied checks you added and why,",
@@ -890,13 +1503,56 @@ class RouterCore:
             "",
             "Authority order:",
             "1. FINAL_EFFECTS.md defines the true goal.",
-            "2. The current checker task manifest defines the current evaluator task split.",
-            "3. Tester results, AI-user lane results, workspace state, and closeout artifacts are the current evidence base.",
+            "2. checker/tasks.json is the sole evaluator task truth for the current wave.",
+            "3. Each tester result or AI-user lane result is the sole durable truth for that evaluator output.",
             "4. Active feedback and feedback history provide prior context only; they do not override current evidence.",
             "5. If current evidence contradicts an older finding, mark the older finding resolved or superseded in reviewer_report.md and reflect only the still-active findings in feedback.json.",
             "",
+            "Single-source-of-truth rule:",
+            "- feedback.json is the sole routing truth for this reviewer pass.",
+            "- reviewer_report.md is explanatory only and must not introduce active findings absent from feedback.json.",
+            "- Do not keep mirrored checker sidecar docs alive as separate semantic sources.",
+            "- If a duplicate evaluator file disagrees with checker/tasks.json or the accepted lane results, the durable source wins.",
+            "- A stale mirrored file is blocking only if it proves the actual task graph, gate semantics, or closeout semantics are wrong.",
+            "",
+            "Reviewer adjudication rule:",
+            "- Treat FINAL_EFFECTS.md as the authoritative requirement source.",
+            "- Treat checker/tasks.json as a derived operationalization, not as a stronger authority than FINAL_EFFECTS.md.",
+            "- If an implementer explicitly argues that a checker-derived task or active finding over-tightens FINAL_EFFECTS.md, you must adjudicate that rebuttal explicitly.",
+            "",
+            "Adjudication steps:",
+            "1. Read the controlling FINAL_EFFECTS.md text.",
+            "2. Determine whether the checker/task interpretation is an operational clarification or a semantic narrowing.",
+            "3. Compare that interpretation against the implementer's authority-grounded rebuttal and the current workspace evidence.",
+            "4. State which interpretation governs and why.",
+            "",
+            "Reviewer prohibition:",
+            "- Do not reject or fault an implementation merely because it violates an over-tightened checker/task interpretation that is not actually supported by FINAL_EFFECTS.md.",
+            "- Do not treat checker self-consistency as sufficient when it conflicts with the authoritative requirement text.",
+            "",
+            "Split-lifecycle rule:",
+            "- Use the current node split truth injected by router as the primary split-lifecycle evidence for this node.",
+            "- Do not treat historical nodes, historical `parent_node_id` ancestry rows, or the mere presence of other nodes in router.db as proof that the current node split.",
+            "- Resolve split-related findings against current-node split lifecycle evidence before carrying them forward.",
+            "",
+            "Artifact gate policy:",
+            "- Distinguish between strong-gate and weak-gate artifacts.",
+            "- A finding may be `blocking: true` only if at least one is true:",
+            "  1. a primary deliverable required by FINAL_EFFECTS.md is still missing or materially wrong;",
+            "  2. a durable handoff artifact consumed by router or a later actor is missing or materially wrong;",
+            "  3. the sole minimal non-redundant evidence needed for honest pass/fail or honest closeout is missing or materially wrong.",
+            "- If none of the above is true, the finding must be treated as weak-gate by default.",
+            "- Missing weak-gate artifacts must not block by themselves.",
+            "- If checker or a task contract over-classifies weak-gate artifacts as blockers, route that as a checker-side contract problem instead of repeatedly blocking ai_user lanes for low-value paperwork.",
+            "- Record weak-gate findings in feedback.json only when they are useful advisory context for a later actor; otherwise leave them out of feedback.json and mention them only in reviewer_report.md.",
+            "",
+            "Snapshot-writing rule:",
+            "- When you write any current-pass reviewer finding, report, or routing decision, use the exact current dispatched snapshot id injected by router.",
+            "- Do not copy snapshot ids from history into current-pass claims.",
+            "- If you mention any older snapshot id, label it explicitly as historical, stale, or superseded.",
+            "",
             "Required workflow:",
-            "1. Read the current checker task manifest, tester report(s), AI-user lane result(s), closeout artifacts, and workspace state.",
+            "1. Read the current checker task manifest, tester report(s), AI-user lane result(s), and the minimal workspace/closeout state needed for an honest decision.",
             "2. Read any active feedback or feedback-history paths injected below the ROUTER FEEDBACK SLOT marker.",
             "3. Decide which findings are still active now.",
             "4. Write feedback.json first as the complete current active-finding snapshot for router.",
@@ -912,31 +1568,30 @@ class RouterCore:
             "feedback.json schema requirements:",
             "- Top-level keys must be exactly:",
             "  - version",
+            "  - snapshot_id",
             "  - implementer",
             "  - checker",
             "  - tester",
             "  - ai_user",
-            "- version must be exactly 1.",
+            "- version must be exactly 2.",
+            "- snapshot_id must equal the current dispatched snapshot id.",
             "- implementer/checker/tester must be objects with keys exactly:",
-            "  - feedback_ref",
             "  - findings",
             "- ai_user must be a list of objects with keys exactly:",
             "  - task_id",
-            "  - feedback_ref",
             "  - findings",
             "- Every finding object must contain exactly:",
             "  - blocking",
             "  - summary",
             "  - evidence_ref",
-            "- If findings are present in a bucket, feedback_ref must point to an existing regular file for that actor-specific feedback note.",
             "- ai_user.task_id must match a task_id from the current checker manifest.",
             "",
             "feedback.json template:",
             "```json",
             "{",
-            '  "version": 1,',
+            '  "version": 2,',
+            '  "snapshot_id": "snapshot-abc123",',
             '  "implementer": {',
-            '    "feedback_ref": "/abs/path/to/implementer_feedback.md",',
             '    "findings": [',
             "      {",
             '        "blocking": true,',
@@ -946,17 +1601,20 @@ class RouterCore:
             "    ]",
             "  },",
             '  "checker": {',
-            '    "feedback_ref": "",',
-            '    "findings": []',
+            '    "findings": [',
+            "      {",
+            '        "blocking": false,',
+            '        "summary": "non-blocking advisory note about an overweight weak-gate artifact contract",',
+            '        "evidence_ref": "/abs/path/to/evidence"',
+            "      }",
+            "    ]",
             "  },",
             '  "tester": {',
-            '    "feedback_ref": "",',
             '    "findings": []',
             "  },",
             '  "ai_user": [',
             "    {",
             '      "task_id": "task-01",',
-            '      "feedback_ref": "/abs/path/to/ai_user_task_01_feedback.md",',
             '      "findings": [',
             "        {",
             '          "blocking": true,',
@@ -973,10 +1631,11 @@ class RouterCore:
             "- feedback.json must be written before reviewer_report.md.",
             "- reviewer_report.md should explain why each active finding belongs to its owner bucket and summarize what is resolved, still open, or superseded.",
             "- Keep reviewer_report.md consistent with feedback.json.",
+            "- reviewer_report.md should state explicitly which findings are blocking and which are non-blocking.",
             "",
             "Submission interface:",
             f"- Use: {self._repo_root / 'scripts' / 'routerctl.sh'} complete --verdict-kind <OK|IMPLEMENTER_ACTION_REQUIRED|EVALUATOR_FAULT> --report-ref <path/to/reviewer_report.md> --feedback-ref <path/to/feedback.json>",
-            "- report-ref and feedback-ref must be absolute paths to existing regular files.",
+            "- report-ref and feedback-ref must be the canonical current reviewer paths injected by router.",
             "- verdict_kind remains required for compatibility with the current router interface.",
             "",
             "Hard validation rule:",
@@ -1003,6 +1662,7 @@ class RouterCore:
         workspace_root: Path,
         final_effects_file: Path,
         prelude_lines: list[str] | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> str:
         routerctl = (self._repo_root / "scripts" / "routerctl.sh").resolve()
         if actor_kind is ActorKind.EVALUATOR_CHECKER:
@@ -1021,7 +1681,14 @@ class RouterCore:
             lines.extend(
                 self._build_completion_contract_lines(actor_kind=actor_kind, routerctl=routerctl)
             )
-            if actor_kind is ActorKind.EVALUATOR_TESTER:
+            if actor_kind is ActorKind.IMPLEMENTER:
+                lines.extend(["", *self._build_implementer_prompt_lines(routerctl=routerctl)])
+            elif actor_kind is ActorKind.KERNEL:
+                if str((extra_env or {}).get("LOOP_REQUEST_SEQ") or "").strip():
+                    lines.extend(["", *self._build_kernel_split_review_prompt_lines()])
+                else:
+                    lines.extend(["", *self._build_kernel_takeover_prompt_lines()])
+            elif actor_kind is ActorKind.EVALUATOR_TESTER:
                 lines.extend(["", *self._build_tester_prompt_lines()])
             elif actor_kind is ActorKind.EVALUATOR_AI_USER:
                 lines.extend(["", *self._build_ai_user_prompt_lines()])
@@ -1062,6 +1729,7 @@ class RouterCore:
         completion_file = actor_completion_record_path(
             workspace_root,
             actor_kind,
+            node_id=str(node_id),
             task_id=actor_task_id if actor_kind is ActorKind.EVALUATOR_AI_USER else None,
         )
         return ActorLaunchSpec(
@@ -1077,6 +1745,7 @@ class RouterCore:
                 workspace_root=workspace_root,
                 final_effects_file=resolved_final_effects,
                 prelude_lines=prelude_lines,
+                extra_env=extra_env,
             ),
             env={
                 "LOOP_ROUTER_DB_PATH": str(self._store.db_path.resolve()),
@@ -1141,26 +1810,73 @@ class RouterCore:
             pending_prelude_lines=[],
         )
 
+    def _subtree_records(self, root_node_id: str) -> list[NodeRuntimeRecord]:
+        records_by_id = {
+            str(record.node_id): record
+            for record in self._store.list_nodes()
+        }
+        root_record = records_by_id.get(str(root_node_id))
+        if root_record is None:
+            return []
+        ordered: list[NodeRuntimeRecord] = []
+        stack = [str(root_node_id)]
+        seen: set[str] = set()
+        while stack:
+            node_id = stack.pop()
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            record = records_by_id.get(node_id)
+            if record is None:
+                continue
+            ordered.append(record)
+            stack.extend(reversed([str(child_id) for child_id in record.child_node_ids]))
+        return ordered
+
+    def _record_has_pending_split_review(self, record: NodeRuntimeRecord) -> bool:
+        return int(record.split_request) != 0 and int(record.split_approved) == 0
+
+    def _record_is_active_system_node(self, record: NodeRuntimeRecord) -> bool:
+        if record.current_components:
+            return True
+        return self._record_has_pending_split_review(record)
+
+    def _active_system_node_count(self) -> int:
+        return sum(
+            1
+            for record in self._store.list_nodes()
+            if self._record_is_active_system_node(record)
+        )
+
+    def _open_split_approved_node_count(self) -> int:
+        return sum(
+            1
+            for record in self._store.list_nodes()
+            if int(record.split_approved) == 1 and not str(record.result_commit or "").strip()
+        )
+
     def _build_kernel_review_prelude(
         self,
         *,
         request_seq: int,
-        source_node_id: str,
+        source_record: NodeRuntimeRecord,
         split_bundle_ref: str,
         durable_commit: str,
         diff_fingerprint: str,
     ) -> list[str]:
-        lines = [
+        return [
             "Router kernel review dispatch.",
-            f"Source node id: {source_node_id}",
             f"Split request seq: {request_seq}",
+            f"Parent workspace root: {source_record.workspace_root}",
+            f"Parent final effects file: {source_record.final_effects_file}",
             f"Frozen split bundle snapshot: {split_bundle_ref}",
-            f"Source durable commit baseline: {durable_commit}",
+            f"Parent durable commit baseline: {durable_commit}",
             f"Source diff fingerprint: {diff_fingerprint}",
+            f"Active system node count: {int(self._active_system_node_count())}",
+            f"Open split-approved node count: {int(self._open_split_approved_node_count())}",
             "Review the frozen split bundle snapshot, not the live workspace bundle.",
             "Write REJECT only when the proposal should not be accepted in its current frozen form.",
         ]
-        return lines
 
     def _build_running_node_record(
         self,
@@ -1276,6 +1992,7 @@ class RouterCore:
         completion_file = actor_completion_record_path(
             spec.workspace_root,
             spec.actor_kind,
+            node_id=spec.node_id,
             task_id=str(spec.env.get("LOOP_TASK_ID") or "").strip() or None,
         )
         completion_file.unlink(missing_ok=True)
@@ -1818,6 +2535,122 @@ class RouterCore:
             return None
         return candidate
 
+    def _snapshot_runtime_output(
+        self,
+        *,
+        source_ref: Path,
+        target_ref: Path,
+        label: str,
+    ) -> Path:
+        try:
+            target_ref.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_ref, target_ref)
+        except Exception as exc:
+            target_ref.unlink(missing_ok=True)
+            raise RouterBusinessError(f"{label} snapshot failed: {exc}") from exc
+        return target_ref
+
+    def _current_dispatched_snapshot_id(self, record: NodeRuntimeRecord) -> str:
+        checker_tasks_ref = str(record.checker_tasks_ref or "").strip()
+        if not checker_tasks_ref:
+            return ""
+        try:
+            manifest = self._load_checker_task_manifest(Path(checker_tasks_ref))
+        except RouterBusinessError:
+            return ""
+        return str(manifest.get("snapshot_id") or "").strip()
+
+    def _validate_snapshot_markers(
+        self,
+        *,
+        text: str,
+        expected_snapshot_id: str,
+        label: str,
+    ) -> list[str]:
+        if not expected_snapshot_id:
+            return []
+        reason_lines: list[str] = []
+        expected_marker = f"Current dispatched snapshot id: {expected_snapshot_id}"
+        if expected_marker not in text:
+            reason_lines.append(
+                f"{label} must include the exact line `{expected_marker}`."
+            )
+        snapshot_pattern = re.compile(r"snapshot-[0-9a-f]+")
+        for index, line in enumerate(str(text or "").splitlines(), start=1):
+            line_snapshots = {match.group(0) for match in snapshot_pattern.finditer(line)}
+            if not line_snapshots:
+                continue
+            normalized_line = line.lower()
+            for snapshot_id in sorted(line_snapshots):
+                if snapshot_id == expected_snapshot_id:
+                    continue
+                if any(token in normalized_line for token in ("historical", "stale", "superseded")):
+                    continue
+                reason_lines.append(
+                    f"{label} line {index} references stale snapshot {snapshot_id} without marking it historical/stale/superseded."
+                )
+        return reason_lines
+
+    def _validate_tester_result_file(
+        self,
+        *,
+        result_ref: Path,
+        record: NodeRuntimeRecord,
+    ) -> list[str]:
+        text = result_ref.read_text(encoding="utf-8", errors="replace")
+        reason_lines: list[str] = []
+        if "Overall verdict:" not in text:
+            reason_lines.append("Evaluator tester result must include `Overall verdict:`.")
+        reason_lines.extend(
+            self._validate_snapshot_markers(
+                text=text,
+                expected_snapshot_id=self._current_dispatched_snapshot_id(record),
+                label="Evaluator tester result",
+            )
+        )
+        return reason_lines
+
+    def _validate_ai_user_result_file(
+        self,
+        *,
+        result_ref: Path,
+        record: NodeRuntimeRecord,
+        task_id: str,
+    ) -> list[str]:
+        text = result_ref.read_text(encoding="utf-8", errors="replace")
+        reason_lines: list[str] = []
+        if f"Task id: {task_id}" not in text:
+            reason_lines.append(
+                f"Evaluator AI-user result must include the exact line `Task id: {task_id}`."
+            )
+        if "Task verdict:" not in text:
+            reason_lines.append("Evaluator AI-user result must include `Task verdict:`.")
+        reason_lines.extend(
+            self._validate_snapshot_markers(
+                text=text,
+                expected_snapshot_id=self._current_dispatched_snapshot_id(record),
+                label="Evaluator AI-user result",
+            )
+        )
+        return reason_lines
+
+    def _validate_reviewer_report_file(
+        self,
+        *,
+        report_ref: Path,
+        record: NodeRuntimeRecord,
+    ) -> list[str]:
+        text = report_ref.read_text(encoding="utf-8", errors="replace")
+        reason_lines: list[str] = []
+        reason_lines.extend(
+            self._validate_snapshot_markers(
+                text=text,
+                expected_snapshot_id=self._current_dispatched_snapshot_id(record),
+                label="Reviewer report",
+            )
+        )
+        return reason_lines
+
     def _normalize_reviewer_feedback_findings(
         self,
         *,
@@ -1876,7 +2709,7 @@ class RouterCore:
     ) -> tuple[dict[str, object] | None, list[str]]:
         if not isinstance(bucket_payload, dict):
             return None, [f"{bucket_label} must be an object."]
-        allowed_keys = {"feedback_ref", "findings"}
+        allowed_keys = {"findings"}
         if task_id_required:
             allowed_keys.add("task_id")
         extra_keys = sorted(set(bucket_payload) - allowed_keys)
@@ -1899,20 +2732,9 @@ class RouterCore:
             findings_payload=bucket_payload.get("findings"),
         )
         reason_lines.extend(finding_reason_lines)
-        raw_feedback_ref = str(bucket_payload.get("feedback_ref") or "").strip()
-        feedback_ref = self._resolve_existing_payload_file(raw_feedback_ref)
-        if raw_feedback_ref and feedback_ref is None:
-            reason_lines.append(
-                f"{bucket_label}.feedback_ref must be an existing regular file when provided."
-            )
-        if normalized_findings and feedback_ref is None:
-            reason_lines.append(
-                f"{bucket_label}.feedback_ref must be an existing regular file when findings are present."
-            )
         if reason_lines:
             return None, reason_lines
         normalized_bucket: dict[str, object] = {
-            "feedback_ref": str(feedback_ref or ""),
             "findings": normalized_findings,
         }
         if task_id_required:
@@ -1933,7 +2755,7 @@ class RouterCore:
             return None, [f"Reviewer feedback_ref must contain valid JSON: {exc.msg}."]
         if not isinstance(raw_payload, dict):
             return None, ["Reviewer feedback_ref JSON must be an object."]
-        allowed_keys = {"version", "implementer", "checker", "tester", "ai_user"}
+        allowed_keys = {"version", "snapshot_id", "implementer", "checker", "tester", "ai_user"}
         extra_keys = sorted(set(raw_payload) - allowed_keys)
         reason_lines: list[str] = []
         if extra_keys:
@@ -1947,8 +2769,19 @@ class RouterCore:
             version_value = int(version)
         except (TypeError, ValueError):
             version_value = -1
-        if version_value != 1:
-            reason_lines.append("Reviewer feedback_ref version must be exactly 1.")
+        if version_value != 2:
+            reason_lines.append("Reviewer feedback_ref version must be exactly 2.")
+        expected_snapshot_id = self._current_dispatched_snapshot_id(record)
+        observed_snapshot_id = str(raw_payload.get("snapshot_id") or "").strip()
+        if not expected_snapshot_id:
+            reason_lines.append(
+                "Reviewer feedback_ref requires a current dispatched snapshot id from checker before submission."
+            )
+        elif observed_snapshot_id != expected_snapshot_id:
+            reason_lines.append(
+                "Reviewer feedback_ref snapshot_id must match the current dispatched snapshot id "
+                f"{expected_snapshot_id}."
+            )
         try:
             checker_tasks_ref = str(record.checker_tasks_ref or "").strip()
             dispatched_task_ids = (
@@ -1964,7 +2797,7 @@ class RouterCore:
                 "Reviewer feedback_ref requires a valid checker task manifest before ai_user findings can be validated: "
                 + exc.message
             ]
-        normalized: dict[str, object] = {"version": 1}
+        normalized: dict[str, object] = {"version": 2, "snapshot_id": expected_snapshot_id}
         for owner in ("implementer", "checker", "tester"):
             if owner not in raw_payload:
                 reason_lines.append(f"Reviewer feedback_ref is missing top-level bucket {owner!r}.")
@@ -2012,15 +2845,17 @@ class RouterCore:
             return None, reason_lines
         return normalized, []
 
-    def _clear_workspace_feedback_ledger(self, workspace_root: Path) -> None:
-        active_path = active_feedback_path(workspace_root)
+    def _clear_workspace_feedback_ledger(self, workspace_root: Path, *, node_id: str) -> None:
+        active_path = node_active_feedback_path(workspace_root, node_id)
         active_path.unlink(missing_ok=True)
 
     def _load_active_feedback_ledger(
         self,
         workspace_root: str | Path,
+        *,
+        node_id: str,
     ) -> dict[str, object] | None:
-        active_path = active_feedback_path(workspace_root)
+        active_path = node_active_feedback_path(workspace_root, node_id)
         if not active_path.is_file():
             return None
         try:
@@ -2062,7 +2897,10 @@ class RouterCore:
         self,
         record: NodeRuntimeRecord,
     ) -> tuple[str | None, bool, list[str]]:
-        ledger_payload = self._load_active_feedback_ledger(record.workspace_root)
+        ledger_payload = self._load_active_feedback_ledger(
+            record.workspace_root,
+            node_id=record.node_id,
+        )
         if ledger_payload is None:
             return None, False, []
         if self._feedback_bucket_has_blocking_findings(ledger_payload.get("implementer")):
@@ -2082,15 +2920,16 @@ class RouterCore:
         actor_kind: ActorKind,
         task_id: str | None = None,
     ) -> list[str]:
-        ledger_payload = self._load_active_feedback_ledger(record.workspace_root)
+        ledger_payload = self._load_active_feedback_ledger(
+            record.workspace_root,
+            node_id=record.node_id,
+        )
         if ledger_payload is None:
             return []
-        feedback_ref = ""
         findings: list[dict[str, object]] = []
         if actor_kind is ActorKind.IMPLEMENTER:
             bucket = ledger_payload.get("implementer")
             if isinstance(bucket, dict):
-                feedback_ref = str(bucket.get("feedback_ref") or "").strip()
                 findings = [
                     dict(item)
                     for item in list(bucket.get("findings") or [])
@@ -2099,7 +2938,6 @@ class RouterCore:
         elif actor_kind is ActorKind.EVALUATOR_CHECKER:
             bucket = ledger_payload.get("checker")
             if isinstance(bucket, dict):
-                feedback_ref = str(bucket.get("feedback_ref") or "").strip()
                 findings = [
                     dict(item)
                     for item in list(bucket.get("findings") or [])
@@ -2108,7 +2946,6 @@ class RouterCore:
         elif actor_kind is ActorKind.EVALUATOR_TESTER:
             bucket = ledger_payload.get("tester")
             if isinstance(bucket, dict):
-                feedback_ref = str(bucket.get("feedback_ref") or "").strip()
                 findings = [
                     dict(item)
                     for item in list(bucket.get("findings") or [])
@@ -2121,22 +2958,21 @@ class RouterCore:
                     continue
                 if str(bucket.get("task_id") or "").strip() != normalized_task_id:
                     continue
-                feedback_ref = str(bucket.get("feedback_ref") or "").strip()
                 findings = [
                     dict(item)
                     for item in list(bucket.get("findings") or [])
                     if isinstance(item, dict)
                 ]
                 break
-        if not findings and not feedback_ref:
+        if not findings:
             return []
         lines = [
             "Router active feedback for this actor:",
-            f"- Active feedback ledger: {active_feedback_path(record.workspace_root)}",
-            f"- Feedback history reference: {feedback_history_path(record.workspace_root)}",
+            f"- Active feedback ledger: {node_active_feedback_path(record.workspace_root, record.node_id)}",
+            f"- Feedback history reference: {node_feedback_history_path(record.workspace_root, record.node_id)}",
+            "- History may mention older snapshots or superseded task ids; current-pass outputs must use the current dispatched snapshot id injected by router.",
+            "- Active feedback is routing context, not authoritative proof. If it conflicts with current concrete evidence or current-node split truth injected by router, address that conflict explicitly instead of inheriting the finding blindly.",
         ]
-        if feedback_ref:
-            lines.append(f"- Actor feedback reference: {feedback_ref}")
         if findings:
             lines.append("- Active findings:")
             for finding in findings:
@@ -2163,7 +2999,7 @@ class RouterCore:
         feedback_submission: dict[str, object],
     ) -> Path:
         workspace_root = Path(record.workspace_root).expanduser().resolve()
-        snapshot_path = reviewer_feedback_submission_snapshot_path(
+        snapshot_path = reviewer_submission_snapshot_path(
             workspace_root,
             node_id=record.node_id,
             attempt_count=actor_attempt_count,
@@ -2174,9 +3010,10 @@ class RouterCore:
             encoding="utf-8",
         )
         active_payload = {
-            "version": 1,
+            "version": 2,
             "node_id": str(record.node_id),
             "reviewer_attempt_count": int(actor_attempt_count),
+            "snapshot_id": str(feedback_submission.get("snapshot_id") or ""),
             "verdict_kind": str(verdict_kind),
             "report_ref": str(report_ref),
             "feedback_submission_ref": str(feedback_submission_ref),
@@ -2187,13 +3024,13 @@ class RouterCore:
             "tester": dict(feedback_submission.get("tester") or {}),
             "ai_user": list(feedback_submission.get("ai_user") or []),
         }
-        active_path = active_feedback_path(workspace_root)
+        active_path = node_active_feedback_path(workspace_root, record.node_id)
         active_path.parent.mkdir(parents=True, exist_ok=True)
         active_path.write_text(
             json.dumps(active_payload, sort_keys=True, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )
-        history_path = feedback_history_path(workspace_root)
+        history_path = node_feedback_history_path(workspace_root, record.node_id)
         history_path.parent.mkdir(parents=True, exist_ok=True)
         with history_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(active_payload, sort_keys=True, separators=(",", ":")) + "\n")
@@ -2224,6 +3061,7 @@ class RouterCore:
         completion_path = actor_completion_record_path(
             record.workspace_root,
             item.actor_kind,
+            node_id=record.node_id,
             task_id=str(component.task_id or "").strip() or None,
         )
         completion_payload: dict[str, object] | None = None
@@ -2275,11 +3113,35 @@ class RouterCore:
                 if tasks_ref is None:
                     reason_lines.append("Checker completion must define an existing tasks_ref file.")
                 else:
+                    expected_tasks_ref = checker_current_tasks_path(
+                        record.workspace_root,
+                        record.node_id,
+                    )
+                    if tasks_ref != expected_tasks_ref:
+                        reason_lines.append(
+                            "Checker completion must use the canonical current manifest path "
+                            f"{expected_tasks_ref}; rewrite that file and resubmit."
+                        )
                     try:
-                        self._resolve_checker_tasks(tasks_ref)
+                        manifest = self._load_checker_task_manifest(tasks_ref)
                     except RouterBusinessError as exc:
                         reason_lines.append(exc.message)
-                    completion_payload["tasks_ref"] = str(tasks_ref)
+                    else:
+                        if int(manifest.get("version") or 0) != 2:
+                            reason_lines.append(
+                                "Checker completion must submit manifest version=2 with inline task entries."
+                            )
+                        if not reason_lines:
+                            try:
+                                accepted_tasks_ref = self._snapshot_checker_tasks(
+                                    record=record,
+                                    tasks_ref=tasks_ref,
+                                    attempt_count=int(component.attempt_count),
+                                )
+                            except RouterBusinessError as exc:
+                                reason_lines.append(exc.message)
+                            else:
+                                completion_payload["tasks_ref"] = str(accepted_tasks_ref)
             elif item.actor_kind is ActorKind.EVALUATOR_TESTER:
                 result_ref = self._resolve_existing_payload_file(
                     completion_payload.get("result_ref"),
@@ -2287,7 +3149,36 @@ class RouterCore:
                 if result_ref is None:
                     reason_lines.append("Evaluator tester completion must define an existing result_ref file.")
                 else:
-                    completion_payload["result_ref"] = str(result_ref)
+                    expected_result_ref = tester_current_result_path(
+                        record.workspace_root,
+                        record.node_id,
+                    )
+                    if result_ref != expected_result_ref:
+                        reason_lines.append(
+                            "Evaluator tester completion must use the canonical current result path "
+                            f"{expected_result_ref}; rewrite that file and resubmit."
+                        )
+                    reason_lines.extend(
+                        self._validate_tester_result_file(
+                            result_ref=result_ref,
+                            record=record,
+                        )
+                    )
+                    if not reason_lines:
+                        try:
+                            accepted_result_ref = self._snapshot_runtime_output(
+                                source_ref=result_ref,
+                                target_ref=tester_accepted_result_path(
+                                    record.workspace_root,
+                                    record.node_id,
+                                    attempt_count=int(component.attempt_count),
+                                ),
+                                label="Evaluator tester result",
+                            )
+                        except RouterBusinessError as exc:
+                            reason_lines.append(exc.message)
+                        else:
+                            completion_payload["result_ref"] = str(accepted_result_ref)
             elif item.actor_kind is ActorKind.EVALUATOR_AI_USER:
                 task_id = str(completion_payload.get("task_id") or "").strip()
                 if not task_id:
@@ -2318,7 +3209,39 @@ class RouterCore:
                 if result_ref is None:
                     reason_lines.append("Evaluator AI-user completion must define an existing result_ref file.")
                 else:
-                    completion_payload["result_ref"] = str(result_ref)
+                    expected_result_ref = ai_user_current_result_path(
+                        record.workspace_root,
+                        record.node_id,
+                        task_id=task_id,
+                    )
+                    if result_ref != expected_result_ref:
+                        reason_lines.append(
+                            "Evaluator AI-user completion must use the canonical current result path "
+                            f"{expected_result_ref}; rewrite that file and resubmit."
+                        )
+                    reason_lines.extend(
+                        self._validate_ai_user_result_file(
+                            result_ref=result_ref,
+                            record=record,
+                            task_id=task_id,
+                        )
+                    )
+                    if not reason_lines:
+                        try:
+                            accepted_result_ref = self._snapshot_runtime_output(
+                                source_ref=result_ref,
+                                target_ref=ai_user_accepted_result_path(
+                                    record.workspace_root,
+                                    record.node_id,
+                                    task_id=task_id,
+                                    attempt_count=int(component.attempt_count),
+                                ),
+                                label="Evaluator AI-user result",
+                            )
+                        except RouterBusinessError as exc:
+                            reason_lines.append(exc.message)
+                        else:
+                            completion_payload["result_ref"] = str(accepted_result_ref)
             elif item.actor_kind is ActorKind.EVALUATOR_REVIEWER:
                 verdict_kind = str(completion_payload.get("verdict_kind") or "").strip().upper()
                 if verdict_kind not in {"OK", "IMPLEMENTER_ACTION_REQUIRED", "EVALUATOR_FAULT"}:
@@ -2333,11 +3256,34 @@ class RouterCore:
                 if report_ref is None:
                     reason_lines.append("Reviewer completion must define an existing report_ref file.")
                 else:
-                    completion_payload["report_ref"] = str(report_ref)
+                    expected_report_ref = reviewer_current_report_path(
+                        record.workspace_root,
+                        record.node_id,
+                    )
+                    if report_ref != expected_report_ref:
+                        reason_lines.append(
+                            "Reviewer completion must use the canonical current report path "
+                            f"{expected_report_ref}; rewrite that file and resubmit."
+                        )
+                    reason_lines.extend(
+                        self._validate_reviewer_report_file(
+                            report_ref=report_ref,
+                            record=record,
+                        )
+                    )
                 feedback_ref = self._resolve_existing_payload_file(
                     completion_payload.get("feedback_ref"),
                 )
                 if feedback_ref is not None:
+                    expected_feedback_ref = reviewer_current_feedback_path(
+                        record.workspace_root,
+                        record.node_id,
+                    )
+                    if feedback_ref != expected_feedback_ref:
+                        reason_lines.append(
+                            "Reviewer completion must use the canonical current feedback path "
+                            f"{expected_feedback_ref}; rewrite that file and resubmit."
+                        )
                     normalized_feedback_submission, feedback_reason_lines = (
                         self._resolve_reviewer_feedback_submission(
                             record=record,
@@ -2345,8 +3291,31 @@ class RouterCore:
                         )
                     )
                     reason_lines.extend(feedback_reason_lines)
-                    if normalized_feedback_submission is not None:
-                        completion_payload["feedback_ref"] = str(feedback_ref)
+                    if normalized_feedback_submission is not None and report_ref is not None:
+                        try:
+                            accepted_feedback_ref = self._snapshot_runtime_output(
+                                source_ref=feedback_ref,
+                                target_ref=reviewer_accepted_feedback_path(
+                                    record.workspace_root,
+                                    record.node_id,
+                                    attempt_count=int(component.attempt_count),
+                                ),
+                                label="Reviewer feedback",
+                            )
+                            accepted_report_ref = self._snapshot_runtime_output(
+                                source_ref=report_ref,
+                                target_ref=reviewer_accepted_report_path(
+                                    record.workspace_root,
+                                    record.node_id,
+                                    attempt_count=int(component.attempt_count),
+                                ),
+                                label="Reviewer report",
+                            )
+                        except RouterBusinessError as exc:
+                            reason_lines.append(exc.message)
+                        else:
+                            completion_payload["feedback_ref"] = str(accepted_feedback_ref)
+                            completion_payload["report_ref"] = str(accepted_report_ref)
                         completion_payload["feedback_submission"] = normalized_feedback_submission
                 if verdict_kind == "OK":
                     result_commit, git_reason_lines = self._resolve_workspace_result_commit(
@@ -2411,11 +3380,15 @@ class RouterCore:
                             completion_payload["reason_ref"] = str(resolved_reason)
 
         output_fingerprint_after = workspace_output_fingerprint(record.workspace_root)
+        evaluator_runtime_only_actor = item.actor_kind in {
+            ActorKind.EVALUATOR_CHECKER,
+            ActorKind.EVALUATOR_TESTER,
+            ActorKind.EVALUATOR_AI_USER,
+            ActorKind.EVALUATOR_REVIEWER,
+        }
         if (
-            not (
-                item.actor_kind is ActorKind.KERNEL
-                and not bool(record.escalated_to_kernel)
-            )
+            not evaluator_runtime_only_actor
+            and item.actor_kind is not ActorKind.KERNEL
             and str(output_fingerprint_after) == str(component.workspace_fingerprint_before)
         ):
             if bool(component.saw_output_in_attempt):
@@ -2432,7 +3405,11 @@ class RouterCore:
             tasks_ref = Path(str(completion_payload.get("tasks_ref") or "")).expanduser().resolve()
             try:
                 completion_payload["tasks_ref"] = str(
-                    self._snapshot_checker_tasks(record=record, tasks_ref=tasks_ref)
+                    self._snapshot_checker_tasks(
+                        record=record,
+                        tasks_ref=tasks_ref,
+                        attempt_count=int(component.attempt_count),
+                    )
                 )
             except RouterBusinessError as exc:
                 reason_lines.append(exc.message)
@@ -2457,6 +3434,31 @@ class RouterCore:
         ]
         lines.extend([f"- {line}" for line in reason_lines])
         lines.extend(self._build_completion_contract_lines(actor_kind=actor_kind, routerctl=routerctl))
+        return lines
+
+    def _build_evaluator_fault_checker_prelude(
+        self,
+        *,
+        report_ref: str,
+        feedback_ref: str | None,
+        prior_checker_tasks_ref: str | None,
+    ) -> list[str]:
+        lines = [
+            "Reviewer reported evaluator-side fault.",
+            f"Reviewer report reference: {report_ref}",
+        ]
+        feedback_ref_text = str(feedback_ref or "").strip()
+        if feedback_ref_text:
+            lines.append(f"Reviewer feedback reference: {feedback_ref_text}")
+        prior_checker_tasks_ref_text = str(prior_checker_tasks_ref or "").strip()
+        if prior_checker_tasks_ref_text:
+            lines.append(f"Previous checker manifest reference: {prior_checker_tasks_ref_text}")
+        lines.extend(
+            [
+                "Previous evaluator wave ended in EVALUATOR_FAULT. Do not reproduce the prior checker manifest blindly.",
+                "Read the reviewer report and feedback first, identify the evaluator-side faults they call out, and correct those faults before emitting a new checker manifest.",
+            ]
+        )
         return lines
 
     def _recover_actor_after_exit(
@@ -2649,7 +3651,10 @@ class RouterCore:
             verdict_kind = str(completion_payload.get("verdict_kind") or "").strip().upper()
             report_ref = str(completion_payload.get("report_ref") or "").strip()
             result_commit = str(completion_payload.get("result_commit") or "").strip()
-            self._clear_workspace_feedback_ledger(Path(record.workspace_root))
+            self._clear_workspace_feedback_ledger(
+                Path(record.workspace_root),
+                node_id=record.node_id,
+            )
             if completion_payload.get("feedback_submission") is not None:
                 self._materialize_reviewer_feedback_ledger(
                     record=completed_record,
@@ -2707,17 +3712,26 @@ class RouterCore:
                 self._store.upsert_node(implementer_pending)
                 return self._launch_implementer_for_record(implementer_pending)
             if restart_target == "checker":
+                feedback_ref = str(completion_payload.get("feedback_ref") or "").strip()
                 checker_pending = replace(
                     reviewer_completed,
                     current_components=[],
                     evaluator_phase="checker",
                     checker_tasks_ref="",
                     task_result_refs={},
-                    pending_prelude_lines=[
-                        "Reviewer reported evaluator-side fault.",
-                        f"Reviewer report reference: {report_ref}",
-                        "Re-run evaluator from checker and keep evaluator-side blame on the evaluator path.",
-                    ],
+                    pending_prelude_lines=(
+                        self._build_evaluator_fault_checker_prelude(
+                            report_ref=report_ref,
+                            feedback_ref=feedback_ref,
+                            prior_checker_tasks_ref=str(reviewer_completed.checker_tasks_ref or ""),
+                        )
+                        if verdict_kind == "EVALUATOR_FAULT"
+                        else [
+                            "Reviewer reported evaluator-side fault.",
+                            f"Reviewer report reference: {report_ref}",
+                            "Re-run evaluator from checker and keep evaluator-side blame on the evaluator path.",
+                        ]
+                    ),
                 )
                 self._store.upsert_node(checker_pending)
                 return self._launch_checker_for_node(checker_pending)
@@ -2761,17 +3775,18 @@ class RouterCore:
                 self._store.upsert_node(implementer_pending)
                 return self._launch_implementer_for_record(implementer_pending)
             if verdict_kind == "EVALUATOR_FAULT":
+                feedback_ref = str(completion_payload.get("feedback_ref") or "").strip()
                 checker_pending = replace(
                     reviewer_completed,
                     current_components=[],
                     evaluator_phase="checker",
                     checker_tasks_ref="",
                     task_result_refs={},
-                    pending_prelude_lines=[
-                        "Reviewer reported evaluator-side fault.",
-                        f"Reviewer report reference: {report_ref}",
-                        "Re-run evaluator from checker and keep evaluator-side blame on the evaluator path.",
-                    ],
+                    pending_prelude_lines=self._build_evaluator_fault_checker_prelude(
+                        report_ref=report_ref,
+                        feedback_ref=feedback_ref,
+                        prior_checker_tasks_ref=str(reviewer_completed.checker_tasks_ref or ""),
+                    ),
                 )
                 self._store.upsert_node(checker_pending)
                 return self._launch_checker_for_node(checker_pending)
@@ -2962,7 +3977,7 @@ class RouterCore:
             ],
         )
 
-    def _resolve_checker_tasks(self, tasks_ref: Path) -> list[dict[str, str]]:
+    def _load_checker_task_manifest(self, tasks_ref: Path) -> dict[str, object]:
         resolved = Path(tasks_ref).expanduser().resolve()
         try:
             payload = json.loads(resolved.read_text(encoding="utf-8"))
@@ -2976,82 +3991,172 @@ class RouterCore:
             ) from exc
         if not isinstance(payload, dict):
             raise InvalidCheckerTasksError("checker tasks payload must decode to an object")
-        if int(payload.get("version") or 0) != 1:
-            raise InvalidCheckerTasksError("checker tasks payload must use version=1")
+        try:
+            version = int(payload.get("version") or 0)
+        except (TypeError, ValueError):
+            version = -1
+        if version not in {1, 2}:
+            raise InvalidCheckerTasksError("checker tasks payload must use version=1 or version=2")
+        if version == 2:
+            allowed_top_keys = {
+                "version",
+                "snapshot_id",
+                "workspace_root",
+                "authoritative_final_effects_path",
+                "obligations",
+                "tasks",
+            }
+            extra_keys = sorted(set(payload) - allowed_top_keys)
+            if extra_keys:
+                raise InvalidCheckerTasksError(
+                    "checker version=2 manifest contains unsupported top-level keys: "
+                    + ", ".join(extra_keys)
+                )
+            if not isinstance(payload.get("obligations"), list):
+                raise InvalidCheckerTasksError(
+                    "checker version=2 manifest must define obligations as a list"
+                )
         tasks = payload.get("tasks")
         if not isinstance(tasks, list) or not tasks:
             raise InvalidCheckerTasksError(
                 "checker tasks payload must contain a non-empty tasks list"
             )
-        normalized: list[dict[str, str]] = []
+        normalized_tasks: list[dict[str, object]] = []
         seen_task_ids: set[str] = set()
         for task in tasks:
             if not isinstance(task, dict):
                 raise InvalidCheckerTasksError("checker tasks entries must be objects")
             task_id = str(task.get("task_id") or "").strip()
-            task_ref = str(task.get("task_ref") or "").strip()
-            if not task_id or not task_ref:
-                raise InvalidCheckerTasksError(
-                    "checker tasks entries must define task_id and task_ref"
-                )
+            if not task_id:
+                raise InvalidCheckerTasksError("checker tasks entries must define task_id")
             if task_id in seen_task_ids:
                 raise InvalidCheckerTasksError(
                     f"checker tasks payload must not reuse task_id {task_id!r}"
                 )
             seen_task_ids.add(task_id)
-            normalized.append(
-                {
-                    "task_id": task_id,
-                    "task_ref": str(Path(task_ref).expanduser().resolve()),
-                }
-            )
-        return normalized
-
-    def _snapshot_checker_tasks(self, *, record: NodeRuntimeRecord, tasks_ref: Path) -> Path:
-        tasks = self._resolve_checker_tasks(tasks_ref)
-        snapshot_root = (
-            self._store.db_path.parent
-            / "router"
-            / "checker_tasks"
-            / f"node-{record.node_id}"
-            / f"snapshot-{uuid.uuid4().hex}"
-        ).resolve()
-        try:
-            snapshot_root.mkdir(parents=True, exist_ok=False)
-            snapshot_tasks: list[dict[str, str]] = []
-            for task in tasks:
-                task_id = str(task["task_id"])
-                source_ref = Path(str(task["task_ref"])).expanduser().resolve()
-                if not source_ref.exists() or not source_ref.is_file():
+            if version == 1:
+                task_ref = str(task.get("task_ref") or "").strip()
+                if not task_ref:
+                    raise InvalidCheckerTasksError(
+                        "checker version=1 tasks entries must define task_ref"
+                    )
+                task_ref_path = Path(task_ref).expanduser().resolve()
+                if not task_ref_path.exists() or not task_ref_path.is_file():
                     raise InvalidCheckerTasksError(
                         f"checker task_ref for task {task_id!r} must exist and be a regular file"
                     )
-                copied_ref = (snapshot_root / f"{task_id}{source_ref.suffix}").resolve()
-                shutil.copy2(source_ref, copied_ref)
-                snapshot_tasks.append(
+                normalized_tasks.append(
                     {
                         "task_id": task_id,
-                        "task_ref": str(copied_ref),
+                        "task_ref": str(task_ref_path),
+                        "covered_requirement_ids": list(task.get("covered_requirement_ids") or []),
+                        "goal": str(task.get("goal") or "").strip(),
+                        "blocking_condition": str(task.get("blocking_condition") or "").strip(),
+                        "task_instructions": task_ref_path.read_text(
+                            encoding="utf-8",
+                            errors="replace",
+                        ),
+                        "required_evidence": list(task.get("required_evidence") or task.get("required_artifacts") or []),
                     }
                 )
-            snapshot_manifest = (snapshot_root / "tasks.json").resolve()
-            snapshot_manifest.write_text(
-                json.dumps(
-                    {
-                        "version": 1,
-                        "tasks": snapshot_tasks,
-                    },
-                    indent=2,
-                    sort_keys=True,
-                ),
+                continue
+            allowed_task_keys = {
+                "task_id",
+                "covered_requirement_ids",
+                "goal",
+                "blocking_condition",
+                "task_instructions",
+                "required_evidence",
+            }
+            extra_task_keys = sorted(set(task) - allowed_task_keys)
+            if extra_task_keys:
+                raise InvalidCheckerTasksError(
+                    f"checker version=2 task {task_id!r} contains unsupported keys: {', '.join(extra_task_keys)}"
+                )
+            covered_requirement_ids = task.get("covered_requirement_ids")
+            if not isinstance(covered_requirement_ids, list):
+                raise InvalidCheckerTasksError(
+                    f"checker version=2 task {task_id!r} must define covered_requirement_ids as a list"
+                )
+            required_evidence = task.get("required_evidence")
+            if not isinstance(required_evidence, list):
+                raise InvalidCheckerTasksError(
+                    f"checker version=2 task {task_id!r} must define required_evidence as a list"
+                )
+            goal = str(task.get("goal") or "").strip()
+            blocking_condition = str(task.get("blocking_condition") or "").strip()
+            task_instructions = str(task.get("task_instructions") or "").strip()
+            if not goal or not blocking_condition or not task_instructions:
+                raise InvalidCheckerTasksError(
+                    f"checker version=2 task {task_id!r} must define goal, blocking_condition, and task_instructions"
+                )
+            normalized_tasks.append(
+                {
+                    "task_id": task_id,
+                    "covered_requirement_ids": [str(item) for item in covered_requirement_ids],
+                    "goal": goal,
+                    "blocking_condition": blocking_condition,
+                    "task_instructions": task_instructions,
+                    "required_evidence": [str(item) for item in required_evidence],
+                }
+            )
+        snapshot_id = str(payload.get("snapshot_id") or "").strip()
+        return {
+            "version": version,
+            "snapshot_id": snapshot_id,
+            "workspace_root": str(payload.get("workspace_root") or "").strip(),
+            "authoritative_final_effects_path": str(
+                payload.get("authoritative_final_effects_path") or ""
+            ).strip(),
+            "obligations": list(payload.get("obligations") or []),
+            "tasks_ref": str(resolved),
+            "tasks": normalized_tasks,
+        }
+
+    def _resolve_checker_tasks(self, tasks_ref: Path) -> list[dict[str, object]]:
+        return list(self._load_checker_task_manifest(tasks_ref).get("tasks") or [])
+
+    def _snapshot_checker_tasks(
+        self,
+        *,
+        record: NodeRuntimeRecord,
+        tasks_ref: Path,
+        attempt_count: int,
+    ) -> Path:
+        manifest = self._load_checker_task_manifest(tasks_ref)
+        snapshot_id = f"snapshot-{uuid.uuid4().hex}"
+        accepted_path = checker_accepted_tasks_path(
+            record.workspace_root,
+            record.node_id,
+            attempt_count=attempt_count,
+        )
+        accepted_path.parent.mkdir(parents=True, exist_ok=True)
+        accepted_payload = {
+            "version": 2,
+            "snapshot_id": snapshot_id,
+            "workspace_root": str(record.workspace_root),
+            "authoritative_final_effects_path": str(record.final_effects_file),
+            "obligations": list(manifest.get("obligations") or []),
+            "tasks": [
+                {
+                    "task_id": str(task["task_id"]),
+                    "covered_requirement_ids": list(task.get("covered_requirement_ids") or []),
+                    "goal": str(task.get("goal") or "").strip(),
+                    "blocking_condition": str(task.get("blocking_condition") or "").strip(),
+                    "task_instructions": str(task.get("task_instructions") or "").strip(),
+                    "required_evidence": list(task.get("required_evidence") or []),
+                }
+                for task in list(manifest.get("tasks") or [])
+            ],
+        }
+        try:
+            accepted_path.write_text(
+                json.dumps(accepted_payload, indent=2, sort_keys=True),
                 encoding="utf-8",
             )
-            return snapshot_manifest
-        except RouterBusinessError:
-            shutil.rmtree(snapshot_root, ignore_errors=True)
-            raise
+            return accepted_path
         except Exception as exc:
-            shutil.rmtree(snapshot_root, ignore_errors=True)
+            accepted_path.unlink(missing_ok=True)
             raise InvalidCheckerTasksError(
                 f"checker task manifest snapshot failed: {exc}"
             ) from exc
@@ -3061,7 +4166,7 @@ class RouterCore:
         record: NodeRuntimeRecord,
         *,
         limit: int | None = None,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, object]]:
         checker_tasks_ref = str(record.checker_tasks_ref or "").strip()
         if not checker_tasks_ref:
             raise InvalidCheckerTasksError("checker task manifest is missing while evaluator_phase=tasks")
@@ -3075,7 +4180,7 @@ class RouterCore:
             for actor in record.current_components
             if actor.actor_kind is ActorKind.EVALUATOR_AI_USER and str(actor.task_id or "").strip()
         }
-        pending: list[dict[str, str]] = []
+        pending: list[dict[str, object]] = []
         for task in tasks:
             task_id = str(task["task_id"])
             task_results = task_result_refs.get(task_id, {})
@@ -3083,43 +4188,93 @@ class RouterCore:
                 continue
             if task_id in running_ai_user_task_ids:
                 continue
-            pending.append(
-                {
-                    "task_id": task_id,
-                    "task_ref": str(task["task_ref"]),
-                }
-            )
+            pending.append(dict(task))
             if limit is not None and len(pending) >= int(limit):
                 break
         return pending
 
+    def _checker_manifest_context(self, record: NodeRuntimeRecord) -> tuple[str, str]:
+        checker_tasks_ref = str(record.checker_tasks_ref or "").strip()
+        if not checker_tasks_ref:
+            return "", ""
+        try:
+            manifest = self._load_checker_task_manifest(Path(checker_tasks_ref))
+        except RouterBusinessError:
+            return checker_tasks_ref, ""
+        return checker_tasks_ref, str(manifest.get("snapshot_id") or "").strip()
+
+    def _build_current_node_split_truth_prelude(
+        self,
+        record: NodeRuntimeRecord,
+    ) -> list[str]:
+        return [
+            f"Current node split_request: {int(record.split_request)}",
+            f"Current node split_approved: {int(record.split_approved)}",
+            f"Current node child_node_ids: {json.dumps([str(item) for item in record.child_node_ids])}",
+        ]
+
     def _build_serial_task_prelude(
         self,
         *,
-        task_id: str,
-        task_ref: str,
-        actor_kind: ActorKind,
+        record: NodeRuntimeRecord,
+        task_entry: dict[str, object],
     ) -> list[str]:
+        task_id = str(task_entry.get("task_id") or "").strip()
+        checker_tasks_ref, snapshot_id = self._checker_manifest_context(record)
+        result_path = ai_user_current_result_path(
+            record.workspace_root,
+            record.node_id,
+            task_id=task_id,
+        )
+        artifacts_dir = ai_user_artifacts_dir(
+            record.workspace_root,
+            record.node_id,
+            task_id=task_id,
+        )
         return [
             "Router evaluator lane dispatch.",
             f"Evaluator task id: {task_id}",
-            f"Evaluator task reference: {task_ref}",
-            f"Complete this {actor_kind.value} task and record completion via router control before exiting.",
+            f"Current dispatched snapshot id: {snapshot_id or '<pending-snapshot-id>'}",
+            f"Authoritative checker manifest path: {checker_tasks_ref}",
+            f"Your only durable result path: {result_path}",
+            f"Your task-local artifacts directory: {artifacts_dir}",
+            *self._build_current_node_split_truth_prelude(record),
+            "The JSON object below is your only routed task truth for this lane.",
+            "--- BEGIN TASK ENTRY JSON ---",
+            json.dumps(task_entry, indent=2, sort_keys=True),
+            "--- END TASK ENTRY JSON ---",
+            "Complete this evaluator_ai_user task and record completion via router control before exiting.",
         ]
 
     def _build_tester_review_prelude(self, record: NodeRuntimeRecord) -> list[str]:
+        checker_tasks_ref, snapshot_id = self._checker_manifest_context(record)
         lines = [
             "Router evaluator tester dispatch.",
             "Run one global code review over the current workspace changes and write a single review report.",
-            f"Checker tasks reference: {record.checker_tasks_ref}",
+            f"Current dispatched snapshot id: {snapshot_id or '<pending-snapshot-id>'}",
+            f"Authoritative checker manifest path: {checker_tasks_ref}",
+            f"Your only durable result path: {tester_current_result_path(record.workspace_root, record.node_id)}",
             "This tester run is global, not per-task.",
         ]
         return lines
 
+    def _build_checker_dispatch_prelude(self, record: NodeRuntimeRecord) -> list[str]:
+        return [
+            "Router evaluator checker dispatch.",
+            f"Your only durable checker manifest path: {checker_current_tasks_path(record.workspace_root, record.node_id)}",
+            "Router will assign the dispatched snapshot id when that manifest is accepted.",
+            "Do not write checker sidecar truth under workspace root; keep evaluator durability inside .loop/router_runtime.",
+        ]
+
     def _build_reviewer_prelude(self, record: NodeRuntimeRecord) -> list[str]:
+        checker_tasks_ref, snapshot_id = self._checker_manifest_context(record)
         lines = [
             "Router evaluator reviewer dispatch.",
-            f"Checker tasks reference: {record.checker_tasks_ref}",
+            f"Current dispatched snapshot id: {snapshot_id or '<pending-snapshot-id>'}",
+            f"Authoritative checker manifest path: {checker_tasks_ref}",
+            f"Your only durable feedback path: {reviewer_current_feedback_path(record.workspace_root, record.node_id)}",
+            f"Your only durable report path: {reviewer_current_report_path(record.workspace_root, record.node_id)}",
+            *self._build_current_node_split_truth_prelude(record),
             "Lane results collected so far:",
         ]
         if not record.task_result_refs:
@@ -3196,7 +4351,7 @@ class RouterCore:
                 kernel_pending,
                 self._build_kernel_review_prelude(
                     request_seq=int(pending.request_seq),
-                    source_node_id=pending.node_id,
+                    source_record=source_record,
                     split_bundle_ref=split_bundle_ref,
                     durable_commit=durable_commit,
                     diff_fingerprint=diff_fingerprint,
@@ -3278,6 +4433,7 @@ class RouterCore:
                     pending_record,
                     actor_kind=ActorKind.EVALUATOR_CHECKER,
                 ),
+                self._build_checker_dispatch_prelude(pending_record),
                 prelude_lines,
             ),
         )
@@ -3322,9 +4478,9 @@ class RouterCore:
         self,
         record: NodeRuntimeRecord,
         *,
-        task_id: str,
-        task_ref: str,
+        task_entry: dict[str, object],
     ) -> NodeRuntimeRecord:
+        task_id = str(task_entry.get("task_id") or "").strip()
         pending_record = replace(record, evaluator_phase="tasks")
         self._store.upsert_node(pending_record)
         spec = self._build_actor_launch_spec(
@@ -3341,9 +4497,8 @@ class RouterCore:
                     task_id=str(task_id),
                 ),
                 self._build_serial_task_prelude(
-                    task_id=str(task_id),
-                    task_ref=str(task_ref),
-                    actor_kind=ActorKind.EVALUATOR_AI_USER,
+                    record=pending_record,
+                    task_entry=dict(task_entry),
                 ),
             ),
             extra_env={"LOOP_TASK_ID": str(task_id)},
@@ -3416,10 +4571,19 @@ class RouterCore:
         )
         try:
             _run_git(repo_root, "worktree", "add", "--detach", str(takeover_root), base_commit)
+            takeover_final_effects = (takeover_root / relative_final_effects).resolve()
+            _materialize_workspace_file_into_worktree(
+                source_file=Path(source_record.final_effects_file),
+                target_file=takeover_final_effects,
+                missing_error=(
+                    "kernel takeover source final_effects_file was not materialized into the git worktree: "
+                    f"{takeover_final_effects}"
+                ),
+            )
         except Exception:
             self._cleanup_git_worktree(repo_root=repo_root, worktree_root=takeover_root)
             raise
-        return takeover_root, (takeover_root / relative_final_effects).resolve()
+        return takeover_root, takeover_final_effects
 
     def _write_kernel_takeover_report(
         self,
@@ -3562,6 +4726,29 @@ class RouterCore:
         if record is None or int(record.split_approved) != 1:
             self._observe_placeholder(item)
             return
+        parent_after_merge_ref = self._resolve_parent_after_merge_final_effects_ref(
+            parent_record=record,
+        )
+        takeover_lines = [
+            "Router takeover dispatch after child merge conflict.",
+            f"Takeover id: {takeover_id}",
+            f"Takeover resolution reference: {resolution_ref}",
+        ]
+        if parent_after_merge_ref:
+            takeover_lines.extend(
+                [
+                    "First resolve the existing git merge conflicts in this workspace, then continue the approved parent-after-merge residual scope.",
+                    f"Approved parent-after-merge final effects reference: {parent_after_merge_ref}",
+                    "Do not expand scope beyond the original parent FINAL_EFFECTS.md and the approved residual scope.",
+                ]
+            )
+        else:
+            takeover_lines.extend(
+                [
+                    "Your only job is to resolve the existing git merge conflicts in this workspace.",
+                    "Do not expand scope, redesign the task, or make unrelated changes.",
+                ]
+            )
         takeover_pending = replace(
             record,
             split_request=0,
@@ -3575,13 +4762,7 @@ class RouterCore:
             reviewer_report_ref="",
             current_components=[],
             result_commit="",
-            pending_prelude_lines=[
-                "Router takeover dispatch after child merge conflict.",
-                f"Takeover id: {takeover_id}",
-                f"Takeover resolution reference: {resolution_ref}",
-                "Your only job is to resolve the existing git merge conflicts in this workspace.",
-                "Do not expand scope, redesign the task, or make unrelated changes.",
-            ],
+            pending_prelude_lines=takeover_lines,
         )
         self._store.upsert_node(takeover_pending)
         self._launch_implementer_for_record(takeover_pending)
@@ -3599,11 +4780,31 @@ class RouterCore:
             dirty_paths = _substantive_git_dirty_paths(resolved)
         except Exception as exc:  # noqa: BLE001
             return "", [f"Workspace git cleanliness could not be checked: {exc}"]
-        if dirty_paths:
+        if not dirty_paths:
+            return head_commit, []
+        try:
+            result_commit = _create_workspace_result_commit(resolved, paths=dirty_paths)
+        except Exception as exc:  # noqa: BLE001
             preview = ", ".join(dirty_paths[:5])
             suffix = " ..." if len(dirty_paths) > 5 else ""
-            return "", [f"Workspace has substantive uncommitted git changes: {preview}{suffix}"]
-        return head_commit, []
+            return "", [
+                "Router could not create a result commit for substantive workspace changes "
+                f"({preview}{suffix}): {exc}"
+            ]
+        if not result_commit:
+            return "", ["Router created no result commit for substantive workspace changes."]
+        try:
+            remaining_dirty = _substantive_git_dirty_paths(resolved)
+        except Exception as exc:  # noqa: BLE001
+            return "", [f"Workspace git cleanliness could not be checked after router result commit: {exc}"]
+        if remaining_dirty:
+            preview = ", ".join(remaining_dirty[:5])
+            suffix = " ..." if len(remaining_dirty) > 5 else ""
+            return "", [
+                "Workspace still has substantive uncommitted git changes after router result commit: "
+                f"{preview}{suffix}"
+            ]
+        return result_commit, []
 
     def _child_result_records_for_parent(
         self,
@@ -3804,10 +5005,36 @@ class RouterCore:
         )
         try:
             _run_git(parent_repo_root, "worktree", "add", "--detach", str(integration_root), base_commit)
+            integration_final_effects = (integration_root / relative_final_effects).resolve()
+            _materialize_workspace_file_into_worktree(
+                source_file=Path(parent_record.final_effects_file),
+                target_file=integration_final_effects,
+                missing_error=(
+                    "parent integration final_effects_file was not materialized into the git worktree: "
+                    f"{integration_final_effects}"
+                ),
+            )
         except Exception:
             self._cleanup_git_worktree(repo_root=parent_repo_root, worktree_root=integration_root)
             raise
-        return integration_root, (integration_root / relative_final_effects).resolve()
+        return integration_root, integration_final_effects
+
+    def _resolve_parent_after_merge_final_effects_ref(
+        self,
+        *,
+        parent_record: NodeRuntimeRecord,
+    ) -> str:
+        request_seq = int(parent_record.approved_split_request_seq or 0)
+        if request_seq <= 0:
+            return ""
+        try:
+            bundle_dir, proposal = self._resolve_request_split_bundle(request_seq)
+        except InvalidSplitBundleError:
+            return ""
+        parent_after_merge = proposal.parent_after_merge
+        if parent_after_merge is None:
+            return ""
+        return str((bundle_dir / parent_after_merge.final_effects_file).resolve())
 
     def _write_takeover_report(
         self,
@@ -3847,6 +5074,9 @@ class RouterCore:
         child_records = self._child_result_records_for_parent(parent_record)
         if child_records is None:
             return
+        parent_after_merge_ref = self._resolve_parent_after_merge_final_effects_ref(
+            parent_record=parent_record,
+        )
         takeover_id = uuid.uuid4().hex
         integration_root, integration_final_effects = self._prepare_parent_integration_workspace(
             parent_record=parent_record,
@@ -3906,6 +5136,34 @@ class RouterCore:
                     f"{str(merge_proc.stderr or '').strip() or str(merge_proc.stdout or '').strip() or 'unknown error'}"
                 )
             result_commit = _resolve_workspace_durable_commit(integration_root)
+            if parent_after_merge_ref:
+                pending_lines = [
+                    "Router resume after clean child merge.",
+                    f"Merged child result commits into workspace: {result_commit}",
+                    f"Approved parent-after-merge final effects reference: {parent_after_merge_ref}",
+                    "Continue implementing the approved parent-after-merge residual scope from this merged workspace before completing.",
+                    "Do not expand scope beyond the original parent FINAL_EFFECTS.md and the approved residual scope.",
+                ]
+                residual_record = replace(
+                    parent_record,
+                    split_request=0,
+                    split_approved=0,
+                    approved_split_request_seq=0,
+                    workspace_root=str(integration_root),
+                    final_effects_file=str(integration_final_effects),
+                    current_components=[],
+                    evaluator_phase="",
+                    checker_tasks_ref="",
+                    task_result_refs={},
+                    reviewer_verdict_kind="",
+                    reviewer_report_ref="",
+                    pending_prelude_lines=pending_lines,
+                    durable_commit=result_commit,
+                    result_commit="",
+                )
+                self._store.upsert_node(residual_record)
+                self._launch_implementer_for_record(residual_record)
+                return
             final_record = replace(
                 parent_record,
                 split_request=0,
@@ -3940,62 +5198,19 @@ class RouterCore:
         payload = json.loads(request_item.payload_json)
         return str(payload.get("diff_fingerprint") or "")
 
-    def _resolve_request_split_bundle(self, request_seq: int) -> tuple[Path, list[dict[str, str]]]:
+    def _resolve_request_split_bundle(self, request_seq: int) -> tuple[Path, SplitProposal]:
         request_item = self._store.load_event(request_seq)
         if request_item is None or request_item.event_type != "RequestSplit":
             raise InvalidSplitBundleError(f"missing RequestSplit for request_seq={request_seq}")
         payload = self._load_event_payload_dict(request_item)
-        bundle_dir = Path(
+        return parse_split_bundle(
             self._payload_required_str(
                 payload,
                 event_type=request_item.event_type,
                 field_name="split_bundle_ref",
-            )
-        ).expanduser().resolve()
-        proposal_path = (bundle_dir / "proposal.json").resolve()
-        try:
-            proposal = json.loads(proposal_path.read_text(encoding="utf-8"))
-        except FileNotFoundError as exc:
-            raise InvalidSplitBundleError(
-                f"split bundle is missing proposal.json: {proposal_path}"
-            ) from exc
-        except json.JSONDecodeError as exc:
-            raise InvalidSplitBundleError(
-                f"split bundle proposal.json must be valid JSON: {proposal_path}"
-            ) from exc
-        if not isinstance(proposal, dict):
-            raise InvalidSplitBundleError("split bundle proposal.json must decode to an object")
-        if int(proposal.get("version") or 0) != 1:
-            raise InvalidSplitBundleError("split bundle proposal.json must use version=1")
-        children = proposal.get("children")
-        if not isinstance(children, list) or not children:
-            raise InvalidSplitBundleError("split bundle proposal.json must contain children")
-        normalized_children: list[dict[str, str]] = []
-        for child in children:
-            name = str(child.get("name") or "").strip()
-            rel_final_effects = str(child.get("final_effects_file") or "").strip()
-            if not name or not rel_final_effects:
-                raise InvalidSplitBundleError(
-                    "split bundle child entries must define name and final_effects_file"
-                )
-            candidate_path = (bundle_dir / rel_final_effects).resolve()
-            try:
-                candidate_path.relative_to(bundle_dir)
-            except ValueError as exc:
-                raise InvalidSplitBundleError(
-                    f"split bundle child {name!r} final_effects_file must stay inside the bundle directory"
-                ) from exc
-            if not candidate_path.exists() or not candidate_path.is_file():
-                raise InvalidSplitBundleError(
-                    f"split bundle child {name!r} final_effects_file does not exist"
-                )
-            normalized_children.append(
-                {
-                    "name": name,
-                    "final_effects_file": rel_final_effects,
-                }
-            )
-        return bundle_dir, normalized_children
+            ),
+            error_type=InvalidSplitBundleError,
+        )
 
     def _clear_split_request_after_kernel_failure(self, node_id: str, request_seq: int) -> None:
         record = self._store.load_node(node_id)
@@ -4033,7 +5248,12 @@ class RouterCore:
         )
 
     def _maybe_request_router_terminal_shutdown(self) -> None:
-        if str(self._store.read_router_status() or "").strip() in {"terminal_failed", "completed"}:
+        router_status = str(self._store.read_router_status() or "").strip()
+        if router_status == "paused":
+            self._terminate_all_running_actors_best_effort()
+            self._request_router_terminal_shutdown()
+            return
+        if router_status in {"terminal_failed", "completed"}:
             self._request_router_terminal_shutdown()
             return
         frontier_total = 0
@@ -4086,6 +5306,27 @@ class RouterCore:
         )
         self._request_router_terminal_shutdown()
 
+    def _terminate_all_running_actors_best_effort(self) -> None:
+        proc_supervisor = self._proc_supervisor
+        terminate_actor = (
+            None if proc_supervisor is None else getattr(proc_supervisor, "terminate_actor", None)
+        )
+        for record in self._store.list_nodes():
+            for actor_ref in list(record.current_components):
+                terminated = False
+                if callable(terminate_actor):
+                    terminated = bool(terminate_actor(actor_ref))
+                if terminated:
+                    continue
+                component = self._component_state_for_actor(record, actor_ref)
+                pid = 0 if component is None else int(component.pid or 0)
+                if pid <= 0:
+                    continue
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+
     def _build_reject_recovery_prelude(self, reason_ref: str | None) -> list[str]:
         lines = [
             "Router resume after split rejection.",
@@ -4102,7 +5343,8 @@ class RouterCore:
         parent_record: NodeRuntimeRecord,
         request_seq: int,
     ) -> tuple[NodeRuntimeRecord, list[NodeRuntimeRecord]]:
-        bundle_dir, children = self._resolve_request_split_bundle(request_seq)
+        bundle_dir, proposal = self._resolve_request_split_bundle(request_seq)
+        children = list(proposal.children)
         child_ids = (
             list(parent_record.child_node_ids)
             if parent_record.child_node_ids
@@ -4122,7 +5364,7 @@ class RouterCore:
                     parent_record=parent_record,
                     child_id=str(child_id),
                     bundle_dir=bundle_dir,
-                    rel_final_effects=str(child["final_effects_file"]),
+                    rel_final_effects=str(child.final_effects_file),
                 )
                 child_record = NodeRuntimeRecord(
                     node_id=str(child_id),
@@ -4248,7 +5490,10 @@ class RouterCore:
                 )
 
     def _reconcile_pending_launches_once(self) -> None:
-        if str(self._store.read_router_status() or "").strip() in {"terminal_failed", "completed"}:
+        if str(self._store.read_router_status() or "").strip() in {"paused", "terminal_failed", "completed"}:
+            if str(self._store.read_router_status() or "").strip() == "paused":
+                self._terminate_all_running_actors_best_effort()
+                self._request_router_terminal_shutdown()
             return
         pending_reviews = self._store.list_pending_split_reviews()
         if pending_reviews and self._store.load_node(KERNEL_NODE_ID) is None:
@@ -4274,6 +5519,8 @@ class RouterCore:
             return
         if str(record.node_id) == ROOT_NODE_ID and str(record.result_commit or "").strip():
             self._activate_final_kernel_takeover(source_record=record)
+            return
+        if str(record.result_commit or "").strip():
             return
         if int(record.split_approved) == 1:
             materialization_incomplete = not record.child_node_ids or any(
@@ -4383,8 +5630,7 @@ class RouterCore:
                 ):
                     pending_record = self._launch_ai_user_task(
                         pending_record,
-                        task_id=str(task["task_id"]),
-                        task_ref=str(task["task_ref"]),
+                        task_entry=dict(task),
                     )
             if self._has_running_actor_kind(pending_record, ActorKind.EVALUATOR_TESTER):
                 return pending_record

@@ -336,6 +336,10 @@ def main() -> int:
             return _fail("fresh store kernel_started_at must default to empty string")
         if store.read_router_status() != "":
             return _fail("fresh store router_status must default to empty string")
+        if store.read_router_paused_reason_json() != "":
+            return _fail("fresh store router_paused_reason_json must default to empty string")
+        if store.read_router_paused_at() != "":
+            return _fail("fresh store router_paused_at must default to empty string")
         if store.read_router_terminal_reason_json() != "":
             return _fail("fresh store router_terminal_reason_json must default to empty string")
         if store.read_router_terminal_at() != "":
@@ -364,6 +368,29 @@ def main() -> int:
             return _fail("store must persist kernel_started_at updates")
         if store.read_router_status() != "terminal_failed":
             return _fail("store must persist router_status updates")
+        store.write_router_paused_state(
+            router_status="paused",
+            router_paused_reason_json='{"reason":"manual pause"}',
+            router_paused_at="2026-04-05T12:00:00+00:00",
+        )
+        if store.read_router_status() != "paused":
+            return _fail("store must persist paused router_status updates")
+        if store.read_router_paused_reason_json() != '{"reason":"manual pause"}':
+            return _fail("store must persist router_paused_reason_json updates")
+        if store.read_router_paused_at() != "2026-04-05T12:00:00+00:00":
+            return _fail("store must persist router_paused_at updates")
+        store.clear_router_pause_state()
+        if store.read_router_status() != "":
+            return _fail("clearing router pause state must clear router_status")
+        if store.read_router_paused_reason_json() != "":
+            return _fail("clearing router pause state must clear router_paused_reason_json")
+        if store.read_router_paused_at() != "":
+            return _fail("clearing router pause state must clear router_paused_at")
+        store.write_router_terminal_state(
+            router_status="terminal_failed",
+            router_terminal_reason_json='{"reason":"majority_frontier_terminal_failed"}',
+            router_terminal_at="2026-04-05T00:00:00+00:00",
+        )
         if store.read_router_terminal_reason_json() != '{"reason":"majority_frontier_terminal_failed"}':
             return _fail("store must persist router_terminal_reason_json updates")
         if store.read_router_terminal_at() != "2026-04-05T00:00:00+00:00":
@@ -398,6 +425,10 @@ def main() -> int:
             return _fail("reopened store must preserve kernel_started_at")
         if reopened.read_router_status() != "completed":
             return _fail("reopened store must preserve completed router_status")
+        if reopened.read_router_paused_reason_json() != "":
+            return _fail("reopened completed store must preserve cleared router_paused_reason_json")
+        if reopened.read_router_paused_at() != "":
+            return _fail("reopened completed store must preserve cleared router_paused_at")
         if reopened.read_router_completed_result_commit() != "fedcba654321":
             return _fail("reopened store must preserve router_completed_result_commit")
         if reopened.read_router_completed_report_ref() != "/tmp/router-complete.md":
