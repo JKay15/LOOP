@@ -120,6 +120,49 @@ def _write_file(path: Path, text: str) -> Path:
     return path.resolve()
 
 
+def _checker_manifest_payload(
+    *,
+    workspace_root: Path,
+    final_effects_file: Path,
+    snapshot_id: str,
+    tasks: list[dict[str, object]],
+    obligation_text: str | None = None,
+) -> dict[str, object]:
+    return {
+        "version": 2,
+        "snapshot_id": snapshot_id,
+        "workspace_root": str(workspace_root.resolve()),
+        "authoritative_final_effects_path": str(final_effects_file.resolve()),
+        "obligations": [
+            {
+                "id": "req-1",
+                "section": "Main",
+                "requirement_text": obligation_text or final_effects_file.read_text(encoding="utf-8").strip(),
+            }
+        ],
+        "tasks": tasks,
+    }
+
+
+def _checker_task_entry(
+    task_id: str,
+    *,
+    goal: str | None = None,
+    blocking_condition: str | None = None,
+    task_instructions: str | None = None,
+    required_evidence: list[str] | None = None,
+    covered_requirement_ids: list[str] | None = None,
+) -> dict[str, object]:
+    return {
+        "task_id": task_id,
+        "covered_requirement_ids": list(covered_requirement_ids or ["req-1"]),
+        "goal": goal or f"Validate {task_id}.",
+        "blocking_condition": blocking_condition or f"Block if {task_id} fails.",
+        "task_instructions": task_instructions or f"Inspect the current workspace and validate {task_id}.",
+        "required_evidence": list(required_evidence or []),
+    }
+
+
 def _write_completion(path: Path, payload: dict[str, object]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
@@ -183,25 +226,57 @@ def _init_repo_with_final_effects(repo_root: Path, text: str) -> tuple[Path, str
     return final_effects.resolve(), _run_git(repo_root, "rev-parse", "HEAD")
 
 
-def _write_split_bundle(bundle_dir: Path, *, child_names: list[str]) -> Path:
+def _write_split_bundle(
+    bundle_dir: Path,
+    *,
+    child_names: list[str],
+    parent_after_merge: bool = False,
+) -> Path:
     bundle_dir.mkdir(parents=True, exist_ok=True)
     resolved_bundle_dir = bundle_dir.resolve()
-    children: list[dict[str, str]] = []
-    for child_name in child_names:
+    coverage_units: list[dict[str, str]] = []
+    children: list[dict[str, object]] = []
+    for index, child_name in enumerate(child_names, start=1):
         final_effects = _write_final_effects(
             resolved_bundle_dir / "children" / child_name / "FINAL_EFFECTS.md",
             f"Work for {child_name}.\n",
+        )
+        unit_id = f"u{index:02d}"
+        coverage_units.append(
+            {
+                "id": unit_id,
+                "requirement_text": f"Remaining work for {child_name}.",
+            }
         )
         children.append(
             {
                 "name": child_name,
                 "final_effects_file": str(final_effects.relative_to(resolved_bundle_dir)),
+                "covered_unit_ids": [unit_id],
             }
         )
-    (resolved_bundle_dir / "proposal.json").write_text(
-        json.dumps({"version": 1, "children": children}, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    proposal: dict[str, object] = {
+        "version": 2,
+        "coverage_units": coverage_units,
+        "children": children,
+    }
+    if parent_after_merge:
+        residual_id = f"u{len(coverage_units) + 1:02d}"
+        residual_effects = _write_final_effects(
+            resolved_bundle_dir / "parent_after_merge" / "FINAL_EFFECTS.md",
+            "Parent residual work after merged child outputs.\n",
+        )
+        coverage_units.append(
+            {
+                "id": residual_id,
+                "requirement_text": "Residual parent work after merged child outputs.",
+            }
+        )
+        proposal["parent_after_merge"] = {
+            "final_effects_file": str(residual_effects.relative_to(resolved_bundle_dir)),
+            "covered_unit_ids": [residual_id],
+        }
+    (resolved_bundle_dir / "proposal.json").write_text(json.dumps(proposal, indent=2, sort_keys=True), encoding="utf-8")
     return resolved_bundle_dir
 
 
@@ -224,6 +299,7 @@ def _upsert_running_node(
     child_node_ids: list[str] | None = None,
     last_rejected_split_diff_fingerprint: str = "",
     result_commit: str = "",
+    checker_tasks_ref: str = "",
     task_result_refs: dict[str, dict[str, str]] | None = None,
     pending_prelude_lines: list[str] | None = None,
     workspace_fingerprint_before: str = "fingerprint-before",
@@ -248,7 +324,7 @@ def _upsert_running_node(
             split_approved=int(split_approved),
             approved_split_request_seq=int(approved_split_request_seq),
             evaluator_phase="",
-            checker_tasks_ref="",
+            checker_tasks_ref=str(checker_tasks_ref),
             task_result_refs=dict(task_result_refs or {}),
             reviewer_verdict_kind="",
             reviewer_report_ref="",
@@ -298,6 +374,18 @@ def main() -> int:
             router_wakeup_socket_path,
         )
         from loop.completion import actor_completion_record_path, workspace_output_fingerprint
+        from loop.evaluator_runtime import (
+            ai_user_current_result_path,
+            ai_user_accepted_result_path,
+            checker_current_tasks_path,
+            checker_accepted_tasks_path,
+            reviewer_accepted_feedback_path,
+            reviewer_accepted_report_path,
+            reviewer_current_feedback_path,
+            reviewer_current_report_path,
+            tester_accepted_result_path,
+            tester_current_result_path,
+        )
         from loop.events import (
             ApproveSplit,
             ActorKind,
@@ -310,7 +398,7 @@ def main() -> int:
             RequestSplit,
         )
         from loop.node_table import component_key
-        from loop.store import RouterStore
+        from loop.store import RouterStore, StoredRouterInboxItem
     except Exception as exc:  # noqa: BLE001
         return _fail(f"router core imports failed: {exc}")
 
@@ -360,6 +448,202 @@ def main() -> int:
             return _fail("tester prompt must define a fixed deep-review workflow")
         if "owner must be one of:" not in tester_prompt:
             return _fail("tester prompt must require owner tagging for each finding")
+        if "Artifact gate policy:" not in tester_prompt:
+            return _fail("tester prompt must define an artifact gate policy")
+        if "Missing weak-gate artifacts must not block by themselves." not in tester_prompt:
+            return _fail("tester prompt must state that weak-gate artifacts are non-blocking by default")
+        if "report that as a checker-side contract problem" not in tester_prompt:
+            return _fail("tester prompt must reroute overweight artifact contracts to checker")
+
+        fault_prelude = prompt_core._build_evaluator_fault_checker_prelude(
+            report_ref="/tmp/reviewer_report.md",
+            feedback_ref="/tmp/reviewer_feedback.json",
+            prior_checker_tasks_ref="/tmp/prior_tasks.json",
+        )
+        if "Reviewer report reference: /tmp/reviewer_report.md" not in fault_prelude:
+            return _fail("fault-aware checker prelude must include reviewer report reference")
+        if "Reviewer feedback reference: /tmp/reviewer_feedback.json" not in fault_prelude:
+            return _fail("fault-aware checker prelude must include reviewer feedback reference")
+        if "Previous checker manifest reference: /tmp/prior_tasks.json" not in fault_prelude:
+            return _fail("fault-aware checker prelude must include prior checker manifest reference")
+        if "Previous evaluator wave ended in EVALUATOR_FAULT. Do not reproduce the prior checker manifest blindly." not in fault_prelude:
+            return _fail("fault-aware checker prelude must explicitly forbid blind reruns")
+
+        implementer_prompt = prompt_core._build_actor_prompt_text(
+            node_id="prompt-node",
+            actor_kind=ActorKind.IMPLEMENTER,
+            workspace_root=prompt_effects.parent,
+            final_effects_file=prompt_effects,
+            prelude_lines=["Router resume after reviewer feedback."],
+        )
+        if "request-split --split-bundle-ref <bundle_dir>" not in implementer_prompt:
+            return _fail("implementer prompt must continue documenting the split submission interface in the completion contract")
+        if "Before declaring completion, check the cheapest concrete way the work could still be falsely 'done'." not in implementer_prompt:
+            return _fail("implementer prompt must preserve the cheapest-failure-mode completion check")
+        if "Do not treat helper materials, cached references, fetched examples, temporary scaffolds, or copied comparison artifacts as the finished result" not in implementer_prompt:
+            return _fail("implementer prompt must forbid treating helper/reference material as the finished deliverable")
+        if "Implementation integrity:" not in implementer_prompt:
+            return _fail("implementer prompt must keep the approved generic implementation-integrity section")
+        if "Split interface:" not in implementer_prompt or "`split` means proposing to kernel" not in implementer_prompt:
+            return _fail("implementer prompt must define what split means before referencing the split interface")
+        if "proposal.json` with `version = 2`" not in implementer_prompt or "one child FINAL_EFFECTS file for each proposed child" not in implementer_prompt:
+            return _fail("implementer prompt must state the minimum split bundle contents")
+        if "Split gate:" not in implementer_prompt:
+            return _fail("implementer prompt must expose the approved split gate")
+        if "Consider split only after you have already made real implementation progress in the current workspace." not in implementer_prompt:
+            return _fail("implementer prompt must require real parent implementation progress before split is considered")
+        if "zero semantic omission into multiple concrete child scopes that can each make meaningful parallel progress before final merge" not in implementer_prompt:
+            return _fail("implementer prompt must relax split toward meaningful parallel progress while preserving zero semantic omission")
+        if "Do not require near-total independence: shared later integration boundaries or a shared central theorem target do not by themselves make split inappropriate." not in implementer_prompt:
+            return _fail("implementer prompt must state that shared later integration alone does not forbid split")
+        if "/Users/xiongjiangkai/xjk_papers/LOOP/IMPLEMENTER_SPLIT_GUIDE.md" not in implementer_prompt:
+            return _fail("implementer prompt must point implementers at the shared split guide path")
+        if "you must read the shared split guide" not in implementer_prompt or "complete `proposal.json v2` schema" not in implementer_prompt:
+            return _fail("implementer prompt must require reading the shared split guide before request-split because the full split schema lives there")
+        if "Post-split behavior:" not in implementer_prompt:
+            return _fail("implementer prompt must explain what happens after a split request is submitted")
+        if "Router and kernel now own the split decision." not in implementer_prompt:
+            return _fail("implementer prompt must tell implementers to stop the attempt after request-split succeeds")
+        if "Do not submit another split request after rejection unless there is new effective implementation progress and a materially improved split case." not in implementer_prompt:
+            return _fail("implementer prompt must prevent immediate repeat split submissions after rejection")
+        if "finish any explicit `parent_after_merge` residual work" not in implementer_prompt:
+            return _fail("implementer prompt must require explicit residual work to be finished after child merge")
+        if "Authority-grounded rebuttal rule:" not in implementer_prompt or "routing inputs, not higher authority than FINAL_EFFECTS.md" not in implementer_prompt:
+            return _fail("implementer prompt must explicitly subordinate routed feedback to FINAL_EFFECTS authority")
+        if "Explain why that interpretation is a semantic narrowing rather than a necessary operational clarification." not in implementer_prompt:
+            return _fail("implementer prompt must require explicit semantic-narrowing rebuttal reasoning")
+        if "Split rule:" in implementer_prompt or "Completion rule:" in implementer_prompt:
+            return _fail("implementer prompt must not add unapproved split/completion rule sections")
+
+        kernel_prompt = prompt_core._build_actor_prompt_text(
+            node_id="0",
+            actor_kind=ActorKind.KERNEL,
+            workspace_root=prompt_effects.parent,
+            final_effects_file=prompt_effects,
+            prelude_lines=[
+                "Router kernel review dispatch.",
+                "Split request seq: 7",
+                f"Parent workspace root: {prompt_effects.parent}",
+                f"Parent final effects file: {prompt_effects}",
+                "Frozen split bundle snapshot: /tmp/frozen-bundle",
+                "Parent durable commit baseline: abc123",
+                "Active system node count: 12",
+                "Open split-approved node count: 2",
+            ],
+            extra_env={"LOOP_REQUEST_SEQ": "7"},
+        )
+        if "Zero-omission rule:" not in kernel_prompt:
+            return _fail("kernel prompt must define the zero-omission rule for split review")
+        if "coverage_units must account for every still-unfinished requirement" not in kernel_prompt:
+            return _fail("kernel prompt must concretize zero omission beyond headline tasks")
+        if "Children must not have overlapping ownership of the same coverage unit." not in kernel_prompt:
+            return _fail("kernel prompt must forbid overlapping child ownership in split review")
+        if "Shared later integration boundaries or a shared central theorem target do not by themselves make a split invalid." not in kernel_prompt:
+            return _fail("kernel prompt must preserve split viability despite shared later integration boundaries")
+        if "Reject splits only when overlap or cross-child blocking dominates the normal success path strongly enough that likely integration cost outweighs the benefit of parallel progress." not in kernel_prompt:
+            return _fail("kernel prompt must reject splits only when overlap dominates enough to erase parallel benefit")
+        if "If active system node count is 100 or higher, reject by default." not in kernel_prompt:
+            return _fail("kernel prompt must define a hard high-pressure split threshold")
+        if "Parent workspace root:" not in kernel_prompt or "Frozen split bundle snapshot:" not in kernel_prompt:
+            return _fail("kernel prompt must surface the injected parent workspace and frozen bundle paths")
+        if "Current split depth" in kernel_prompt or "Existing child count for this parent" in kernel_prompt:
+            return _fail("kernel prompt must not inject unapproved subtree metrics")
+
+        active_effects = _write_final_effects(
+            tmp / "workspace" / "active-node" / "FINAL_EFFECTS.md",
+            "Active node count contract.\n",
+        )
+        pending_effects = _write_final_effects(
+            tmp / "workspace" / "pending-split" / "FINAL_EFFECTS.md",
+            "Pending split contract.\n",
+        )
+        approved_effects = _write_final_effects(
+            tmp / "workspace" / "approved-split" / "FINAL_EFFECTS.md",
+            "Approved split contract.\n",
+        )
+        completed_split_effects = _write_final_effects(
+            tmp / "workspace" / "completed-approved-split" / "FINAL_EFFECTS.md",
+            "Completed approved split contract.\n",
+        )
+        _upsert_running_node(
+            store=store,
+            node_id="10",
+            parent_node_id="0",
+            attempt_count=1,
+            durable_commit="active-commit",
+            workspace_root=active_effects.parent,
+            final_effects_file=active_effects,
+            actor_kind=ActorKind.IMPLEMENTER,
+            pid=30101,
+            process_birth_time=1713000101.0,
+            session_ids=["active-session"],
+        )
+        _upsert_running_node(
+            store=store,
+            node_id="11",
+            parent_node_id="0",
+            attempt_count=1,
+            durable_commit="pending-commit",
+            workspace_root=pending_effects.parent,
+            final_effects_file=pending_effects,
+            actor_kind=ActorKind.IMPLEMENTER,
+            pid=30102,
+            process_birth_time=1713000102.0,
+            session_ids=["pending-session"],
+            split_request=1,
+        )
+        pending_record = store.load_node("11")
+        if pending_record is None:
+            return _fail("pending split record must exist for active-node-count testing")
+        store.upsert_node(replace(pending_record, current_components=[]))
+        _upsert_running_node(
+            store=store,
+            node_id="12",
+            parent_node_id="0",
+            attempt_count=1,
+            durable_commit="approved-commit",
+            workspace_root=approved_effects.parent,
+            final_effects_file=approved_effects,
+            actor_kind=ActorKind.IMPLEMENTER,
+            pid=30103,
+            process_birth_time=1713000103.0,
+            session_ids=["approved-session"],
+            split_approved=1,
+        )
+        approved_record = store.load_node("12")
+        if approved_record is None:
+            return _fail("approved split record must exist for active-node-count testing")
+        store.upsert_node(replace(approved_record, current_components=[]))
+        _upsert_running_node(
+            store=store,
+            node_id="13",
+            parent_node_id="0",
+            attempt_count=1,
+            durable_commit="completed-split-durable",
+            workspace_root=completed_split_effects.parent,
+            final_effects_file=completed_split_effects,
+            actor_kind=ActorKind.IMPLEMENTER,
+            pid=30104,
+            process_birth_time=1713000104.0,
+            session_ids=["completed-split-session"],
+            split_approved=1,
+            result_commit="completed-split-result",
+        )
+        completed_split_record = store.load_node("13")
+        if completed_split_record is None:
+            return _fail("completed split record must exist for active-node-count testing")
+        store.upsert_node(replace(completed_split_record, current_components=[]))
+        active_count_prelude = prompt_core._build_kernel_review_prelude(
+            request_seq=9,
+            source_record=store.load_node("10"),
+            split_bundle_ref="/tmp/frozen-active-count-bundle",
+            durable_commit="active-commit",
+            diff_fingerprint="active-diff",
+        )
+        if "Active system node count: 2" not in active_count_prelude:
+            return _fail("kernel split-review prelude must count only running nodes plus pending split-review nodes as active")
+        if "Open split-approved node count: 1" not in active_count_prelude:
+            return _fail("kernel split-review prelude must count open split-approved parents separately from active nodes")
 
         ai_prompt = prompt_core._build_actor_prompt_text(
             node_id="prompt-node",
@@ -369,7 +653,9 @@ def main() -> int:
             prelude_lines=[
                 "Router evaluator lane dispatch.",
                 "Evaluator task id: task-1",
-                "Evaluator task reference: /tmp/task-1.md",
+                "Current dispatched snapshot id: snapshot-prompt",
+                "Authoritative checker manifest path: /tmp/tasks.json",
+                "Your only durable result path: /tmp/result.md",
             ],
         )
         if "=== ROUTER FEEDBACK SLOT ===" not in ai_prompt:
@@ -380,6 +666,16 @@ def main() -> int:
             return _fail("AI-user prompt must require reporting direct checks performed")
         if "owner must be one of:" not in ai_prompt:
             return _fail("AI-user prompt must require owner tagging for each finding")
+        if "The routed task entry is the only task truth for this lane." not in ai_prompt:
+            return _fail("AI-user prompt must make the inline routed task entry the only lane truth")
+        if "Missing weak-gate artifacts must not block by themselves." not in ai_prompt:
+            return _fail("AI-user prompt must keep weak-gate misses non-blocking by default")
+        if "Current dispatched snapshot id: <current snapshot id>" not in ai_prompt:
+            return _fail("AI-user prompt must require writing the current dispatched snapshot id")
+        if "Split-lifecycle rule:" not in ai_prompt or "historical `parent_node_id` ancestry rows" not in ai_prompt:
+            return _fail("AI-user prompt must forbid inferring split from historical node topology")
+        if "Add at most 3 implied checks." not in ai_prompt:
+            return _fail("AI-user prompt must preserve the cap on implied checks after gate-policy edits")
 
         checker_prompt = prompt_core._build_actor_prompt_text(
             node_id="prompt-node",
@@ -390,6 +686,20 @@ def main() -> int:
         )
         if "=== ROUTER FEEDBACK SLOT ===" not in checker_prompt:
             return _fail("checker prompt must include the router feedback slot")
+        if "checker/tasks.json is the sole durable evaluator task truth for this wave." not in checker_prompt:
+            return _fail("checker prompt must pin checker/tasks.json as the sole durable task truth")
+        if "Do not create parallel authoritative files for obligations, coverage, routing, disposition, manifests, checklists, summaries, certifications, or per-task markdown." not in checker_prompt:
+            return _fail("checker prompt must reject parallel evaluator sidecar truth")
+        if "do not silently narrow or strengthen the meaning of FINAL_EFFECTS.md" not in checker_prompt:
+            return _fail("checker prompt must distinguish operational clarification from semantic narrowing")
+        if "checker-derived task interpretation over-tightens FINAL_EFFECTS.md" not in checker_prompt:
+            return _fail("checker prompt must preserve implementer rebuttal against checker over-tightening")
+        if "If router prelude says the previous evaluator wave ended in EVALUATOR_FAULT" not in checker_prompt:
+            return _fail("checker prompt must instruct fault-aware reruns after EVALUATOR_FAULT")
+        if "do not reproduce the prior checker manifest blindly" not in checker_prompt:
+            return _fail("checker prompt must forbid blind checker-manifest regeneration after evaluator fault")
+        if "required_evidence" not in checker_prompt or "task_instructions" not in checker_prompt:
+            return _fail("checker prompt must expose inline task instructions and required_evidence in tasks.json")
 
         reviewer_prompt = prompt_core._build_actor_prompt_text(
             node_id="prompt-node",
@@ -402,10 +712,86 @@ def main() -> int:
             return _fail("reviewer prompt must prioritize feedback.json over the prose report")
         if '"implementer": {' not in reviewer_prompt or '"ai_user": [' not in reviewer_prompt:
             return _fail("reviewer prompt must include the actor-bucketed feedback.json template")
+        if '"version": 2' not in reviewer_prompt or '"snapshot_id": "snapshot-abc123"' not in reviewer_prompt:
+            return _fail("reviewer prompt must document the version=2 snapshot-aware feedback schema")
         if "--feedback-ref <path/to/feedback.json>" not in reviewer_prompt:
             return _fail("reviewer prompt must document the feedback-ref submission interface explicitly")
         if "Treat any routerctl rejection as a hard validation failure." not in reviewer_prompt:
             return _fail("reviewer prompt must require strict handling of routerctl submission rejection")
+        if '"blocking": false' not in reviewer_prompt:
+            return _fail("reviewer prompt must include a blocking=false feedback.json example")
+        if "Missing weak-gate artifacts must not block by themselves." not in reviewer_prompt:
+            return _fail("reviewer prompt must keep weak-gate artifacts non-blocking by default")
+        if "Record weak-gate findings in feedback.json only when they are useful advisory context" not in reviewer_prompt:
+            return _fail("reviewer prompt must explain when weak-gate findings belong in feedback.json")
+        if "Split-lifecycle rule:" not in reviewer_prompt or "Resolve split-related findings against current-node split lifecycle evidence" not in reviewer_prompt:
+            return _fail("reviewer prompt must forbid carrying forward split findings from historical node topology alone")
+        if "If an implementer explicitly argues that a checker-derived task or active finding over-tightens FINAL_EFFECTS.md, you must adjudicate that rebuttal explicitly." not in reviewer_prompt:
+            return _fail("reviewer prompt must require explicit adjudication of implementer rebuttals")
+        if "Determine whether the checker/task interpretation is an operational clarification or a semantic narrowing." not in reviewer_prompt:
+            return _fail("reviewer prompt must distinguish operational clarification from semantic narrowing")
+        if "Do not reject or fault an implementation merely because it violates an over-tightened checker/task interpretation" not in reviewer_prompt:
+            return _fail("reviewer prompt must not treat unsupported checker narrowing as binding")
+
+        split_truth_record = replace(
+            pending_record,
+            child_node_ids=["21", "22"],
+        )
+        lane_split_prelude = prompt_core._build_serial_task_prelude(
+            record=split_truth_record,
+            task_entry={"task_id": "task-1"},
+        )
+        if "Current node split_request: 1" not in lane_split_prelude:
+            return _fail("AI-user launch prelude must inject current-node split_request truth")
+        if "Current node split_approved: 0" not in lane_split_prelude:
+            return _fail("AI-user launch prelude must inject current-node split_approved truth")
+        if 'Current node child_node_ids: ["21", "22"]' not in lane_split_prelude:
+            return _fail("AI-user launch prelude must inject current-node child_node_ids truth")
+
+        reviewer_split_prelude = prompt_core._build_reviewer_prelude(split_truth_record)
+        if "Current node split_request: 1" not in reviewer_split_prelude:
+            return _fail("reviewer prelude must inject current-node split_request truth")
+        if "Current node split_approved: 0" not in reviewer_split_prelude:
+            return _fail("reviewer prelude must inject current-node split_approved truth")
+        if 'Current node child_node_ids: ["21", "22"]' not in reviewer_split_prelude:
+            return _fail("reviewer prelude must inject current-node child_node_ids truth")
+
+        feedback_record = replace(
+            split_truth_record,
+            workspace_root=str(prompt_effects.parent),
+        )
+        prompt_core._materialize_reviewer_feedback_ledger(
+            record=feedback_record,
+            actor_attempt_count=1,
+            verdict_kind="IMPLEMENTER_ACTION_REQUIRED",
+            report_ref="/tmp/report.md",
+            feedback_submission_ref=Path("/tmp/feedback.json"),
+            feedback_submission={
+                "version": 2,
+                "snapshot_id": "snapshot-prompt",
+                "implementer": {
+                    "findings": [
+                        {
+                            "blocking": True,
+                            "summary": "check this finding against current concrete evidence",
+                            "evidence_ref": "/tmp/evidence.md",
+                        }
+                    ]
+                },
+                "checker": {"findings": []},
+                "tester": {"findings": []},
+                "ai_user": [],
+            },
+        )
+        implementer_feedback_prelude = prompt_core._build_actor_feedback_prelude(
+            feedback_record,
+            actor_kind=ActorKind.IMPLEMENTER,
+        )
+        if not any(
+            "Active feedback is routing context, not authoritative proof." in line
+            for line in implementer_feedback_prelude
+        ):
+            return _fail("feedback prelude must tell actors that active feedback is routing context rather than blind authority")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -528,6 +914,15 @@ def main() -> int:
                 return _fail("kernel review launch must use node 0")
             if str(first_kernel_spec.env.get("LOOP_REQUEST_SEQ") or "") != str(seq1):
                 return _fail("kernel review launch must inject the pending request_seq into the kernel actor env")
+            first_kernel_prompt = str(first_kernel_spec.prompt_text)
+            if f"Parent workspace root: {node1_final_effects.parent.resolve()}" not in first_kernel_prompt:
+                return _fail("kernel review launch must inject the concrete parent workspace root into the prompt")
+            if f"Parent final effects file: {node1_final_effects.resolve()}" not in first_kernel_prompt:
+                return _fail("kernel review launch must inject the concrete parent final effects file into the prompt")
+            if "Active system node count: 2" not in first_kernel_prompt:
+                return _fail("kernel review launch must inject the current active system node count into the prompt")
+            if "Open split-approved node count: 0" not in first_kernel_prompt:
+                return _fail("kernel review launch must inject the current open split-approved node count into the prompt")
 
             duplicate_seq1 = store.append_event(
                 RequestSplit(
@@ -663,8 +1058,21 @@ def main() -> int:
             child_launch_specs = [
                 spec for spec in actor_launch_specs if spec.actor_kind is ActorKind.IMPLEMENTER and spec.node_id in {"3", "4"}
             ]
-            if len(child_launch_specs) != 2:
+            if not _wait_until(
+                lambda: len(
+                    [
+                        spec
+                        for spec in actor_launch_specs
+                        if spec.actor_kind is ActorKind.IMPLEMENTER and spec.node_id in {"3", "4"}
+                    ]
+                )
+                == 2,
+                timeout_seconds=2.0,
+            ):
                 return _fail("kernel approve completion must launch one child implementer per bundle entry")
+            child_launch_specs = [
+                spec for spec in actor_launch_specs if spec.actor_kind is ActorKind.IMPLEMENTER and spec.node_id in {"3", "4"}
+            ]
             if child_launch_specs[0].node_id != "3" or child_launch_specs[0].parent_node_id != "2":
                 return _fail("first child launch must use parent node 2 and node id 3")
             if child_launch_specs[1].node_id != "4" or child_launch_specs[1].parent_node_id != "2":
@@ -809,22 +1217,38 @@ def main() -> int:
             tmp / "workspace" / "node-12b" / "FINAL_EFFECTS.md",
             "Checker node 12b.\n",
         )
-        duplicate_task_ref_1 = _write_file(
-            tmp / "workspace" / "node-12b" / "task-dup-1.md",
-            "Task dup 1.\n",
-        )
-        duplicate_task_ref_2 = _write_file(
-            tmp / "workspace" / "node-12b" / "task-dup-2.md",
-            "Task dup 2.\n",
-        )
         duplicate_checker_tasks_ref = _write_file(
-            tmp / "workspace" / "node-12b" / "checker-tasks.json",
+            checker_current_tasks_path(checker_final_effects.parent, "12b"),
             json.dumps(
                 {
-                    "version": 1,
+                    "version": 2,
+                    "snapshot_id": "",
+                    "workspace_root": str(checker_final_effects.parent),
+                    "authoritative_final_effects_path": str(checker_final_effects),
+                    "obligations": [
+                        {
+                            "id": "req-1",
+                            "section": "Main",
+                            "requirement_text": "Checker node 12b.",
+                        }
+                    ],
                     "tasks": [
-                        {"task_id": "dup-task", "task_ref": str(duplicate_task_ref_1.resolve())},
-                        {"task_id": "dup-task", "task_ref": str(duplicate_task_ref_2.resolve())},
+                        {
+                            "task_id": "dup-task",
+                            "covered_requirement_ids": ["req-1"],
+                            "goal": "First duplicate task",
+                            "blocking_condition": "Block if duplicate A fails.",
+                            "task_instructions": "Duplicate task A.",
+                            "required_evidence": [],
+                        },
+                        {
+                            "task_id": "dup-task",
+                            "covered_requirement_ids": ["req-1"],
+                            "goal": "Second duplicate task",
+                            "blocking_condition": "Block if duplicate B fails.",
+                            "task_instructions": "Duplicate task B.",
+                            "required_evidence": [],
+                        },
                     ],
                 },
                 indent=2,
@@ -863,7 +1287,11 @@ def main() -> int:
             )
         )
         _write_file(
-            actor_completion_record_path(checker_final_effects.parent, ActorKind.EVALUATOR_CHECKER),
+            actor_completion_record_path(
+                checker_final_effects.parent,
+                ActorKind.EVALUATOR_CHECKER,
+                node_id="12b",
+            ),
             json.dumps(
                 {
                     "version": 1,
@@ -1243,7 +1671,11 @@ def main() -> int:
                 "node 14 implementer output\n",
             )
             _write_completion(
-                actor_completion_record_path(evaluation_effects.parent, ActorKind.IMPLEMENTER),
+                actor_completion_record_path(
+                    evaluation_effects.parent,
+                    ActorKind.IMPLEMENTER,
+                    node_id="14",
+                ),
                 {
                     "version": 1,
                     "node_id": "14",
@@ -1317,41 +1749,31 @@ def main() -> int:
             checker_prompt = str(reconcile_launch_specs[0].prompt_text)
             if "You are the LOOP evaluator_checker." not in checker_prompt:
                 return _fail("checker prompt must use the checker-specific header")
-            if "Historical checker artifacts under checker/ are evidence only" not in checker_prompt:
-                return _fail("checker prompt must forbid reusing stale checker artifacts as authoritative")
-            if "Checker input pack:" not in checker_prompt:
-                return _fail("checker prompt must define a bounded checker input pack")
             if "Do not use planning tools, todo tools, or progress-commentary updates." not in checker_prompt:
                 return _fail("checker prompt must suppress generic planning/commentary behavior for checker")
-            if "Immediately write checker/final_effects_obligations.json from FINAL_EFFECTS.md before reading any other file." not in checker_prompt:
-                return _fail("checker prompt must force an early obligations artifact before broader inspection")
             if "You are planning later evaluator work; you are not performing the substantive audit now." not in checker_prompt:
                 return _fail("checker prompt must define checker as a planner rather than a full evaluator")
-            if "Do not broad-scan README.md, TRACEABILITY.md, analysis/, source TeX, or historical checker outputs" not in checker_prompt:
-                return _fail("checker prompt must forbid broad workspace scans by default")
-            if "checker/final_effects_obligations.json" not in checker_prompt:
-                return _fail("checker prompt must require the obligations artifact")
-            if "checker/final_effects_coverage.json" not in checker_prompt:
-                return _fail("checker prompt must require the coverage artifact")
-            if "Every obligation_id appears exactly once in coverage." not in checker_prompt:
-                return _fail("checker prompt must include the finish-gate coverage uniqueness rule")
-            if "coverage_kind must be exactly one of:" not in checker_prompt:
-                return _fail("checker prompt must pin coverage_kind to a closed value set")
-            if "current_terminal_trend must be exactly one of:" not in checker_prompt:
-                return _fail("checker prompt must pin current_terminal_trend to a closed value set")
             if "Obligation extraction rule: each bullet or numbered item becomes one obligation; each prose paragraph outside lists becomes one obligation." not in checker_prompt:
                 return _fail("checker prompt must make obligation extraction near-mechanical")
-            if "If evidence is incomplete, encode the uncertainty inside a task goal or blocking_condition instead of investigating further." not in checker_prompt:
+            if "If evidence is incomplete, encode the uncertainty inside a task goal or blocking_condition instead of broadening the scan." not in checker_prompt:
                 return _fail("checker prompt must prefer tasking uncertainty over extra investigation")
-            if "Default task skeleton: start from these task families before inventing anything more:" not in checker_prompt:
-                return _fail("checker prompt must give checker a default task skeleton")
-            if "Every task_ref points to an existing checker/task-*.md file directly under checker/." not in checker_prompt:
-                return _fail("checker prompt must pin task_ref to direct checker/task-*.md files")
-            if "Do not inspect previous harness runs or any checker artifacts outside the current workspace root." not in checker_prompt:
-                return _fail("checker prompt must forbid searching historical checker artifacts outside the workspace")
+            if "checker/tasks.json is the sole durable evaluator task truth for this wave." not in checker_prompt:
+                return _fail("checker prompt must make checker/tasks.json the sole durable evaluator truth")
+            if "Do not create parallel authoritative files for obligations, coverage, routing, disposition, manifests, checklists, summaries, certifications, or per-task markdown." not in checker_prompt:
+                return _fail("checker prompt must reject parallel evaluator sidecar truth")
+            if "do not silently narrow or strengthen the meaning of FINAL_EFFECTS.md" not in checker_prompt:
+                return _fail("checker prompt must separate operational clarification from semantic narrowing")
+            if "checker-derived task interpretation over-tightens FINAL_EFFECTS.md" not in checker_prompt:
+                return _fail("checker prompt must preserve authority-grounded implementer rebuttals")
+            if "Do not require an md/json pair by default." not in checker_prompt:
+                return _fail("checker prompt must avoid default md/json artifact pairs")
+            if "Do not use task_ref indirection." not in checker_prompt:
+                return _fail("checker prompt must remove task_ref indirection")
+            if "task_instructions" not in checker_prompt or "required_evidence" not in checker_prompt:
+                return _fail("checker prompt must inline task instructions and required evidence into tasks.json")
             if "Prefer 4-12 tasks unless more are required to avoid semantic omission." not in checker_prompt:
                 return _fail("checker prompt must bias checker away from both umbrella tasks and runaway task counts")
-            if "Once the finish gate passes, stop immediately. Do not continue open-ended analysis." not in checker_prompt:
+            if "If all finish-gate conditions hold, stop immediately." not in checker_prompt:
                 return _fail("checker prompt must tell checker to stop immediately after passing the finish gate")
         finally:
             reconcile_core.stop()
@@ -1785,8 +2207,6 @@ def main() -> int:
                 return _fail("checker recovery prompt must remind the checker completion interface usage")
             if "No completion record was written" not in checker_launch_specs[0].prompt_text:
                 return _fail("checker recovery prompt must explain that the completion record was missing")
-            if "No substantive workspace output changed" not in checker_launch_specs[0].prompt_text:
-                return _fail("checker recovery prompt must explain that no substantive workspace output changed")
         finally:
             core.stop()
 
@@ -2027,7 +2447,11 @@ def main() -> int:
         core.start()
         try:
             _write_completion(
-                actor_completion_record_path(reviewer_final_effects.parent, ActorKind.EVALUATOR_REVIEWER),
+                actor_completion_record_path(
+                    reviewer_final_effects.parent,
+                    ActorKind.EVALUATOR_REVIEWER,
+                    node_id="17",
+                ),
                 {
                     "version": 1,
                     "node_id": "17",
@@ -2127,9 +2551,16 @@ def main() -> int:
         )
         reviewer_core.start()
         try:
-            report_ref = _write_file(tmp / "reports" / "reviewer-27.md", "LGTM\n")
+            report_ref = _write_file(
+                reviewer_current_report_path(repo_root, "27"),
+                "LGTM\n",
+            )
             _write_completion(
-                actor_completion_record_path(repo_root, ActorKind.EVALUATOR_REVIEWER),
+                actor_completion_record_path(
+                    repo_root,
+                    ActorKind.EVALUATOR_REVIEWER,
+                    node_id="27",
+                ),
                 {
                     "version": 1,
                     "node_id": "27",
@@ -2177,14 +2608,15 @@ def main() -> int:
         repo_root = (tmp / "repo").resolve()
         _init_git_repo(repo_root)
         reviewer_effects = _write_final_effects(repo_root / "FINAL_EFFECTS.md", "Reviewer node 28b.\n")
-        checker_task_ref = _write_file(repo_root / "checker" / "task-1.md", "task one\n")
         checker_tasks_ref = _write_file(
-            repo_root / "checker" / "tasks.json",
+            checker_current_tasks_path(repo_root, "28b"),
             json.dumps(
-                {
-                    "version": 1,
-                    "tasks": [{"task_id": "task-1", "task_ref": str(checker_task_ref.resolve())}],
-                },
+                _checker_manifest_payload(
+                    workspace_root=repo_root,
+                    final_effects_file=reviewer_effects,
+                    snapshot_id="snapshot-28b",
+                    tasks=[_checker_task_entry("task-1", goal="task one")],
+                ),
                 indent=2,
                 sort_keys=True,
             ),
@@ -2249,22 +2681,21 @@ def main() -> int:
         )
         reviewer_core.start()
         try:
-            report_ref = _write_file(repo_root / "reviewer" / "report.md", "needs implementer fixes\n")
-            implementer_feedback_ref = _write_file(
-                repo_root / "reviewer" / "implementer_feedback.md",
-                "fix login fidelity\n",
+            report_ref = _write_file(
+                reviewer_current_report_path(repo_root, "28b"),
+                "Current dispatched snapshot id: snapshot-28b\nneeds implementer fixes\n",
             )
             evidence_ref = _write_file(
-                repo_root / "reviewer" / "evidence.txt",
+                repo_root / ".loop" / "router_runtime" / "nodes" / "node-28b" / "reviewer" / "current" / "evidence.txt",
                 "button alignment mismatch\n",
             )
             feedback_submission_ref = _write_file(
-                repo_root / "reviewer" / "feedback.json",
+                reviewer_current_feedback_path(repo_root, "28b"),
                 json.dumps(
                     {
-                        "version": 1,
+                        "version": 2,
+                        "snapshot_id": "snapshot-28b",
                         "implementer": {
-                            "feedback_ref": str(implementer_feedback_ref.resolve()),
                             "findings": [
                                 {
                                     "blocking": True,
@@ -2273,8 +2704,8 @@ def main() -> int:
                                 }
                             ],
                         },
-                        "checker": {"feedback_ref": "", "findings": []},
-                        "tester": {"feedback_ref": "", "findings": []},
+                        "checker": {"findings": []},
+                        "tester": {"findings": []},
                         "ai_user": [],
                     },
                     indent=2,
@@ -2282,7 +2713,11 @@ def main() -> int:
                 ),
             )
             _write_completion(
-                actor_completion_record_path(repo_root, ActorKind.EVALUATOR_REVIEWER),
+                actor_completion_record_path(
+                    repo_root,
+                    ActorKind.EVALUATOR_REVIEWER,
+                    node_id="28b",
+                ),
                 {
                     "version": 1,
                     "node_id": "28b",
@@ -2291,7 +2726,7 @@ def main() -> int:
                     "pid": 28101,
                     "process_birth_time": 1712810000.0,
                     "completed_at": now.isoformat(),
-                    "verdict_kind": "IMPLEMENTER_ACTION_REQUIRED",
+                    "verdict_kind": "EVALUATOR_FAULT",
                     "report_ref": str(report_ref.resolve()),
                     "feedback_ref": str(feedback_submission_ref.resolve()),
                 },
@@ -2316,13 +2751,13 @@ def main() -> int:
                 return _fail("reviewer feedback completion must still advance last_applied_seq")
             if not _wait_until(lambda: len(implementer_launch_specs) == 1, timeout_seconds=2.0):
                 return _fail("reviewer feedback completion must still relaunch implementer under the current routing")
-            active_path = active_feedback_path(repo_root)
+            active_path = active_feedback_path(repo_root, node_id="28b")
             if not active_path.is_file():
                 return _fail("accepted reviewer feedback must materialize an active workspace feedback ledger")
             active_payload = json.loads(active_path.read_text(encoding="utf-8"))
-            if active_payload.get("report_ref") != str(report_ref.resolve()):
+            if active_payload.get("report_ref") != str(reviewer_accepted_report_path(repo_root, "28b", attempt_count=1)):
                 return _fail("active feedback ledger must record reviewer report ref")
-            if active_payload.get("feedback_submission_ref") != str(feedback_submission_ref.resolve()):
+            if active_payload.get("feedback_submission_ref") != str(reviewer_accepted_feedback_path(repo_root, "28b", attempt_count=1)):
                 return _fail("active feedback ledger must record reviewer feedback submission ref")
             implementer_findings = (
                 active_payload.get("implementer", {}).get("findings", [])
@@ -2333,7 +2768,7 @@ def main() -> int:
                 return _fail("active feedback ledger must preserve implementer findings")
             if implementer_findings[0].get("summary") != "login button fidelity still fails":
                 return _fail("active feedback ledger must preserve finding summaries")
-            history_path = feedback_history_path(repo_root)
+            history_path = feedback_history_path(repo_root, node_id="28b")
             history_lines = [
                 line for line in history_path.read_text(encoding="utf-8").splitlines() if line.strip()
             ]
@@ -2347,14 +2782,15 @@ def main() -> int:
         repo_root = (tmp / "repo").resolve()
         _init_git_repo(repo_root)
         reviewer_effects = _write_final_effects(repo_root / "FINAL_EFFECTS.md", "Reviewer node 28bb.\n")
-        checker_task_ref = _write_file(repo_root / "checker" / "task-1.md", "task one\n")
         checker_tasks_ref = _write_file(
-            repo_root / "checker" / "tasks.json",
+            checker_current_tasks_path(repo_root, "28bb"),
             json.dumps(
-                {
-                    "version": 1,
-                    "tasks": [{"task_id": "task-1", "task_ref": str(checker_task_ref.resolve())}],
-                },
+                _checker_manifest_payload(
+                    workspace_root=repo_root,
+                    final_effects_file=reviewer_effects,
+                    snapshot_id="snapshot-28bb",
+                    tasks=[_checker_task_entry("task-1", goal="task one")],
+                ),
                 indent=2,
                 sort_keys=True,
             ),
@@ -2419,46 +2855,61 @@ def main() -> int:
         )
         reviewer_core.start()
         try:
-            report_ref = _write_file(repo_root / "reviewer" / "report.md", "mixed findings\n")
-            implementer_feedback_ref = _write_file(
-                repo_root / "reviewer" / "implementer_feedback.md",
-                "implementer issue detail\n",
-            )
-            checker_feedback_ref = _write_file(
-                repo_root / "reviewer" / "checker_feedback.md",
-                "checker issue detail\n",
-            )
-            tester_feedback_ref = _write_file(
-                repo_root / "reviewer" / "tester_feedback.md",
-                "tester issue detail\n",
-            )
-            ai_feedback_ref = _write_file(
-                repo_root / "reviewer" / "ai_task_1_feedback.md",
-                "ai_user issue detail\n",
+            report_ref = _write_file(
+                reviewer_current_report_path(repo_root, "28bb"),
+                "Current dispatched snapshot id: snapshot-28bb\nmixed findings\n",
             )
             implementer_evidence_ref = _write_file(
-                repo_root / "reviewer" / "implementer_evidence.txt",
+                repo_root
+                / ".loop"
+                / "router_runtime"
+                / "nodes"
+                / "node-28bb"
+                / "reviewer"
+                / "current"
+                / "implementer_evidence.txt",
                 "implementer evidence\n",
             )
             checker_evidence_ref = _write_file(
-                repo_root / "reviewer" / "checker_evidence.txt",
+                repo_root
+                / ".loop"
+                / "router_runtime"
+                / "nodes"
+                / "node-28bb"
+                / "reviewer"
+                / "current"
+                / "checker_evidence.txt",
                 "checker evidence\n",
             )
             tester_evidence_ref = _write_file(
-                repo_root / "reviewer" / "tester_evidence.txt",
+                repo_root
+                / ".loop"
+                / "router_runtime"
+                / "nodes"
+                / "node-28bb"
+                / "reviewer"
+                / "current"
+                / "tester_evidence.txt",
                 "tester evidence\n",
             )
             ai_evidence_ref = _write_file(
-                repo_root / "reviewer" / "ai_evidence.txt",
+                repo_root
+                / ".loop"
+                / "router_runtime"
+                / "nodes"
+                / "node-28bb"
+                / "reviewer"
+                / "current"
+                / "ai_evidence.txt",
                 "ai evidence\n",
             )
             feedback_submission_ref = _write_file(
-                repo_root / "reviewer" / "feedback.json",
+                reviewer_current_feedback_path(repo_root, "28bb"),
                 json.dumps(
                     {
-                        "version": 1,
+                        "version": 2,
+                        "snapshot_id": "snapshot-28bb",
                         "implementer": {
-                            "feedback_ref": str(implementer_feedback_ref.resolve()),
                             "findings": [
                                 {
                                     "blocking": True,
@@ -2468,7 +2919,6 @@ def main() -> int:
                             ],
                         },
                         "checker": {
-                            "feedback_ref": str(checker_feedback_ref.resolve()),
                             "findings": [
                                 {
                                     "blocking": True,
@@ -2478,7 +2928,6 @@ def main() -> int:
                             ],
                         },
                         "tester": {
-                            "feedback_ref": str(tester_feedback_ref.resolve()),
                             "findings": [
                                 {
                                     "blocking": True,
@@ -2490,7 +2939,6 @@ def main() -> int:
                         "ai_user": [
                             {
                                 "task_id": "task-1",
-                                "feedback_ref": str(ai_feedback_ref.resolve()),
                                 "findings": [
                                     {
                                         "blocking": True,
@@ -2506,7 +2954,11 @@ def main() -> int:
                 ),
             )
             _write_completion(
-                actor_completion_record_path(repo_root, ActorKind.EVALUATOR_REVIEWER),
+                actor_completion_record_path(
+                    repo_root,
+                    ActorKind.EVALUATOR_REVIEWER,
+                    node_id="28bb",
+                ),
                 {
                     "version": 1,
                     "node_id": "28bb",
@@ -2543,12 +2995,14 @@ def main() -> int:
             if launch_specs[0].actor_kind is not ActorKind.IMPLEMENTER:
                 return _fail("implementer feedback must take restart priority over lower-level feedback")
             prompt_text = str(launch_specs[0].prompt_text)
-            if str(feedback_history_path(repo_root)) not in prompt_text:
+            if str(feedback_history_path(repo_root, node_id="28bb")) not in prompt_text:
                 return _fail("implementer prompt must include feedback history reference path")
             if "implementer issue summary" not in prompt_text:
                 return _fail("implementer prompt must include implementer-targeted active feedback")
             if "checker issue summary" in prompt_text or "tester issue summary" in prompt_text or "ai issue summary" in prompt_text:
                 return _fail("implementer prompt must not inline other actors' active feedback")
+            if "Authority-grounded rebuttal rule:" not in prompt_text:
+                return _fail("implementer feedback relaunch prompt must preserve authority-grounded rebuttal guidance")
         finally:
             reviewer_core.stop()
 
@@ -2557,14 +3011,15 @@ def main() -> int:
         repo_root = (tmp / "repo").resolve()
         _init_git_repo(repo_root)
         reviewer_effects = _write_final_effects(repo_root / "FINAL_EFFECTS.md", "Reviewer node 28bd.\n")
-        checker_task_ref = _write_file(repo_root / "checker" / "task-1.md", "task one\n")
         checker_tasks_ref = _write_file(
-            repo_root / "checker" / "tasks.json",
+            checker_current_tasks_path(repo_root, "28bd"),
             json.dumps(
-                {
-                    "version": 1,
-                    "tasks": [{"task_id": "task-1", "task_ref": str(checker_task_ref.resolve())}],
-                },
+                _checker_manifest_payload(
+                    workspace_root=repo_root,
+                    final_effects_file=reviewer_effects,
+                    snapshot_id="snapshot-28bd",
+                    tasks=[_checker_task_entry("task-1", goal="task one")],
+                ),
                 indent=2,
                 sort_keys=True,
             ),
@@ -2629,31 +3084,40 @@ def main() -> int:
         )
         reviewer_core.start()
         try:
-            report_ref = _write_file(repo_root / "reviewer" / "report.md", "checker findings only\n")
-            checker_feedback_ref = _write_file(
-                repo_root / "reviewer" / "checker_feedback.md",
-                "checker issue detail\n",
+            report_ref = _write_file(
+                reviewer_current_report_path(repo_root, "28bd"),
+                "Current dispatched snapshot id: snapshot-28bd\nchecker findings only\n",
             )
             checker_evidence_ref = _write_file(
-                repo_root / "reviewer" / "checker_evidence.txt",
+                repo_root
+                / ".loop"
+                / "router_runtime"
+                / "nodes"
+                / "node-28bd"
+                / "reviewer"
+                / "current"
+                / "checker_evidence.txt",
                 "checker evidence\n",
             )
-            tester_feedback_ref = _write_file(
-                repo_root / "reviewer" / "tester_feedback.md",
-                "tester issue detail\n",
-            )
             tester_evidence_ref = _write_file(
-                repo_root / "reviewer" / "tester_evidence.txt",
+                repo_root
+                / ".loop"
+                / "router_runtime"
+                / "nodes"
+                / "node-28bd"
+                / "reviewer"
+                / "current"
+                / "tester_evidence.txt",
                 "tester evidence\n",
             )
             feedback_submission_ref = _write_file(
-                repo_root / "reviewer" / "feedback.json",
+                reviewer_current_feedback_path(repo_root, "28bd"),
                 json.dumps(
                     {
-                        "version": 1,
-                        "implementer": {"feedback_ref": "", "findings": []},
+                        "version": 2,
+                        "snapshot_id": "snapshot-28bd",
+                        "implementer": {"findings": []},
                         "checker": {
-                            "feedback_ref": str(checker_feedback_ref.resolve()),
                             "findings": [
                                 {
                                     "blocking": True,
@@ -2663,7 +3127,6 @@ def main() -> int:
                             ],
                         },
                         "tester": {
-                            "feedback_ref": str(tester_feedback_ref.resolve()),
                             "findings": [
                                 {
                                     "blocking": True,
@@ -2679,7 +3142,11 @@ def main() -> int:
                 ),
             )
             _write_completion(
-                actor_completion_record_path(repo_root, ActorKind.EVALUATOR_REVIEWER),
+                actor_completion_record_path(
+                    repo_root,
+                    ActorKind.EVALUATOR_REVIEWER,
+                    node_id="28bd",
+                ),
                 {
                     "version": 1,
                     "node_id": "28bd",
@@ -2716,7 +3183,7 @@ def main() -> int:
             if launch_specs[0].actor_kind is not ActorKind.EVALUATOR_CHECKER:
                 return _fail("checker feedback must restart from checker instead of implementer")
             prompt_text = str(launch_specs[0].prompt_text)
-            if str(feedback_history_path(repo_root)) not in prompt_text:
+            if str(feedback_history_path(repo_root, node_id="28bd")) not in prompt_text:
                 return _fail("checker prompt must include feedback history reference path")
             if "checker issue summary" not in prompt_text:
                 return _fail("checker prompt must include checker-targeted active feedback")
@@ -2730,18 +3197,18 @@ def main() -> int:
         repo_root = (tmp / "repo").resolve()
         _init_git_repo(repo_root)
         reviewer_effects = _write_final_effects(repo_root / "FINAL_EFFECTS.md", "Reviewer node 28be.\n")
-        task_ref_1 = _write_file(repo_root / "checker" / "task-1.md", "task one\n")
-        task_ref_2 = _write_file(repo_root / "checker" / "task-2.md", "task two\n")
         checker_tasks_ref = _write_file(
-            repo_root / "checker" / "tasks.json",
+            checker_current_tasks_path(repo_root, "28be"),
             json.dumps(
-                {
-                    "version": 1,
-                    "tasks": [
-                        {"task_id": "task-1", "task_ref": str(task_ref_1.resolve())},
-                        {"task_id": "task-2", "task_ref": str(task_ref_2.resolve())},
+                _checker_manifest_payload(
+                    workspace_root=repo_root,
+                    final_effects_file=reviewer_effects,
+                    snapshot_id="snapshot-28be",
+                    tasks=[
+                        _checker_task_entry("task-1", goal="task one"),
+                        _checker_task_entry("task-2", goal="task two"),
                     ],
-                },
+                ),
                 indent=2,
                 sort_keys=True,
             ),
@@ -2818,32 +3285,41 @@ def main() -> int:
         )
         reviewer_core.start()
         try:
-            report_ref = _write_file(repo_root / "reviewer" / "report.md", "tester and task-1 only\n")
-            tester_feedback_ref = _write_file(
-                repo_root / "reviewer" / "tester_feedback.md",
-                "tester issue detail\n",
-            )
-            ai_feedback_ref = _write_file(
-                repo_root / "reviewer" / "ai_feedback_task_1.md",
-                "ai task 1 issue detail\n",
+            report_ref = _write_file(
+                reviewer_current_report_path(repo_root, "28be"),
+                "Current dispatched snapshot id: snapshot-28be\ntester and task-1 only\n",
             )
             tester_evidence_ref = _write_file(
-                repo_root / "reviewer" / "tester_evidence.txt",
+                repo_root
+                / ".loop"
+                / "router_runtime"
+                / "nodes"
+                / "node-28be"
+                / "reviewer"
+                / "current"
+                / "tester_evidence.txt",
                 "tester evidence\n",
             )
             ai_evidence_ref = _write_file(
-                repo_root / "reviewer" / "ai_evidence_task_1.txt",
+                repo_root
+                / ".loop"
+                / "router_runtime"
+                / "nodes"
+                / "node-28be"
+                / "reviewer"
+                / "current"
+                / "ai_evidence_task_1.txt",
                 "ai task 1 evidence\n",
             )
             feedback_submission_ref = _write_file(
-                repo_root / "reviewer" / "feedback.json",
+                reviewer_current_feedback_path(repo_root, "28be"),
                 json.dumps(
                     {
-                        "version": 1,
-                        "implementer": {"feedback_ref": "", "findings": []},
-                        "checker": {"feedback_ref": "", "findings": []},
+                        "version": 2,
+                        "snapshot_id": "snapshot-28be",
+                        "implementer": {"findings": []},
+                        "checker": {"findings": []},
                         "tester": {
-                            "feedback_ref": str(tester_feedback_ref.resolve()),
                             "findings": [
                                 {
                                     "blocking": True,
@@ -2855,7 +3331,6 @@ def main() -> int:
                         "ai_user": [
                             {
                                 "task_id": "task-1",
-                                "feedback_ref": str(ai_feedback_ref.resolve()),
                                 "findings": [
                                     {
                                         "blocking": True,
@@ -2871,7 +3346,11 @@ def main() -> int:
                 ),
             )
             _write_completion(
-                actor_completion_record_path(repo_root, ActorKind.EVALUATOR_REVIEWER),
+                actor_completion_record_path(
+                    repo_root,
+                    ActorKind.EVALUATOR_REVIEWER,
+                    node_id="28be",
+                ),
                 {
                     "version": 1,
                     "node_id": "28be",
@@ -2913,9 +3392,9 @@ def main() -> int:
                 return _fail("tasks-only feedback must relaunch only the ai_user task_id that still has active feedback")
             tester_prompt = str([spec for spec in launch_specs if spec.actor_kind is ActorKind.EVALUATOR_TESTER][0].prompt_text)
             ai_prompt = str(ai_specs[0].prompt_text)
-            if str(feedback_history_path(repo_root)) not in tester_prompt:
+            if str(feedback_history_path(repo_root, node_id="28be")) not in tester_prompt:
                 return _fail("tester prompt must include feedback history reference path")
-            if str(feedback_history_path(repo_root)) not in ai_prompt:
+            if str(feedback_history_path(repo_root, node_id="28be")) not in ai_prompt:
                 return _fail("ai_user prompt must include feedback history reference path")
             if "tester issue summary" not in tester_prompt or "ai task-1 issue summary" in tester_prompt:
                 return _fail("tester prompt must include only tester-targeted active feedback")
@@ -3027,7 +3506,11 @@ def main() -> int:
                 ),
             )
             _write_completion(
-                actor_completion_record_path(repo_root, ActorKind.EVALUATOR_REVIEWER),
+                actor_completion_record_path(
+                    repo_root,
+                    ActorKind.EVALUATOR_REVIEWER,
+                    node_id="28c",
+                ),
                 {
                     "version": 1,
                     "node_id": "28c",
@@ -3071,10 +3554,32 @@ def main() -> int:
         repo_root = (tmp / "repo").resolve()
         _init_git_repo(repo_root)
         reviewer_effects = _write_final_effects(repo_root / "FINAL_EFFECTS.md", "Reviewer node 28.\n")
+        checker_tasks_ref = _write_file(
+            checker_current_tasks_path(repo_root, "28"),
+            json.dumps(
+                _checker_manifest_payload(
+                    workspace_root=repo_root,
+                    final_effects_file=reviewer_effects,
+                    snapshot_id="snapshot-reviewer-dirty-28",
+                    tasks=[
+                        _checker_task_entry(
+                            "T28",
+                            goal="Validate reviewer closeout persistence.",
+                            task_instructions="Inspect reviewer OK closeout persistence behavior.",
+                        )
+                    ],
+                ),
+                indent=2,
+                sort_keys=True,
+            ),
+        )
         _run_git(repo_root, "add", "FINAL_EFFECTS.md")
         _run_git(repo_root, "commit", "-m", "add reviewer effects")
         base_commit = _run_git(repo_root, "rev-parse", "HEAD")
         (repo_root / "dirty.txt").write_text("still dirty\n", encoding="utf-8")
+        (repo_root / ".DS_Store").write_text("noise\n", encoding="utf-8")
+        (repo_root / "target-task005").mkdir(parents=True, exist_ok=True)
+        (repo_root / "target-task005" / "scratch.txt").write_text("noise\n", encoding="utf-8")
         db_path = tmp / "router.sqlite3"
         wakeup_path = router_wakeup_socket_path(db_path)
         store = RouterStore(db_path)
@@ -3090,6 +3595,7 @@ def main() -> int:
             pid=28001,
             process_birth_time=1712800000.0,
             session_ids=["reviewer-session-28"],
+            checker_tasks_ref=str(checker_tasks_ref),
         )
         reviewer_record = store.load_node("28")
         if reviewer_record is None:
@@ -3130,9 +3636,38 @@ def main() -> int:
         )
         reviewer_core.start()
         try:
-            report_ref = _write_file(tmp / "reports" / "reviewer-28.md", "still dirty\n")
+            report_ref = _write_file(
+                reviewer_current_report_path(repo_root, "28"),
+                "\n".join(
+                    [
+                        "Current dispatched snapshot id: snapshot-reviewer-dirty-28",
+                        "Blocking active findings: none.",
+                        "",
+                    ]
+                ),
+            )
+            feedback_ref = _write_file(
+                reviewer_current_feedback_path(repo_root, "28"),
+                json.dumps(
+                    {
+                        "version": 2,
+                        "snapshot_id": "snapshot-reviewer-dirty-28",
+                        "implementer": {"findings": []},
+                        "checker": {"findings": []},
+                        "tester": {"findings": []},
+                        "ai_user": [],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+            )
             _write_completion(
-                actor_completion_record_path(repo_root, ActorKind.EVALUATOR_REVIEWER),
+                actor_completion_record_path(
+                    repo_root,
+                    ActorKind.EVALUATOR_REVIEWER,
+                    node_id="28",
+                ),
                 {
                     "version": 1,
                     "node_id": "28",
@@ -3143,6 +3678,15 @@ def main() -> int:
                     "completed_at": now.isoformat(),
                     "verdict_kind": "OK",
                     "report_ref": str(report_ref),
+                    "feedback_ref": str(feedback_ref),
+                    "feedback_submission": {
+                        "version": 2,
+                        "snapshot_id": "snapshot-reviewer-dirty-28",
+                        "implementer": {"findings": []},
+                        "checker": {"findings": []},
+                        "tester": {"findings": []},
+                        "ai_user": [],
+                    },
                 },
             )
             invalid_seq = store.append_event(
@@ -3162,14 +3706,29 @@ def main() -> int:
             )
             notify_router_wakeup(wakeup_path)
             if not _wait_until(lambda: store.read_last_applied_seq() == invalid_seq, timeout_seconds=2.0):
-                return _fail("dirty reviewer OK completion must still advance last_applied_seq")
-            if not _wait_until(lambda: len(reviewer_recovery_specs) == 1, timeout_seconds=2.0):
-                return _fail("dirty reviewer OK completion must relaunch reviewer instead of accepting a dirty result")
-            invalid_record = store.load_node("28")
-            if invalid_record is None:
-                return _fail("dirty reviewer completion node must remain durable")
-            if str(invalid_record.result_commit or "").strip():
-                return _fail("dirty reviewer OK completion must not persist result_commit")
+                return _fail("router-owned reviewer result commit must still advance last_applied_seq")
+            settled_record = store.load_node("28")
+            if settled_record is None:
+                return _fail("router-owned reviewer result commit node must remain durable")
+            if reviewer_recovery_specs:
+                return _fail("reviewer OK with substantive dirty work must not relaunch reviewer once router can materialize the result commit")
+            result_commit = str(settled_record.result_commit or "").strip()
+            if not result_commit:
+                return _fail("reviewer OK must persist a router-created result_commit")
+            if result_commit == base_commit:
+                return _fail("router-created result_commit must advance beyond the durable baseline when substantive work is dirty")
+            if result_commit != _run_git(repo_root, "rev-parse", "HEAD"):
+                return _fail("router-created reviewer result_commit must match workspace HEAD")
+            committed_paths = set(
+                filter(
+                    None,
+                    _run_git(repo_root, "show", "--pretty=format:", "--name-only", result_commit).splitlines(),
+                )
+            )
+            if "dirty.txt" not in committed_paths:
+                return _fail("router-created reviewer result_commit must include substantive workspace changes")
+            if ".DS_Store" in committed_paths or any(path.startswith("target-task005/") for path in committed_paths):
+                return _fail("router-created reviewer result_commit must exclude non-substantive workspace noise")
         finally:
             reviewer_core.stop()
 
@@ -3337,6 +3896,137 @@ def main() -> int:
                     return _fail("absorbed child must preserve task result refs via archive copy")
         finally:
             merge_core.stop()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        repo_root = (tmp / "repo-parent-residual").resolve()
+        _init_git_repo(repo_root)
+        parent_effects = _write_final_effects(repo_root / "FINAL_EFFECTS.md", "Parent node 65.\n")
+        _run_git(repo_root, "add", "FINAL_EFFECTS.md")
+        _run_git(repo_root, "commit", "-m", "add parent residual effects")
+        base_commit = _run_git(repo_root, "rev-parse", "HEAD")
+        child_a_commit = _commit_in_detached_worktree(
+            repo_root=repo_root,
+            base_commit=base_commit,
+            worktree_root=tmp / "residual-child-a",
+            relpath="feature_a.txt",
+            content="feature A\n",
+            message="residual child a",
+        )
+        child_b_commit = _commit_in_detached_worktree(
+            repo_root=repo_root,
+            base_commit=base_commit,
+            worktree_root=tmp / "residual-child-b",
+            relpath="feature_b.txt",
+            content="feature B\n",
+            message="residual child b",
+        )
+        db_path = tmp / "router.sqlite3"
+        wakeup_path = router_wakeup_socket_path(db_path)
+        store = RouterStore(db_path)
+        residual_bundle = _write_split_bundle(
+            tmp / "residual-bundle",
+            child_names=["child_a", "child_b"],
+            parent_after_merge=True,
+        )
+        request_seq = store.append_event(
+            RequestSplit(
+                actor=ActorRef(node_id="65", actor_kind=ActorKind.IMPLEMENTER, attempt_count=1),
+                split_bundle_ref=str(residual_bundle),
+                durable_commit=base_commit,
+                diff_fingerprint="residual-fingerprint",
+                requested_at=datetime.now(timezone.utc),
+            ),
+            recorded_at=datetime.now(timezone.utc),
+        )
+        _upsert_running_node(
+            store=store,
+            node_id="65",
+            parent_node_id="0",
+            attempt_count=1,
+            durable_commit=base_commit,
+            workspace_root=repo_root,
+            final_effects_file=parent_effects,
+            actor_kind=ActorKind.IMPLEMENTER,
+            pid=65001,
+            process_birth_time=1716500000.0,
+            session_ids=["parent-session-65"],
+            split_approved=1,
+            approved_split_request_seq=request_seq,
+            child_node_ids=["66", "67"],
+        )
+        parent_record = store.load_node("65")
+        if parent_record is None:
+            return _fail("parent-after-merge parent record must be loadable")
+        store.upsert_node(replace(parent_record, current_components=[]))
+        for child_id, child_commit, effects_name, pid in (
+            ("66", child_a_commit, "child-a/FINAL_EFFECTS.md", 66001),
+            ("67", child_b_commit, "child-b/FINAL_EFFECTS.md", 67001),
+        ):
+            child_effects = _write_final_effects(tmp / effects_name, f"Child {child_id}.\n")
+            _upsert_running_node(
+                store=store,
+                node_id=child_id,
+                parent_node_id="65",
+                attempt_count=1,
+                durable_commit=base_commit,
+                result_commit=child_commit,
+                workspace_root=child_effects.parent,
+                final_effects_file=child_effects,
+                actor_kind=ActorKind.IMPLEMENTER,
+                pid=pid,
+                process_birth_time=float(pid),
+                session_ids=[f"child-session-{child_id}"],
+            )
+            child_record = store.load_node(child_id)
+            if child_record is None:
+                return _fail("parent-after-merge child node must be loadable before reconcile")
+            store.upsert_node(replace(child_record, current_components=[], reviewer_verdict_kind="OK"))
+        residual_launch_specs: list[object] = []
+
+        def _residual_launcher(spec) -> ActorLaunchResult:
+            residual_launch_specs.append(spec)
+            return ActorLaunchResult(
+                process=_LiveProcess(pid=65002),
+                process_birth_time=1716500001.0,
+                session_id="residual-session-65",
+                rollout_path=(tmp / "runtime" / "residual-node-65.jsonl").resolve(),
+            )
+
+        residual_core = RouterCore(
+            store=store,
+            wakeup_socket_path=wakeup_path,
+            actor_launcher=_residual_launcher,
+        )
+        residual_core.start()
+        try:
+            if not _wait_until(lambda: len(residual_launch_specs) == 1, timeout_seconds=2.0):
+                return _fail("clean child merge with parent_after_merge must relaunch the parent implementer")
+            residual_spec = residual_launch_specs[0]
+            if residual_spec.actor_kind is not ActorKind.IMPLEMENTER or str(residual_spec.node_id) != "65":
+                return _fail("parent-after-merge relaunch must target the parent implementer lane")
+            expected_residual_ref = (residual_bundle / "parent_after_merge" / "FINAL_EFFECTS.md").resolve()
+            if str(expected_residual_ref) not in str(residual_spec.prompt_text):
+                return _fail("parent-after-merge relaunch prompt must inject the approved residual final effects reference")
+            residual_parent = store.load_node("65")
+            if residual_parent is None:
+                return _fail("parent-after-merge parent must remain durable")
+            if str(residual_parent.result_commit or "").strip():
+                return _fail("parent-after-merge parent must not auto-persist result_commit before residual work is completed")
+            if int(residual_parent.split_approved) != 0:
+                return _fail("parent-after-merge relaunch must clear split_approved before handing control back to the parent implementer")
+            merged_head = _run_git(Path(residual_parent.workspace_root), "rev-parse", "HEAD")
+            if str(residual_parent.durable_commit or "").strip() != merged_head:
+                return _fail("parent-after-merge relaunch must advance durable_commit to the clean merged child baseline")
+            residual_final_effects = Path(residual_parent.final_effects_file)
+            if not residual_final_effects.exists() or residual_final_effects.read_text(encoding="utf-8") != Path(parent_effects).read_text(encoding="utf-8"):
+                return _fail("parent-after-merge relaunch must materialize the current parent FINAL_EFFECTS into the merged workspace")
+            if (Path(residual_parent.workspace_root) / "feature_a.txt").read_text(encoding="utf-8") != "feature A\n":
+                return _fail("parent-after-merge workspace must contain merged child A changes")
+            if (Path(residual_parent.workspace_root) / "feature_b.txt").read_text(encoding="utf-8") != "feature B\n":
+                return _fail("parent-after-merge workspace must contain merged child B changes")
+        finally:
+            residual_core.stop()
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -3661,6 +4351,8 @@ def main() -> int:
             return _fail("ordinary final kernel takeover must not carry split-review LOOP_REQUEST_SEQ metadata")
         if "final kernel takeover" not in str(final_launch_specs[0].prompt_text).lower():
             return _fail("final kernel takeover prompt must explain that node 0 is taking over final closeout")
+        if "pending implementer split request" in str(final_launch_specs[0].prompt_text).lower() or "frozen proposal.json" in str(final_launch_specs[0].prompt_text).lower():
+            return _fail("final kernel takeover must not reuse the split-review kernel prompt")
         kernel_record = store.load_node(KERNEL_NODE_ID)
         if kernel_record is None:
             return _fail("final kernel takeover must materialize node 0")
@@ -3668,6 +4360,9 @@ def main() -> int:
             return _fail("final kernel takeover must mark node 0 as escalated_to_kernel")
         if str(kernel_record.durable_commit or "").strip() != root_commit:
             return _fail("final kernel takeover must use the root result_commit as node 0 durable baseline")
+        kernel_final_effects = Path(kernel_record.final_effects_file)
+        if not kernel_final_effects.exists() or kernel_final_effects.read_text(encoding="utf-8") != Path(root_effects).read_text(encoding="utf-8"):
+            return _fail("final kernel takeover must materialize the current root FINAL_EFFECTS into the kernel worktree")
         _write_file(Path(kernel_record.workspace_root) / "kernel-closeout.md", "closeout note\n")
         final_core._advance_after_valid_actor_completion(
             record=kernel_record,
@@ -3747,6 +4442,77 @@ def main() -> int:
             return _fail("node 0 reviewer OK must preserve the final result_commit on the durable node")
         if finalized.current_components or str(finalized.evaluator_phase or "").strip():
             return _fail("node 0 reviewer OK must leave the node inactive and evaluator-complete")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        repo_root = (tmp / "repo-kernel-noop-closeout").resolve()
+        _init_git_repo(repo_root)
+        kernel_effects = _write_final_effects(repo_root / "FINAL_EFFECTS.md", "Kernel noop closeout.\n")
+        _run_git(repo_root, "add", "FINAL_EFFECTS.md")
+        _run_git(repo_root, "commit", "-m", "add kernel noop closeout effects")
+        kernel_commit = _run_git(repo_root, "rev-parse", "HEAD")
+        db_path = tmp / "router.sqlite3"
+        store = RouterStore(db_path)
+        _upsert_running_node(
+            store=store,
+            node_id=KERNEL_NODE_ID,
+            parent_node_id="1",
+            attempt_count=2,
+            durable_commit=kernel_commit,
+            workspace_root=repo_root,
+            final_effects_file=kernel_effects,
+            actor_kind=ActorKind.KERNEL,
+            pid=93001,
+            process_birth_time=1719300000.0,
+            session_ids=["kernel-noop-session"],
+            workspace_fingerprint_before=workspace_output_fingerprint(repo_root),
+        )
+        kernel_record = store.load_node(KERNEL_NODE_ID)
+        if kernel_record is None:
+            return _fail("node 0 kernel noop closeout test node must be loadable")
+        kernel_record = replace(kernel_record, escalated_to_kernel=True)
+        store.upsert_node(kernel_record)
+        _write_completion(
+            actor_completion_record_path(repo_root, ActorKind.KERNEL, node_id=KERNEL_NODE_ID),
+            {
+                "version": 1,
+                "node_id": KERNEL_NODE_ID,
+                "actor_kind": ActorKind.KERNEL.value,
+                "attempt_count": 2,
+                "pid": 93001,
+                "process_birth_time": 1719300000.0,
+                "completed_at": now.isoformat(),
+            },
+        )
+        noop_core = RouterCore(
+            store=store,
+            wakeup_socket_path=router_wakeup_socket_path(db_path),
+        )
+        noop_component = kernel_record.components.get(component_key(actor_kind=ActorKind.KERNEL))
+        if noop_component is None:
+            return _fail("node 0 kernel noop closeout test must preserve kernel component state")
+        noop_check = noop_core._validate_actor_completion(
+            record=kernel_record,
+            item=StoredRouterInboxItem(
+                seq=1,
+                event_type="ProcessExitedObserved",
+                node_id=KERNEL_NODE_ID,
+                actor_kind=ActorKind.KERNEL,
+                attempt_count=2,
+                recorded_at=now,
+                payload_json="{}",
+            ),
+            component=noop_component,
+            payload={
+                "exit_code": 0,
+                "signal_name": None,
+            },
+        )
+        if not noop_check.accepted:
+            return _fail(
+                "node 0 final-closeout kernel must be allowed to complete without substantive workspace changes "
+                f"when the current takeover workspace already satisfies closeout: {noop_check.reason_lines}"
+            )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -3934,6 +4700,7 @@ def main() -> int:
                 actor_completion_record_path(
                     task_effects.parent,
                     ActorKind.EVALUATOR_AI_USER,
+                    node_id="23",
                     task_id="task-1",
                 ),
                 {
@@ -3988,17 +4755,22 @@ def main() -> int:
             "Checker node 24.\n",
         )
         _write_file(tmp / "workspace" / "node-24" / "deliverable.md", "changed\n")
-        original_task_ref = _write_file(
-            tmp / "workspace" / "node-24" / "checker" / "task-1.md",
-            "original task body\n",
-        )
         checker_tasks_ref = _write_file(
-            tmp / "workspace" / "node-24" / "checker" / "tasks.json",
+            checker_current_tasks_path(checker_effects.parent, "24"),
             json.dumps(
-                {
-                    "version": 1,
-                    "tasks": [{"task_id": "task-1", "task_ref": str(original_task_ref.resolve())}],
-                },
+                _checker_manifest_payload(
+                    workspace_root=checker_effects.parent,
+                    final_effects_file=checker_effects,
+                    snapshot_id="snapshot-24-live",
+                    tasks=[
+                        _checker_task_entry(
+                            "task-1",
+                            goal="Validate task one.",
+                            task_instructions="Inspect the current workspace and validate task one.",
+                            required_evidence=["screenshot diff"],
+                        )
+                    ],
+                ),
                 indent=2,
                 sort_keys=True,
             ),
@@ -4041,7 +4813,11 @@ def main() -> int:
         checker_core.start()
         try:
             _write_completion(
-                actor_completion_record_path(checker_effects.parent, ActorKind.EVALUATOR_CHECKER),
+                actor_completion_record_path(
+                    checker_effects.parent,
+                    ActorKind.EVALUATOR_CHECKER,
+                    node_id="24",
+                ),
                 {
                     "version": 1,
                     "node_id": "24",
@@ -4088,11 +4864,15 @@ def main() -> int:
             if not frozen_tasks_ref.exists():
                 return _fail("checker completion must persist an existing frozen task manifest")
             frozen_payload = json.loads(frozen_tasks_ref.read_text(encoding="utf-8"))
-            frozen_task_ref = Path(str(frozen_payload["tasks"][0]["task_ref"])).resolve()
-            if frozen_task_ref == original_task_ref.resolve():
-                return _fail("checker completion snapshot must rewrite task_ref to a frozen copied file")
-            if frozen_task_ref.read_text(encoding="utf-8") != "original task body\n":
-                return _fail("checker completion snapshot must preserve the original task contents")
+            if int(frozen_payload.get("version") or 0) != 2:
+                return _fail("checker completion snapshot must preserve the version=2 manifest contract")
+            if str(frozen_payload.get("snapshot_id") or "").strip() == "snapshot-24-live":
+                return _fail("checker completion snapshot must assign a fresh accepted snapshot id")
+            frozen_task = list(frozen_payload.get("tasks") or [{}])[0]
+            if str(frozen_task.get("task_instructions") or "").strip() != "Inspect the current workspace and validate task one.":
+                return _fail("checker completion snapshot must preserve inline task instructions")
+            if list(frozen_task.get("required_evidence") or []) != ["screenshot diff"]:
+                return _fail("checker completion snapshot must preserve required_evidence for accepted manifests")
         finally:
             checker_core.stop()
 
@@ -4106,20 +4886,18 @@ def main() -> int:
             "Task node 25.\n",
         )
         result_ref = _write_file(
-            tmp / "workspace" / "node-25" / "ai-user-result.md",
-            "AI user result.\n",
-        )
-        ai_task_ref = _write_file(
-            tmp / "workspace" / "node-25" / "task-1.md",
-            "Task 1.\n",
+            ai_user_current_result_path(ai_effects.parent, "25", task_id="task-1"),
+            "Task id: wrong-task\nCurrent dispatched snapshot id: snapshot-25\nTask verdict: FAIL\n",
         )
         checker_tasks_ref = _write_file(
-            tmp / "workspace" / "node-25" / "checker-tasks.json",
+            checker_current_tasks_path(ai_effects.parent, "25"),
             json.dumps(
-                {
-                    "version": 1,
-                    "tasks": [{"task_id": "task-1", "task_ref": str(ai_task_ref.resolve())}],
-                },
+                _checker_manifest_payload(
+                    workspace_root=ai_effects.parent,
+                    final_effects_file=ai_effects,
+                    snapshot_id="snapshot-25",
+                    tasks=[_checker_task_entry("task-1", goal="Validate task one.")],
+                ),
                 indent=2,
                 sort_keys=True,
             ),
@@ -4183,6 +4961,7 @@ def main() -> int:
                 actor_completion_record_path(
                     ai_effects.parent,
                     ActorKind.EVALUATOR_AI_USER,
+                    node_id="25",
                     task_id="task-1",
                 ),
                 {
@@ -4235,20 +5014,18 @@ def main() -> int:
             "Task node 26.\n",
         )
         result_ref = _write_file(
-            tmp / "workspace" / "node-26" / "ai-user-result.md",
-            "AI user result.\n",
-        )
-        ai_task_ref = _write_file(
-            tmp / "workspace" / "node-26" / "task-1.md",
-            "Task 1.\n",
+            ai_user_current_result_path(ai_effects.parent, "26", task_id="task-1"),
+            "Task id: task-1\nCurrent dispatched snapshot id: snapshot-26\nTask verdict: PASS\n",
         )
         checker_tasks_ref = _write_file(
-            tmp / "workspace" / "node-26" / "checker-tasks.json",
+            checker_current_tasks_path(ai_effects.parent, "26"),
             json.dumps(
-                {
-                    "version": 1,
-                    "tasks": [{"task_id": "task-1", "task_ref": str(ai_task_ref.resolve())}],
-                },
+                _checker_manifest_payload(
+                    workspace_root=ai_effects.parent,
+                    final_effects_file=ai_effects,
+                    snapshot_id="snapshot-26",
+                    tasks=[_checker_task_entry("task-1", goal="Validate task one.")],
+                ),
                 indent=2,
                 sort_keys=True,
             ),
@@ -4312,6 +5089,7 @@ def main() -> int:
                 actor_completion_record_path(
                     ai_effects.parent,
                     ActorKind.EVALUATOR_AI_USER,
+                    node_id="26",
                     task_id="task-1",
                 ),
                 {
@@ -4354,8 +5132,8 @@ def main() -> int:
                 return _fail("task node 26 must remain loadable after valid AI-user completion")
             if str(
                 persisted.task_result_refs.get("task-1", {}).get(ActorKind.EVALUATOR_AI_USER.value, "")
-            ) != str(result_ref.resolve()):
-                return _fail("valid AI-user completion must persist its result_ref even when task_result_refs started empty")
+            ) != str(ai_user_accepted_result_path(ai_effects.parent, "26", task_id="task-1", attempt_count=1)):
+                return _fail("valid AI-user completion must persist the accepted AI-user result ref even when task_result_refs started empty")
         finally:
             ai_core.stop()
 
@@ -4424,7 +5202,7 @@ def main() -> int:
             )
             notify_router_wakeup(wakeup_path)
             if not _wait_until(
-                lambda: len(failed_kernel_launches) == 1,
+                lambda: len(failed_kernel_launches) >= 1,
                 timeout_seconds=2.0,
             ):
                 return _fail("pending split review must still try to launch the node-0 kernel actor")
@@ -4592,6 +5370,503 @@ def main() -> int:
             return _fail("core.start must not run the startup actor sweep after durable completed was recorded")
         if fake_proc.started != 1 or fake_proc.stopped != 1:
             return _fail("core.start completed resume path must still start and then stop proc exactly once")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        db_path = tmp / "paused-append-router.sqlite3"
+        store = RouterStore(db_path)
+        paused_workspace = (tmp / "paused-root").resolve()
+        paused_workspace.mkdir(parents=True, exist_ok=True)
+        paused_final_effects = _write_final_effects(
+            paused_workspace / "FINAL_EFFECTS.md",
+            "Original paused obligations.\n",
+        )
+        paused_append_ref = _write_file(
+            tmp / "paused-append-final-effects.md",
+            "Paused appended obligations.\n",
+        )
+        child_ref = ActorRef(
+            node_id="7",
+            actor_kind=ActorKind.IMPLEMENTER,
+            attempt_count=2,
+        )
+        store.upsert_node(
+            NodeRuntimeRecord(
+                node_id="1",
+                parent_node_id="0",
+                child_node_ids=["7"],
+                workspace_root=str(paused_workspace),
+                final_effects_file=str(paused_final_effects),
+                split_request=1,
+                split_approved=1,
+                approved_split_request_seq=9,
+                evaluator_phase="tasks",
+                checker_tasks_ref="/tmp/paused-checker.json",
+                task_result_refs={"task-1": {"evaluator_ai_user": "/tmp/result.json"}},
+                reviewer_verdict_kind="",
+                reviewer_report_ref="",
+                pending_prelude_lines=[],
+                current_components=[child_ref],
+                durable_commit="paused-root-durable",
+                result_commit="",
+                escalated_to_kernel=False,
+                last_rejected_split_diff_fingerprint="paused-fingerprint",
+                components={
+                    component_key(actor_kind=ActorKind.IMPLEMENTER): ComponentRuntimeState(
+                        status=ComponentStatus.INACTIVE,
+                        attempt_count=1,
+                        pid=0,
+                        process_birth_time=None,
+                        session_ids=["paused-root"],
+                        workspace_fingerprint_before="paused-root-fp",
+                        saw_output_in_attempt=True,
+                        consecutive_no_progress=0,
+                        consecutive_failed_exits=0,
+                    )
+                },
+            )
+        )
+        store.write_router_paused_state(
+            router_status="paused",
+            router_paused_reason_json='{"reason":"manual pause"}',
+            router_paused_at="2026-04-09T00:00:00+00:00",
+        )
+        paused_resume_core = RouterCore(
+            store=store,
+            wakeup_socket_path=router_wakeup_socket_path(db_path),
+        )
+        paused_payload = paused_resume_core.prepare_resume(
+            append_final_effects_ref=paused_append_ref,
+        )
+        if str(paused_payload.get("resume_mode") or "") != "paused_append":
+            return _fail("paused append resume must report paused_append resume_mode")
+        if str(store.read_router_status() or "").strip():
+            return _fail("paused append resume must clear router_status before runtime restart")
+        resumed_paused_root = store.load_node("1")
+        if resumed_paused_root is None:
+            return _fail("paused append resume must preserve the root node")
+        if resumed_paused_root.child_node_ids != ["7"] or int(resumed_paused_root.split_request) != 1:
+            return _fail("paused append resume must preserve the current root frontier state")
+        if resumed_paused_root.current_components != [child_ref]:
+            return _fail("paused append resume must not rewrite current frontier ownership")
+        paused_merged_final_effects = paused_final_effects.read_text(encoding="utf-8")
+        if "Original paused obligations." not in paused_merged_final_effects:
+            return _fail("paused append resume must preserve the original root FINAL_EFFECTS text")
+        if "## Appended Final Effects" not in paused_merged_final_effects or "Paused appended obligations." not in paused_merged_final_effects:
+            return _fail("paused append resume must append the new obligations to the root FINAL_EFFECTS file")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        db_path = tmp / "terminal-append-router.sqlite3"
+        store = RouterStore(db_path)
+        terminal_workspace = (tmp / "terminal-root").resolve()
+        terminal_workspace.mkdir(parents=True, exist_ok=True)
+        terminal_effects = _write_final_effects(
+            terminal_workspace / "FINAL_EFFECTS.md",
+            "Original terminal obligations.\n",
+        )
+        terminal_append_ref = _write_file(
+            tmp / "terminal-append-final-effects.md",
+            "Terminal appended obligations.\n",
+        )
+        child_workspace = (tmp / "terminal-child").resolve()
+        child_workspace.mkdir(parents=True, exist_ok=True)
+        child_effects = _write_final_effects(
+            child_workspace / "FINAL_EFFECTS.md",
+            "Child obligations.\n",
+        )
+        store.upsert_nodes(
+            [
+                NodeRuntimeRecord(
+                    node_id="1",
+                    parent_node_id="0",
+                    child_node_ids=["71"],
+                    workspace_root=str(terminal_workspace),
+                    final_effects_file=str(terminal_effects),
+                    split_request=1,
+                    split_approved=1,
+                    approved_split_request_seq=5,
+                    evaluator_phase="",
+                    checker_tasks_ref="",
+                    task_result_refs={},
+                    reviewer_verdict_kind="",
+                    reviewer_report_ref="",
+                    pending_prelude_lines=[],
+                    current_components=[],
+                    durable_commit="root-durable",
+                    result_commit="",
+                    escalated_to_kernel=False,
+                    last_rejected_split_diff_fingerprint="",
+                    components={
+                        component_key(actor_kind=ActorKind.IMPLEMENTER): ComponentRuntimeState(
+                            status=ComponentStatus.TERMINAL_FAILED,
+                            attempt_count=1,
+                            pid=0,
+                            process_birth_time=None,
+                            session_ids=["root-terminal"],
+                            workspace_fingerprint_before="root-fp",
+                            saw_output_in_attempt=True,
+                            consecutive_no_progress=0,
+                            consecutive_failed_exits=1,
+                        )
+                    },
+                ),
+                NodeRuntimeRecord(
+                    node_id="71",
+                    parent_node_id="1",
+                    child_node_ids=[],
+                    workspace_root=str(child_workspace),
+                    final_effects_file=str(child_effects),
+                    split_request=0,
+                    split_approved=0,
+                    approved_split_request_seq=0,
+                    evaluator_phase="",
+                    checker_tasks_ref="",
+                    task_result_refs={},
+                    reviewer_verdict_kind="",
+                    reviewer_report_ref="",
+                    pending_prelude_lines=[],
+                    current_components=[
+                        ActorRef(
+                            node_id="71",
+                            actor_kind=ActorKind.IMPLEMENTER,
+                            attempt_count=3,
+                        )
+                    ],
+                    durable_commit="child-durable",
+                    result_commit="",
+                    escalated_to_kernel=False,
+                    last_rejected_split_diff_fingerprint="",
+                    components={
+                        component_key(actor_kind=ActorKind.IMPLEMENTER): ComponentRuntimeState(
+                            status=ComponentStatus.TERMINAL_FAILED,
+                            attempt_count=3,
+                            pid=7101,
+                            process_birth_time=1713000100.0,
+                            session_ids=["child-terminal"],
+                            workspace_fingerprint_before="child-fp",
+                            saw_output_in_attempt=True,
+                            consecutive_no_progress=0,
+                            consecutive_failed_exits=3,
+                        )
+                    },
+                ),
+            ]
+        )
+        store.write_router_terminal_state(
+            router_status="terminal_failed",
+            router_terminal_reason_json='{"reason":"majority_frontier_terminal_failed"}',
+            router_terminal_at="2026-04-09T00:00:00+00:00",
+        )
+        terminal_resume_core = RouterCore(
+            store=store,
+            wakeup_socket_path=router_wakeup_socket_path(db_path),
+        )
+        terminal_payload = terminal_resume_core.prepare_resume(
+            append_final_effects_ref=terminal_append_ref,
+        )
+        if str(terminal_payload.get("resume_mode") or "") != "terminal_failed_append":
+            return _fail("terminal_failed append resume must report terminal_failed_append resume_mode")
+        if int(terminal_payload.get("recovered_components") or 0) != 1:
+            return _fail("terminal_failed append resume must still recover only unfinished frontier components")
+        if str(store.read_router_status() or "").strip():
+            return _fail("terminal_failed append resume must clear router_status before runtime restart")
+        resumed_terminal_root = store.load_node("1")
+        resumed_terminal_child = store.load_node("71")
+        if resumed_terminal_root is None or resumed_terminal_child is None:
+            return _fail("terminal_failed append resume must preserve durable nodes")
+        resumed_terminal_child_component = resumed_terminal_child.components.get(component_key(actor_kind=ActorKind.IMPLEMENTER))
+        if resumed_terminal_child_component is None or resumed_terminal_child_component.status is not ComponentStatus.INACTIVE:
+            return _fail("terminal_failed append resume must still reactivate the unfinished child frontier")
+        terminal_merged_final_effects = terminal_effects.read_text(encoding="utf-8")
+        if "Original terminal obligations." not in terminal_merged_final_effects:
+            return _fail("terminal_failed append resume must preserve the original root FINAL_EFFECTS text")
+        if "## Appended Final Effects" not in terminal_merged_final_effects or "Terminal appended obligations." not in terminal_merged_final_effects:
+            return _fail("terminal_failed append resume must append the new obligations to the root FINAL_EFFECTS file")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        db_path = tmp / "router.sqlite3"
+        store = RouterStore(db_path)
+        terminal_workspace = (tmp / "terminal-workspace").resolve()
+        terminal_workspace.mkdir(parents=True, exist_ok=True)
+        terminal_effects = _write_final_effects(
+            terminal_workspace / "FINAL_EFFECTS.md",
+            "Recover the child frontier.\n",
+        )
+        store.upsert_nodes(
+            [
+                NodeRuntimeRecord(
+                    node_id="70",
+                    parent_node_id="0",
+                    child_node_ids=["71"],
+                    workspace_root=str(terminal_workspace),
+                    final_effects_file=str(terminal_effects),
+                    split_request=0,
+                    split_approved=1,
+                    approved_split_request_seq=9,
+                    evaluator_phase="",
+                    checker_tasks_ref="",
+                    task_result_refs={},
+                    reviewer_verdict_kind="",
+                    reviewer_report_ref="",
+                    pending_prelude_lines=[],
+                    current_components=[],
+                    durable_commit="parent-durable",
+                    result_commit="",
+                    escalated_to_kernel=False,
+                    last_rejected_split_diff_fingerprint="",
+                    components={
+                        component_key(actor_kind=ActorKind.IMPLEMENTER): ComponentRuntimeState(
+                            status=ComponentStatus.TERMINAL_FAILED,
+                            attempt_count=2,
+                            pid=7001,
+                            process_birth_time=1713000000.0,
+                            session_ids=["parent-terminal"],
+                            workspace_fingerprint_before="parent-fp",
+                            saw_output_in_attempt=True,
+                            consecutive_no_progress=0,
+                            consecutive_failed_exits=3,
+                        )
+                    },
+                ),
+                NodeRuntimeRecord(
+                    node_id="71",
+                    parent_node_id="70",
+                    child_node_ids=[],
+                    workspace_root=str(terminal_workspace),
+                    final_effects_file=str(terminal_effects),
+                    split_request=0,
+                    split_approved=0,
+                    approved_split_request_seq=0,
+                    evaluator_phase="",
+                    checker_tasks_ref="",
+                    task_result_refs={},
+                    reviewer_verdict_kind="",
+                    reviewer_report_ref="",
+                    pending_prelude_lines=[],
+                    current_components=[
+                        ActorRef(
+                            node_id="71",
+                            actor_kind=ActorKind.IMPLEMENTER,
+                            attempt_count=3,
+                        )
+                    ],
+                    durable_commit="child-durable",
+                    result_commit="",
+                    escalated_to_kernel=False,
+                    last_rejected_split_diff_fingerprint="",
+                    components={
+                        component_key(actor_kind=ActorKind.IMPLEMENTER): ComponentRuntimeState(
+                            status=ComponentStatus.TERMINAL_FAILED,
+                            attempt_count=3,
+                            pid=7101,
+                            process_birth_time=1713000100.0,
+                            session_ids=["child-terminal"],
+                            workspace_fingerprint_before="child-fp",
+                            saw_output_in_attempt=True,
+                            consecutive_no_progress=0,
+                            consecutive_failed_exits=3,
+                        )
+                    },
+                ),
+            ]
+        )
+        store.write_router_terminal_state(
+            router_status="terminal_failed",
+            router_terminal_reason_json='{"reason":"majority_frontier_terminal_failed"}',
+            router_terminal_at="2026-04-09T00:00:00+00:00",
+        )
+        resume_core = RouterCore(
+            store=store,
+            wakeup_socket_path=router_wakeup_socket_path(db_path),
+        )
+        resume_payload = resume_core.prepare_resume()
+        if str(resume_payload.get("resume_mode") or "") != "terminal_failed":
+            return _fail("terminal_failed resume must report terminal_failed resume_mode")
+        if int(resume_payload.get("recovered_components") or 0) != 1:
+            return _fail("terminal_failed resume must only recover unfinished frontier components")
+        if str(store.read_router_status() or "").strip():
+            return _fail("terminal_failed resume must clear router_status before runtime restart")
+        resumed_parent = store.load_node("70")
+        resumed_child = store.load_node("71")
+        if resumed_parent is None or resumed_child is None:
+            return _fail("terminal_failed resume must preserve durable nodes")
+        parent_component = resumed_parent.components.get(component_key(actor_kind=ActorKind.IMPLEMENTER))
+        child_component = resumed_child.components.get(component_key(actor_kind=ActorKind.IMPLEMENTER))
+        if parent_component is None or child_component is None:
+            return _fail("terminal_failed resume must preserve implementer component state")
+        if parent_component.status is not ComponentStatus.TERMINAL_FAILED:
+            return _fail("terminal_failed resume must not revive a split-approved parent that is waiting on child completion")
+        if child_component.status is not ComponentStatus.INACTIVE:
+            return _fail("terminal_failed resume must reactivate the child frontier by marking it inactive")
+        if int(child_component.consecutive_failed_exits) != 0:
+            return _fail("terminal_failed resume must reset failed exit counters for recovered components")
+        if resumed_child.current_components:
+            return _fail("terminal_failed resume must clear recovered current_components so reconcile can relaunch them cleanly")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        repo_root = (tmp / "completed-root-repo").resolve()
+        _init_git_repo(repo_root)
+        final_effects_file = _write_final_effects(
+            repo_root / "FINAL_EFFECTS.md",
+            "Original completed obligations.\n",
+        )
+        _run_git(repo_root, "add", "FINAL_EFFECTS.md")
+        _run_git(repo_root, "commit", "-m", "add final effects")
+        base_commit = _run_git(repo_root, "rev-parse", "HEAD")
+        (repo_root / "deliverable.txt").write_text("earlier root output\n", encoding="utf-8")
+        _run_git(repo_root, "add", "deliverable.txt")
+        _run_git(repo_root, "commit", "-m", "complete earlier root wave")
+        earlier_root_result_commit = _run_git(repo_root, "rev-parse", "HEAD")
+        takeover_root = (tmp / "completed-takeover-repo").resolve()
+        _init_git_repo(takeover_root)
+        takeover_final_effects_file = _write_final_effects(
+            takeover_root / "FINAL_EFFECTS.md",
+            "Previously completed obligations.\n",
+        )
+        _run_git(takeover_root, "add", "FINAL_EFFECTS.md")
+        _run_git(takeover_root, "commit", "-m", "add takeover final effects")
+        takeover_base_commit = _run_git(takeover_root, "rev-parse", "HEAD")
+        (takeover_root / "deliverable.txt").write_text("final integrated output\n", encoding="utf-8")
+        _run_git(takeover_root, "add", "deliverable.txt")
+        _run_git(takeover_root, "commit", "-m", "complete integrated wave")
+        result_commit = _run_git(takeover_root, "rev-parse", "HEAD")
+        append_ref = _write_file(
+            tmp / "append-final-effects.md",
+            "New appended obligations.\n",
+        )
+        db_path = tmp / "completed-router.sqlite3"
+        store = RouterStore(db_path)
+        store.upsert_node(
+            NodeRuntimeRecord(
+                node_id="1",
+                parent_node_id="0",
+                child_node_ids=["71"],
+                workspace_root=str(repo_root),
+                final_effects_file=str(final_effects_file),
+                split_request=1,
+                split_approved=1,
+                approved_split_request_seq=17,
+                evaluator_phase="",
+                checker_tasks_ref="/tmp/old-checker.json",
+                task_result_refs={"task-1": {"evaluator_tester": "/tmp/old-result.md"}},
+                reviewer_verdict_kind="OK",
+                reviewer_report_ref="/tmp/old-reviewer.md",
+                pending_prelude_lines=[],
+                current_components=[],
+                durable_commit=base_commit,
+                result_commit=earlier_root_result_commit,
+                escalated_to_kernel=False,
+                last_rejected_split_diff_fingerprint="old-root-fingerprint",
+                components={
+                    component_key(actor_kind=ActorKind.IMPLEMENTER): ComponentRuntimeState(
+                        status=ComponentStatus.COMPLETED,
+                        attempt_count=4,
+                        pid=0,
+                        process_birth_time=None,
+                        session_ids=["old-implementer"],
+                        workspace_fingerprint_before="completed-fp",
+                        saw_output_in_attempt=True,
+                        consecutive_no_progress=0,
+                        consecutive_failed_exits=0,
+                    )
+                },
+            )
+        )
+        store.upsert_node(
+            NodeRuntimeRecord(
+                node_id="0",
+                parent_node_id="0",
+                child_node_ids=[],
+                workspace_root=str(takeover_root),
+                final_effects_file=str(takeover_final_effects_file),
+                split_request=0,
+                split_approved=0,
+                approved_split_request_seq=0,
+                evaluator_phase="",
+                checker_tasks_ref="",
+                task_result_refs={},
+                reviewer_verdict_kind="OK",
+                reviewer_report_ref="/tmp/final-reviewer.md",
+                pending_prelude_lines=[],
+                current_components=[],
+                durable_commit=takeover_base_commit,
+                result_commit=result_commit,
+                escalated_to_kernel=True,
+                last_rejected_split_diff_fingerprint="kernel-fingerprint",
+                components={
+                    component_key(actor_kind=ActorKind.KERNEL): ComponentRuntimeState(
+                        status=ComponentStatus.COMPLETED,
+                        attempt_count=2,
+                        pid=0,
+                        process_birth_time=None,
+                        session_ids=["old-kernel"],
+                        workspace_fingerprint_before="kernel-fp",
+                        saw_output_in_attempt=True,
+                        consecutive_no_progress=0,
+                        consecutive_failed_exits=0,
+                    )
+                },
+            )
+        )
+        store.write_router_completed_state(
+            router_status="completed",
+            router_completed_result_commit=result_commit,
+            router_completed_report_ref="/tmp/final-reviewer.md",
+            router_completed_at="2026-04-09T01:00:00+00:00",
+        )
+        completed_resume_core = RouterCore(
+            store=store,
+            wakeup_socket_path=router_wakeup_socket_path(db_path),
+        )
+        completed_payload = completed_resume_core.prepare_resume(
+            append_final_effects_ref=append_ref,
+        )
+        if str(completed_payload.get("resume_mode") or "") != "completed_append":
+            return _fail("completed resume must report completed_append resume_mode")
+        resumed_root = store.load_node("1")
+        if resumed_root is None:
+            return _fail("completed resume must preserve the root node")
+        if str(store.read_router_status() or "").strip():
+            return _fail("completed resume must clear completed router_status before runtime restart")
+        if str(resumed_root.workspace_root or "").strip() != str(takeover_root):
+            return _fail("completed resume must reopen root from the final completed workspace")
+        if str(Path(resumed_root.final_effects_file).resolve()) != str(takeover_final_effects_file.resolve()):
+            return _fail("completed resume must reopen root against the final completed FINAL_EFFECTS file")
+        if str(resumed_root.durable_commit or "").strip() != result_commit:
+            return _fail("completed resume must promote the final completed result_commit into durable_commit")
+        if str(resumed_root.result_commit or "").strip():
+            return _fail("completed resume must clear result_commit so a new wave can run")
+        if resumed_root.child_node_ids or int(resumed_root.split_request) != 0 or int(resumed_root.split_approved) != 0:
+            return _fail("completed resume must reopen the root as a single unsplit node")
+        if str(resumed_root.reviewer_verdict_kind or "").strip():
+            return _fail("completed resume must clear reviewer verdict state")
+        if str(resumed_root.checker_tasks_ref or "").strip():
+            return _fail("completed resume must clear checker task graph state")
+        if resumed_root.task_result_refs:
+            return _fail("completed resume must clear task result refs before the next wave")
+        if bool(resumed_root.escalated_to_kernel):
+            return _fail("completed resume must clear root escalated_to_kernel state for the next wave")
+        implementer_component = resumed_root.components.get(component_key(actor_kind=ActorKind.IMPLEMENTER))
+        if implementer_component is None or implementer_component.status is not ComponentStatus.INACTIVE:
+            return _fail("completed resume must leave the root implementer inactive so reconcile can relaunch it")
+        if not resumed_root.pending_prelude_lines or "previously completed obligations" not in " ".join(resumed_root.pending_prelude_lines).lower():
+            return _fail("completed resume must inject a prelude that explains the previously completed obligations")
+        resumed_kernel = store.load_node("0")
+        if resumed_kernel is None:
+            return _fail("completed resume must preserve the historical kernel node record")
+        if bool(resumed_kernel.escalated_to_kernel) or str(resumed_kernel.result_commit or "").strip():
+            return _fail("completed resume must clear the historical kernel takeover state before the next wave")
+        merged_final_effects = takeover_final_effects_file.read_text(encoding="utf-8")
+        if "Previously completed obligations." not in merged_final_effects:
+            return _fail("completed resume must preserve the final completed FINAL_EFFECTS text")
+        if "## Appended Final Effects" not in merged_final_effects or "New appended obligations." not in merged_final_effects:
+            return _fail("completed resume must append the new final effects block into the final completed FINAL_EFFECTS file")
+        original_root_text = final_effects_file.read_text(encoding="utf-8")
+        if "New appended obligations." in original_root_text:
+            return _fail("completed resume must not mutate the stale pre-takeover root FINAL_EFFECTS file")
 
     print("[loop-system-router-core][PASS] core dispatches split reviews FIFO through the node-0 kernel actor, materializes approved children, recovers rejected dead actors, force-terminates approved parents, and retries pending kernel work through ordinary actor recovery")
     return 0

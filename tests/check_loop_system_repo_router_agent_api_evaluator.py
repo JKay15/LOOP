@@ -67,8 +67,11 @@ def _upsert_running_node(
     process_birth_time: float,
     session_ids: list[str],
     workspace_fingerprint_before: str,
+    checker_tasks_ref: str = "",
+    task_result_refs: dict[str, dict[str, str]] | None = None,
+    task_id: str = "",
 ):
-    from loop.events import ActorRef
+    from loop.events import ActorKind, ActorRef
     from loop.node_table import (
         ComponentRuntimeState,
         ComponentStatus,
@@ -86,8 +89,8 @@ def _upsert_running_node(
             split_request=0,
             split_approved=0,
             evaluator_phase="",
-            checker_tasks_ref="",
-            task_result_refs={},
+            checker_tasks_ref=str(checker_tasks_ref),
+            task_result_refs=dict(task_result_refs or {}),
             reviewer_verdict_kind="",
             reviewer_report_ref="",
             pending_prelude_lines=[],
@@ -96,6 +99,7 @@ def _upsert_running_node(
                     node_id=node_id,
                     actor_kind=actor_kind,
                     attempt_count=int(attempt_count),
+                    task_id=(task_id or None) if actor_kind is ActorKind.EVALUATOR_AI_USER else None,
                 )
             ],
             durable_commit=durable_commit,
@@ -105,6 +109,7 @@ def _upsert_running_node(
                 component_key(actor_kind=actor_kind): ComponentRuntimeState(
                     status=ComponentStatus.RUNNING,
                     attempt_count=int(attempt_count),
+                    task_id=str(task_id or "") if actor_kind is ActorKind.EVALUATOR_AI_USER else "",
                     pid=int(pid),
                     process_birth_time=float(process_birth_time),
                     session_ids=list(session_ids),
@@ -133,6 +138,12 @@ def main() -> int:
         from loop.agent_api import main as agent_api_main
         from loop.agent_api import build_parser
         from loop.completion import actor_completion_record_path
+        from loop.evaluator_runtime import (
+            checker_current_tasks_path,
+            reviewer_current_feedback_path,
+            reviewer_current_report_path,
+            tester_current_result_path,
+        )
         from loop.events import ActorKind
         from loop.store import RouterStore
     except Exception as exc:  # noqa: BLE001
@@ -140,7 +151,7 @@ def main() -> int:
 
     parser = build_parser()
     commands = _subcommand_names(parser)
-    expected_present = {"request-split", "complete", "start"}
+    expected_present = {"request-split", "complete"}
     if not expected_present.issubset(commands):
         return _fail(f"agent_api parser must expose {sorted(expected_present)!r}, got {sorted(commands)!r}")
     unexpected = {
@@ -204,12 +215,29 @@ def main() -> int:
             workspace_fingerprint_before="fp-before-checker",
         )
         checker_tasks = _write_file(
-            workspace_root / "checker" / "tasks.json",
+            checker_current_tasks_path(workspace_root, "1"),
             json.dumps(
                 {
-                    "version": 1,
+                    "version": 2,
+                    "snapshot_id": "snapshot-local-agent-api",
+                    "workspace_root": str(workspace_root),
+                    "authoritative_final_effects_path": str(final_effects),
+                    "obligations": [
+                        {
+                            "id": "req-1",
+                            "section": "Main",
+                            "requirement_text": "Do the node work.",
+                        }
+                    ],
                     "tasks": [
-                        {"task_id": "task-1", "task_ref": str(_write_file(workspace_root / "checker" / "task-1.md", "Check A\n"))},
+                        {
+                            "task_id": "task-1",
+                            "covered_requirement_ids": ["req-1"],
+                            "goal": "Check A",
+                            "blocking_condition": "Block if A fails.",
+                            "task_instructions": "Inspect the current implementation and validate A.",
+                            "required_evidence": ["One direct result file."],
+                        },
                     ],
                 },
                 indent=2,
@@ -247,8 +275,19 @@ def main() -> int:
             process_birth_time=1711965602.0,
             session_ids=["tester-session"],
             workspace_fingerprint_before="fp-before-tester",
+            checker_tasks_ref=str(checker_tasks),
         )
-        tester_result = _write_file(workspace_root / "results" / "task-1-tester.md", "tester result\n")
+        tester_result = _write_file(
+            tester_current_result_path(workspace_root, "1"),
+            "\n".join(
+                [
+                    "Current dispatched snapshot id: snapshot-local-agent-api",
+                    "Overall verdict: PASS",
+                    "Evidence: synthetic local tester result",
+                    "",
+                ]
+            ),
+        )
         with _env(
             LOOP_ROUTER_DB_PATH=str(db_path),
             LOOP_NODE_ID="1",
@@ -280,23 +319,36 @@ def main() -> int:
             process_birth_time=1711965603.0,
             session_ids=["reviewer-session"],
             workspace_fingerprint_before="fp-before-reviewer",
+            checker_tasks_ref=str(checker_tasks),
         )
-        reviewer_report = _write_file(workspace_root / "reviewer" / "report.md", "needs fixes\n")
-        reviewer_feedback_detail = _write_file(
-            workspace_root / "reviewer" / "implementer_feedback.md",
-            "implementer must address the reviewer finding\n",
+        reviewer_report = _write_file(
+            reviewer_current_report_path(workspace_root, "1"),
+            "\n".join(
+                [
+                    "Current dispatched snapshot id: snapshot-local-agent-api",
+                    "Still open: implementer finding remains active.",
+                    "",
+                ]
+            ),
         )
         reviewer_feedback_evidence = _write_file(
-            workspace_root / "reviewer" / "evidence.txt",
+            workspace_root
+            / ".loop"
+            / "router_runtime"
+            / "nodes"
+            / "node-1"
+            / "reviewer"
+            / "current"
+            / "evidence.txt",
             "fidelity mismatch evidence\n",
         )
         reviewer_feedback = _write_file(
-            workspace_root / "reviewer" / "feedback.json",
+            reviewer_current_feedback_path(workspace_root, "1"),
             json.dumps(
                 {
-                    "version": 1,
+                    "version": 2,
+                    "snapshot_id": "snapshot-local-agent-api",
                     "implementer": {
-                        "feedback_ref": str(reviewer_feedback_detail),
                         "findings": [
                             {
                                 "blocking": True,
@@ -305,8 +357,8 @@ def main() -> int:
                             }
                         ],
                     },
-                    "checker": {"feedback_ref": "", "findings": []},
-                    "tester": {"feedback_ref": "", "findings": []},
+                    "checker": {"findings": []},
+                    "tester": {"findings": []},
                     "ai_user": [],
                 },
                 indent=2,
@@ -397,7 +449,11 @@ def main() -> int:
         shell_payload = json.loads(shell_proc.stdout)
         if str(shell_payload.get("status") or "") != "RECORDED":
             return _fail("routerctl.sh complete from workspace cwd must record successfully")
-        shell_completion_path = actor_completion_record_path(shell_workspace_root, ActorKind.IMPLEMENTER)
+        shell_completion_path = actor_completion_record_path(
+            shell_workspace_root,
+            ActorKind.IMPLEMENTER,
+            node_id="2",
+        )
         if not shell_completion_path.exists():
             return _fail("routerctl.sh complete from workspace cwd must write the completion record")
 

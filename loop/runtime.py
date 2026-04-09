@@ -1,4 +1,4 @@
-"""Long-lived router runtime entrypoint for `agent_api start`."""
+"""Long-lived router runtime entrypoint for `router_api start`."""
 
 from __future__ import annotations
 
@@ -134,11 +134,12 @@ def build_actor_launcher(*, router_db_path: Path):
 def run_router_runtime(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run one long-lived router runtime.")
     parser.add_argument("--router-db", required=True)
-    parser.add_argument("--kernel-session-id", required=True)
-    parser.add_argument("--kernel-rollout-path", required=True)
-    parser.add_argument("--kernel-started-at", required=True)
-    parser.add_argument("--final-effects-file", required=True)
+    parser.add_argument("--kernel-session-id")
+    parser.add_argument("--kernel-rollout-path")
+    parser.add_argument("--kernel-started-at")
+    parser.add_argument("--final-effects-file")
     parser.add_argument("--startup-result-file", required=True)
+    parser.add_argument("--resume-only", action="store_true")
     args = parser.parse_args(argv)
 
     store = RouterStore(Path(args.router_db).expanduser().resolve())
@@ -148,12 +149,20 @@ def run_router_runtime(argv: list[str] | None = None) -> int:
         actor_launcher=build_actor_launcher(router_db_path=store.db_path),
     )
     try:
-        payload = core.start_router(
-            kernel_session_id=args.kernel_session_id,
-            kernel_rollout_path=args.kernel_rollout_path,
-            kernel_started_at=args.kernel_started_at,
-            final_effects_file=args.final_effects_file,
-        )
+        if bool(args.resume_only):
+            core.start()
+            payload = {
+                "accepted": True,
+                "status": "RESUMED",
+                "message": "router resumed from the latest durable state",
+            }
+        else:
+            payload = core.start_router(
+                kernel_session_id=args.kernel_session_id,
+                kernel_rollout_path=args.kernel_rollout_path,
+                kernel_started_at=args.kernel_started_at,
+                final_effects_file=args.final_effects_file,
+            )
     except RouterStartError as exc:
         _write_startup_result(Path(args.startup_result_file), exc.to_payload())
         return 2

@@ -1,4 +1,4 @@
-"""Thin router control API entrypoint for child/kernel agents."""
+"""Agent-facing completion and split API entrypoint for child/kernel actors."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -15,15 +16,27 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from loop.core import (
+    RouterCore,
+    RouterResumeError,
     RouterStartError,
     notify_router_wakeup,
     resolve_router_start_inputs,
     router_wakeup_socket_path,
 )
 from loop.completion import actor_completion_record_path
+from loop.evaluator_runtime import (
+    active_feedback_path as node_active_feedback_path,
+    ai_user_artifacts_dir,
+    ai_user_current_result_path,
+    checker_current_tasks_path,
+    feedback_history_path as node_feedback_history_path,
+    reviewer_current_feedback_path,
+    reviewer_current_report_path,
+    tester_current_result_path,
+)
 from loop.events import ActorKind, ActorRef, RequestSplit
-from loop.feedback import active_feedback_path, feedback_history_path
 from loop.node_table import component_key_for_actor
+from loop.split_contract import parse_split_bundle
 from loop.store import RouterStore
 from loop.runtime_noise import (
     is_runtime_noise_path,
@@ -120,6 +133,87 @@ def _resolve_existing_file_ref(raw: str | Path | None, *, label: str) -> Path:
     return candidate
 
 
+def _reject_complete(
+    *,
+    reason_code: str,
+    message: str,
+    fix_hint: str | None = None,
+) -> int:
+    payload: dict[str, object] = {
+        "accepted": False,
+        "exit_code": 2,
+        "message": f"complete rejected locally: {message}",
+        "reason_code": reason_code,
+        "status": "REJECTED",
+    }
+    if fix_hint:
+        payload["fix_hint"] = fix_hint
+    return _print_payload(payload)
+
+
+def _load_json_object(path: Path, *, label: str) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{label} must be valid UTF-8 JSON") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} must be valid JSON: {exc.msg}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} must decode to a JSON object")
+    return payload
+
+
+def _load_dispatched_manifest(record) -> dict[str, object]:
+    checker_tasks_ref = str(record.checker_tasks_ref or "").strip()
+    if not checker_tasks_ref:
+        raise ValueError("current checker task manifest is missing")
+    manifest_ref = Path(checker_tasks_ref).expanduser().resolve()
+    return _load_json_object(manifest_ref, label="checker_tasks_ref")
+
+
+def _validate_snapshot_markers(
+    *,
+    text: str,
+    expected_snapshot_id: str,
+    label: str,
+) -> list[str]:
+    if not expected_snapshot_id:
+        return []
+    reason_lines: list[str] = []
+    expected_marker = f"Current dispatched snapshot id: {expected_snapshot_id}"
+    if expected_marker not in text:
+        reason_lines.append(f"{label} must include `{expected_marker}`")
+    snapshot_pattern = re.compile(r"snapshot-[0-9a-f]+")
+    for index, line in enumerate(text.splitlines(), start=1):
+        line_snapshots = {match.group(0) for match in snapshot_pattern.finditer(line)}
+        for snapshot_id in sorted(line_snapshots):
+            if snapshot_id == expected_snapshot_id:
+                continue
+            lowered = line.lower()
+            if any(token in lowered for token in ("historical", "stale", "superseded")):
+                continue
+            reason_lines.append(
+                f"{label} line {index} references stale snapshot {snapshot_id} without labeling it historical/stale/superseded"
+            )
+    return reason_lines
+
+
+def _canonical_checker_tasks_ref(record) -> Path:
+    return checker_current_tasks_path(record.workspace_root, record.node_id)
+
+
+def _canonical_result_ref(record, actor: ActorRef) -> Path:
+    if actor.actor_kind is ActorKind.EVALUATOR_TESTER:
+        return tester_current_result_path(record.workspace_root, record.node_id)
+    if actor.actor_kind is ActorKind.EVALUATOR_AI_USER:
+        return ai_user_current_result_path(
+            record.workspace_root,
+            record.node_id,
+            task_id=str(actor.task_id or "").strip(),
+        )
+    raise ValueError(f"unsupported result actor kind {actor.actor_kind.value}")
+
+
 def _print_payload(payload: dict[str, object]) -> int:
     print(json.dumps(payload, indent=2, sort_keys=True))
     return int(payload.get("exit_code", 0) or 0)
@@ -141,8 +235,8 @@ def _component_status_payload(component) -> dict[str, object]:
 
 
 def _node_status_payload(record) -> dict[str, object]:
-    active_feedback = active_feedback_path(record.workspace_root)
-    feedback_history = feedback_history_path(record.workspace_root)
+    active_feedback = node_active_feedback_path(record.workspace_root, record.node_id)
+    feedback_history = node_feedback_history_path(record.workspace_root, record.node_id)
     components_payload = {
         component_key: _component_status_payload(component)
         for component_key, component in sorted(record.components.items(), key=lambda item: item[0])
@@ -200,6 +294,8 @@ def _handle_status(args: argparse.Namespace) -> int:
                 "kernel_session_id": str(store.read_kernel_session_id() or ""),
                 "kernel_rollout_path": str(store.read_kernel_rollout_path() or ""),
                 "kernel_started_at": str(store.read_kernel_started_at() or ""),
+                "router_paused_reason_json": str(store.read_router_paused_reason_json() or ""),
+                "router_paused_at": str(store.read_router_paused_at() or ""),
                 "router_terminal_reason_json": str(store.read_router_terminal_reason_json() or ""),
                 "router_terminal_at": str(store.read_router_terminal_at() or ""),
                 "router_completed_result_commit": str(store.read_router_completed_result_commit() or ""),
@@ -236,11 +332,12 @@ def _startup_result_path(router_db_path: Path) -> Path:
 def _spawn_router_runtime(
     *,
     router_db_path: Path,
-    kernel_session_id: str,
-    kernel_rollout_path: str,
-    kernel_started_at: str,
-    final_effects_file: str,
+    kernel_session_id: str | None = None,
+    kernel_rollout_path: str | None = None,
+    kernel_started_at: str | None = None,
+    final_effects_file: str | None = None,
     startup_result_path: Path,
+    resume_only: bool = False,
 ):
     runtime_cmd = [
         sys.executable,
@@ -248,17 +345,24 @@ def _spawn_router_runtime(
         "loop.runtime",
         "--router-db",
         str(router_db_path),
-        "--kernel-session-id",
-        str(kernel_session_id),
-        "--kernel-rollout-path",
-        str(kernel_rollout_path),
-        "--kernel-started-at",
-        str(kernel_started_at),
-        "--final-effects-file",
-        str(final_effects_file),
         "--startup-result-file",
         str(startup_result_path),
     ]
+    if resume_only:
+        runtime_cmd.append("--resume-only")
+    else:
+        runtime_cmd.extend(
+            [
+                "--kernel-session-id",
+                str(kernel_session_id),
+                "--kernel-rollout-path",
+                str(kernel_rollout_path),
+                "--kernel-started-at",
+                str(kernel_started_at),
+                "--final-effects-file",
+                str(final_effects_file),
+            ]
+        )
     log_dir = (router_db_path.parent / "router").resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = log_dir / "runtime.stdout.txt"
@@ -299,8 +403,8 @@ def _wait_for_startup_result(
         "status": "REJECTED",
         "reason_code": "ROOT_ACTOR_LAUNCH_FAILED",
         "message": (
-            "router start rejected: runtime did not produce a startup result in time. "
-            "Check router/runtime.stderr.txt and retry start."
+            "router runtime rejected: did not produce a startup result in time. "
+            "Check router/runtime.stderr.txt and retry."
         ),
     }
 
@@ -372,43 +476,7 @@ def _compute_split_diff_fingerprint(*, workspace_root: Path, durable_commit: str
 
 
 def _resolve_split_bundle(bundle_ref: str | Path) -> Path:
-    bundle_dir = Path(bundle_ref).expanduser().resolve()
-    if not bundle_dir.exists() or not bundle_dir.is_dir():
-        raise ValueError("split bundle must exist and be a directory")
-    proposal_path = (bundle_dir / "proposal.json").resolve()
-    if not proposal_path.exists() or not proposal_path.is_file():
-        raise ValueError("split bundle must contain proposal.json")
-    try:
-        proposal = json.loads(proposal_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError("split bundle proposal.json must be valid JSON") from exc
-    if int(proposal.get("version") or 0) != 1:
-        raise ValueError("split bundle proposal.json must use version=1")
-    children = proposal.get("children")
-    if not isinstance(children, list) or not children:
-        raise ValueError("split bundle proposal.json must contain a non-empty children list")
-    for index, child in enumerate(children, start=1):
-        if not isinstance(child, dict):
-            raise ValueError(f"split bundle child #{index} must be an object")
-        child_name = str(child.get("name") or "").strip()
-        rel_final_effects = str(child.get("final_effects_file") or "").strip()
-        if not child_name:
-            raise ValueError(f"split bundle child #{index} must define a non-empty name")
-        if not rel_final_effects:
-            raise ValueError(
-                f"split bundle child {child_name!r} must define final_effects_file"
-            )
-        candidate_path = (bundle_dir / rel_final_effects).resolve()
-        try:
-            candidate_path.relative_to(bundle_dir)
-        except ValueError as exc:
-            raise ValueError(
-                f"split bundle child {child_name!r} final_effects_file must stay inside the bundle directory"
-            ) from exc
-        if not candidate_path.exists() or not candidate_path.is_file():
-            raise ValueError(
-                f"split bundle child {child_name!r} final_effects_file does not exist"
-            )
+    bundle_dir, _proposal = parse_split_bundle(bundle_ref, error_type=ValueError)
     return bundle_dir
 
 
@@ -637,18 +705,11 @@ def _handle_complete(args: argparse.Namespace) -> int:
     try:
         record, component = _resolve_running_component(store, actor)
     except ValueError as exc:
-        return _print_payload(
-            {
-                "accepted": False,
-                "exit_code": 2,
-                "message": f"complete rejected locally: {exc}",
-                "reason_code": "INVALID_COMPONENT_STATE",
-                "status": "REJECTED",
-            }
-        )
+        return _reject_complete(reason_code="INVALID_COMPONENT_STATE", message=str(exc))
     completion_path = actor_completion_record_path(
         record.workspace_root,
         actor.actor_kind,
+        node_id=actor.node_id,
         task_id=actor.task_id,
     )
     payload: dict[str, object] = {
@@ -664,82 +725,151 @@ def _handle_complete(args: argparse.Namespace) -> int:
         try:
             tasks_ref = _resolve_existing_file_ref(args.tasks_ref, label="tasks_ref")
         except ValueError as exc:
-            return _print_payload(
-                {
-                    "accepted": False,
-                    "exit_code": 2,
-                    "message": f"complete rejected locally: {exc}",
-                    "reason_code": "INVALID_CHECKER_TASKS_REF",
-                    "status": "REJECTED",
-                }
+            return _reject_complete(
+                reason_code="INVALID_CHECKER_TASKS_REF",
+                message=str(exc),
+            )
+        expected_tasks_ref = _canonical_checker_tasks_ref(record)
+        if tasks_ref != expected_tasks_ref:
+            return _reject_complete(
+                reason_code="NONCANONICAL_CHECKER_TASKS_REF",
+                message=f"checker tasks_ref must be {expected_tasks_ref}",
+                fix_hint="Write the checker manifest to the canonical current path injected by router, then resubmit.",
+            )
+        try:
+            manifest = _load_json_object(tasks_ref, label="tasks_ref")
+        except ValueError as exc:
+            return _reject_complete(
+                reason_code="INVALID_CHECKER_TASKS_REF",
+                message=str(exc),
+            )
+        try:
+            version_value = int(manifest.get("version") or 0)
+        except (TypeError, ValueError):
+            version_value = -1
+        if version_value != 2:
+            return _reject_complete(
+                reason_code="INVALID_CHECKER_MANIFEST_VERSION",
+                message="checker manifest must use version=2",
+                fix_hint="Rewrite checker/tasks.json as the new single-source manifest with inline task entries.",
             )
         payload["tasks_ref"] = str(tasks_ref)
     elif actor.actor_kind is ActorKind.EVALUATOR_TESTER:
         try:
             result_ref = _resolve_existing_file_ref(args.result_ref, label="result_ref")
         except ValueError as exc:
-            return _print_payload(
-                {
-                    "accepted": False,
-                    "exit_code": 2,
-                    "message": f"complete rejected locally: {exc}",
-                    "reason_code": "INVALID_TASK_RESULT_REF",
-                    "status": "REJECTED",
-                }
+            return _reject_complete(reason_code="INVALID_TASK_RESULT_REF", message=str(exc))
+        expected_result_ref = _canonical_result_ref(record, actor)
+        if result_ref != expected_result_ref:
+            return _reject_complete(
+                reason_code="NONCANONICAL_TESTER_RESULT_REF",
+                message=f"tester result_ref must be {expected_result_ref}",
+                fix_hint="Write the tester report to the canonical current result path injected by router, then resubmit.",
+            )
+        try:
+            manifest = _load_dispatched_manifest(record)
+        except ValueError as exc:
+            return _reject_complete(reason_code="MISSING_CHECKER_MANIFEST", message=str(exc))
+        text = result_ref.read_text(encoding="utf-8", errors="replace")
+        if "Overall verdict:" not in text:
+            return _reject_complete(
+                reason_code="INVALID_TESTER_RESULT_FORMAT",
+                message="tester result must include `Overall verdict:`",
+                fix_hint="Rewrite the tester result using the prompt-required sections and include the overall verdict line.",
+            )
+        snapshot_errors = _validate_snapshot_markers(
+            text=text,
+            expected_snapshot_id=str(manifest.get("snapshot_id") or "").strip(),
+            label="tester result",
+        )
+        if snapshot_errors:
+            return _reject_complete(
+                reason_code="STALE_SNAPSHOT_ID",
+                message=snapshot_errors[0],
+                fix_hint="Rewrite the current-pass tester result to use the injected current snapshot id, and label any older snapshot ids as historical/stale/superseded.",
             )
         payload["result_ref"] = str(result_ref)
     elif actor.actor_kind is ActorKind.EVALUATOR_AI_USER:
         task_id = str(os.environ.get(_ENV_TASK_ID) or "").strip()
         if not task_id:
-            return _print_payload(
-                {
-                    "accepted": False,
-                    "exit_code": 2,
-                    "message": "complete rejected locally: missing LOOP_TASK_ID for evaluator task actor",
-                    "reason_code": "INVALID_TASK_ID",
-                    "status": "REJECTED",
-                }
+            return _reject_complete(
+                reason_code="INVALID_TASK_ID",
+                message="missing LOOP_TASK_ID for evaluator task actor",
             )
         try:
             result_ref = _resolve_existing_file_ref(args.result_ref, label="result_ref")
         except ValueError as exc:
-            return _print_payload(
-                {
-                    "accepted": False,
-                    "exit_code": 2,
-                    "message": f"complete rejected locally: {exc}",
-                    "reason_code": "INVALID_TASK_RESULT_REF",
-                    "status": "REJECTED",
-                }
+            return _reject_complete(reason_code="INVALID_TASK_RESULT_REF", message=str(exc))
+        expected_result_ref = _canonical_result_ref(record, actor)
+        if result_ref != expected_result_ref:
+            return _reject_complete(
+                reason_code="NONCANONICAL_TASK_RESULT_REF",
+                message=f"AI-user result_ref must be {expected_result_ref}",
+                fix_hint="Write the lane result to the canonical current result path injected by router, and keep screenshots or extra evidence under the injected artifacts directory.",
+            )
+        try:
+            manifest = _load_dispatched_manifest(record)
+        except ValueError as exc:
+            return _reject_complete(reason_code="MISSING_CHECKER_MANIFEST", message=str(exc))
+        text = result_ref.read_text(encoding="utf-8", errors="replace")
+        if f"Task id: {task_id}" not in text:
+            return _reject_complete(
+                reason_code="INVALID_TASK_RESULT_FORMAT",
+                message=f"AI-user result must include `Task id: {task_id}`",
+                fix_hint="Rewrite the lane result using the prompt-required header lines, including the exact task id line.",
+            )
+        if "Task verdict:" not in text:
+            return _reject_complete(
+                reason_code="INVALID_TASK_RESULT_FORMAT",
+                message="AI-user result must include `Task verdict:`",
+                fix_hint="Rewrite the lane result using the prompt-required sections and include the task verdict line.",
+            )
+        snapshot_errors = _validate_snapshot_markers(
+            text=text,
+            expected_snapshot_id=str(manifest.get("snapshot_id") or "").strip(),
+            label="AI-user result",
+        )
+        if snapshot_errors:
+            return _reject_complete(
+                reason_code="STALE_SNAPSHOT_ID",
+                message=snapshot_errors[0],
+                fix_hint="Rewrite the current-pass lane result to use the injected current snapshot id, and label any older snapshot ids as historical/stale/superseded.",
             )
         payload["task_id"] = task_id
         payload["result_ref"] = str(result_ref)
     elif actor.actor_kind is ActorKind.EVALUATOR_REVIEWER:
         verdict_kind = str(args.verdict_kind or "").strip().upper()
         if verdict_kind not in {"OK", "IMPLEMENTER_ACTION_REQUIRED", "EVALUATOR_FAULT"}:
-            return _print_payload(
-                {
-                    "accepted": False,
-                    "exit_code": 2,
-                    "message": (
-                        "complete rejected locally: verdict_kind must be one of "
-                        "OK, IMPLEMENTER_ACTION_REQUIRED, or EVALUATOR_FAULT"
-                    ),
-                    "reason_code": "INVALID_REVIEWER_VERDICT",
-                    "status": "REJECTED",
-                }
+            return _reject_complete(
+                reason_code="INVALID_REVIEWER_VERDICT",
+                message="verdict_kind must be one of OK, IMPLEMENTER_ACTION_REQUIRED, or EVALUATOR_FAULT",
             )
         try:
             report_ref = _resolve_existing_file_ref(args.report_ref, label="report_ref")
         except ValueError as exc:
-            return _print_payload(
-                {
-                    "accepted": False,
-                    "exit_code": 2,
-                    "message": f"complete rejected locally: {exc}",
-                    "reason_code": "INVALID_REVIEWER_REPORT_REF",
-                    "status": "REJECTED",
-                }
+            return _reject_complete(reason_code="INVALID_REVIEWER_REPORT_REF", message=str(exc))
+        expected_report_ref = reviewer_current_report_path(record.workspace_root, record.node_id)
+        if report_ref != expected_report_ref:
+            return _reject_complete(
+                reason_code="NONCANONICAL_REVIEWER_REPORT_REF",
+                message=f"reviewer report_ref must be {expected_report_ref}",
+                fix_hint="Write the reviewer report to the canonical current report path injected by router, then resubmit.",
+            )
+        try:
+            manifest = _load_dispatched_manifest(record)
+        except ValueError as exc:
+            return _reject_complete(reason_code="MISSING_CHECKER_MANIFEST", message=str(exc))
+        report_text = report_ref.read_text(encoding="utf-8", errors="replace")
+        snapshot_errors = _validate_snapshot_markers(
+            text=report_text,
+            expected_snapshot_id=str(manifest.get("snapshot_id") or "").strip(),
+            label="reviewer report",
+        )
+        if snapshot_errors:
+            return _reject_complete(
+                reason_code="STALE_SNAPSHOT_ID",
+                message=snapshot_errors[0],
+                fix_hint="Rewrite the current-pass reviewer report to use the injected current snapshot id, and label any older snapshot ids as historical/stale/superseded.",
             )
         payload["verdict_kind"] = verdict_kind
         payload["report_ref"] = str(report_ref)
@@ -747,14 +877,36 @@ def _handle_complete(args: argparse.Namespace) -> int:
             try:
                 feedback_ref = _resolve_existing_file_ref(args.feedback_ref, label="feedback_ref")
             except ValueError as exc:
-                return _print_payload(
-                    {
-                        "accepted": False,
-                        "exit_code": 2,
-                        "message": f"complete rejected locally: {exc}",
-                        "reason_code": "INVALID_REVIEWER_FEEDBACK_REF",
-                        "status": "REJECTED",
-                    }
+                return _reject_complete(reason_code="INVALID_REVIEWER_FEEDBACK_REF", message=str(exc))
+            expected_feedback_ref = reviewer_current_feedback_path(record.workspace_root, record.node_id)
+            if feedback_ref != expected_feedback_ref:
+                return _reject_complete(
+                    reason_code="NONCANONICAL_REVIEWER_FEEDBACK_REF",
+                    message=f"reviewer feedback_ref must be {expected_feedback_ref}",
+                    fix_hint="Write feedback.json to the canonical current feedback path injected by router, then resubmit.",
+                )
+            try:
+                feedback_payload = _load_json_object(feedback_ref, label="feedback_ref")
+            except ValueError as exc:
+                return _reject_complete(
+                    reason_code="INVALID_REVIEWER_FEEDBACK_REF",
+                    message=str(exc),
+                )
+            try:
+                feedback_version = int(feedback_payload.get("version") or 0)
+            except (TypeError, ValueError):
+                feedback_version = -1
+            if feedback_version != 2:
+                return _reject_complete(
+                    reason_code="INVALID_REVIEWER_FEEDBACK_SCHEMA",
+                    message="feedback.json must use version=2",
+                    fix_hint="Rewrite feedback.json using the prompt-provided version=2 schema.",
+                )
+            if str(feedback_payload.get("snapshot_id") or "").strip() != str(manifest.get("snapshot_id") or "").strip():
+                return _reject_complete(
+                    reason_code="STALE_SNAPSHOT_ID",
+                    message="feedback.json snapshot_id must match the current dispatched snapshot id",
+                    fix_hint="Rewrite feedback.json with the exact current snapshot id injected by router.",
                 )
             payload["feedback_ref"] = str(feedback_ref)
     elif actor.actor_kind is ActorKind.KERNEL:
@@ -859,9 +1011,55 @@ def _handle_start(args: argparse.Namespace) -> int:
     return _print_payload(payload)
 
 
+def _handle_resume(args: argparse.Namespace) -> int:
+    router_db_path = _resolve_router_db_path(args.router_db)
+    startup_result_path = _startup_result_path(router_db_path)
+    startup_result_path.unlink(missing_ok=True)
+    append_final_effects_ref: Path | None = None
+    if args.append_final_effects_ref:
+        try:
+            append_final_effects_ref = _resolve_existing_file_ref(
+                args.append_final_effects_ref,
+                label="append_final_effects_ref",
+            )
+        except ValueError as exc:
+            return _print_payload(
+                {
+                    "accepted": False,
+                    "exit_code": 2,
+                    "message": f"resume rejected locally: {exc}",
+                    "reason_code": "INVALID_APPEND_FINAL_EFFECTS",
+                    "status": "REJECTED",
+                }
+            )
+    store = RouterStore(router_db_path)
+    core = RouterCore(
+        store=store,
+        wakeup_socket_path=router_wakeup_socket_path(store.db_path),
+    )
+    try:
+        core.prepare_resume(append_final_effects_ref=append_final_effects_ref)
+    except RouterResumeError as exc:
+        payload = exc.to_payload()
+        payload["exit_code"] = 2
+        return _print_payload(payload)
+
+    runtime_process = _spawn_router_runtime(
+        router_db_path=router_db_path,
+        startup_result_path=startup_result_path,
+        resume_only=True,
+    )
+    payload = _wait_for_startup_result(
+        startup_result_path=startup_result_path,
+        runtime_process=runtime_process,
+    )
+    payload["exit_code"] = 0 if payload.get("accepted") else 2
+    return _print_payload(payload)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Router control API entrypoint for child/kernel agents."
+        description="Agent-facing completion and split API entrypoint for child/kernel actors."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -885,24 +1083,6 @@ def build_parser() -> argparse.ArgumentParser:
     complete.add_argument("--feedback-ref")
     complete.add_argument("--reason-ref")
     complete.set_defaults(handler=_handle_complete)
-
-    status = subparsers.add_parser(
-        "status",
-        help="Print the durable router status snapshot as stable JSON.",
-    )
-    status.add_argument("--router-db")
-    status.set_defaults(handler=_handle_status)
-
-    start = subparsers.add_parser(
-        "start",
-        help="Start one long-lived router runtime from kernel bootstrap inputs.",
-    )
-    start.add_argument("--router-db")
-    start.add_argument("--kernel-session-id")
-    start.add_argument("--kernel-rollout-path")
-    start.add_argument("--kernel-started-at")
-    start.add_argument("--final-effects-file")
-    start.set_defaults(handler=_handle_start)
     return parser
 
 
