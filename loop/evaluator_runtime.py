@@ -206,3 +206,25 @@ def reviewer_feedback_submission_snapshot_path(
         / "submissions"
         / f"reviewer-attempt-{int(attempt_count):03d}.json"
     ).resolve()
+
+
+def kernel_dir(workspace_root: str | Path, node_id: str | None) -> Path:
+    return (node_runtime_dir(workspace_root, node_id) / "kernel").resolve()
+
+
+def kernel_current_report_path(workspace_root: str | Path, node_id: str | None) -> Path:
+    return (kernel_dir(workspace_root, node_id) / "current" / "report.md").resolve()
+
+
+def kernel_accepted_report_path(
+    workspace_root: str | Path,
+    node_id: str | None,
+    *,
+    attempt_count: int,
+) -> Path:
+    return (
+        kernel_dir(workspace_root, node_id)
+        / "accepted"
+        / f"attempt-{int(attempt_count):03d}"
+        / "report.md"
+    ).resolve()

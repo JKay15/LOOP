@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 import tempfile
 import time
@@ -99,6 +100,7 @@ def _write_checker_tasks(workspace_root: Path, task_ids: list[str]) -> Path:
                 "snapshot_id": "",
                 "workspace_root": str(workspace_root.resolve()),
                 "authoritative_final_effects_path": str((workspace_root / "FINAL_EFFECTS.md").resolve()),
+                "final_effects_sha256": hashlib.sha256((workspace_root / "FINAL_EFFECTS.md").read_bytes()).hexdigest(),
                 "obligations": [
                     {
                         "id": "req-1",
@@ -213,6 +215,7 @@ def main() -> int:
         from loop.evaluator_runtime import (
             ai_user_current_result_path,
             checker_current_tasks_path,
+            reviewer_current_feedback_path,
             reviewer_current_report_path,
             tester_current_result_path,
         )
@@ -340,6 +343,7 @@ def main() -> int:
                         "snapshot_id": "",
                         "workspace_root": str(workspace_root.resolve()),
                         "authoritative_final_effects_path": str(final_effects),
+                        "final_effects_sha256": hashlib.sha256(final_effects.read_bytes()).hexdigest(),
                         "obligations": [
                             {
                                 "id": "req-1",
@@ -590,8 +594,21 @@ def main() -> int:
                     [
                         "# Reviewer Report",
                         f"Current dispatched snapshot id: {current_snapshot_id}",
-                        "Implementer action required.",
+                        "Reroute required.",
                     ]
+                )
+                + "\n",
+            )
+            reviewer_feedback = _write_file(
+                reviewer_current_feedback_path(workspace_root, "1"),
+                json.dumps(
+                    {
+                        "version": 3,
+                        "snapshot_id": current_snapshot_id,
+                        "reroute_mask": 2,
+                    },
+                    indent=2,
+                    sort_keys=True,
                 )
                 + "\n",
             )
@@ -605,8 +622,14 @@ def main() -> int:
                     "pid": reviewer_component.pid,
                     "process_birth_time": reviewer_component.process_birth_time,
                     "completed_at": now.isoformat(),
-                    "verdict_kind": "IMPLEMENTER_ACTION_REQUIRED",
+                    "verdict_kind": "REROUTE_REQUIRED",
                     "report_ref": str(reviewer_report),
+                    "feedback_ref": str(reviewer_feedback),
+                    "feedback_submission": {
+                        "version": 3,
+                        "snapshot_id": current_snapshot_id,
+                        "reroute_mask": 2,
+                    },
                 },
             )
             store.append_event(
@@ -659,6 +682,98 @@ def main() -> int:
                 )
         finally:
             core.stop()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        db_path = tmp / "router.sqlite3"
+        store = RouterStore(db_path)
+        workspace_root = (tmp / "workspace" / "node-1b").resolve()
+        final_effects = _write_file(
+            workspace_root / "FINAL_EFFECTS.md",
+            "Tasks must wait for implementer and checker.\n",
+        )
+        checker_tasks_ref = _write_checker_tasks(workspace_root, ["task-1", "task-2"])
+        _upsert_running_node(
+            store=store,
+            node_id="1b",
+            parent_node_id="0",
+            attempt_count=1,
+            durable_commit="abc1b",
+            workspace_root=workspace_root,
+            final_effects_file=final_effects,
+            actor_kind=ActorKind.IMPLEMENTER,
+            pid=11121,
+            process_birth_time=1711966600.0,
+            session_ids=["session-1b-implementer"],
+            workspace_fingerprint_before="fp-before-1b",
+        )
+        base_record = store.load_node("1b")
+        if base_record is None:
+            return _fail("parallel barrier node must be loadable")
+        store.upsert_node(
+            replace(
+                base_record,
+                evaluator_phase="checker",
+                current_components=[
+                    ActorRef(node_id="1b", actor_kind=ActorKind.IMPLEMENTER, attempt_count=1),
+                    ActorRef(node_id="1b", actor_kind=ActorKind.EVALUATOR_CHECKER, attempt_count=1),
+                ],
+                components={
+                    **base_record.components,
+                    component_key(actor_kind=ActorKind.EVALUATOR_CHECKER): ComponentRuntimeState(
+                        status=ComponentStatus.RUNNING,
+                        attempt_count=1,
+                        pid=11122,
+                        process_birth_time=1711966601.0,
+                        session_ids=["session-1b-checker"],
+                        workspace_fingerprint_before="fp-before-checker-1b",
+                        saw_output_in_attempt=False,
+                        consecutive_no_progress=0,
+                        consecutive_failed_exits=0,
+                    ),
+                },
+            )
+        )
+        barrier_specs: list[object] = []
+        barrier_core = RouterCore(
+            store=store,
+            wakeup_socket_path=tmp / "parallel-barrier.sock",
+            proc_supervisor=_FakeProcSupervisor(),
+            actor_launcher=lambda spec: (
+                barrier_specs.append(spec)
+                or ActorLaunchResult(
+                    process=_LiveProcess(pid=30100 + len(barrier_specs)),
+                    process_birth_time=1713010000.0 + len(barrier_specs),
+                    session_id=f"parallel-barrier-{len(barrier_specs)}",
+                    rollout_path=(tmp / "runtime" / f"parallel-barrier-{len(barrier_specs)}.jsonl").resolve(),
+                )
+            ),
+        )
+        after_checker = barrier_core._advance_after_valid_actor_completion(
+            record=store.load_node("1b"),
+            actor_kind=ActorKind.EVALUATOR_CHECKER,
+            task_id=None,
+            completion_payload={"tasks_ref": str(checker_tasks_ref)},
+        )
+        if barrier_specs:
+            return _fail("checker completion must not start tasks before implementer completes")
+        if after_checker.current_components != [ActorRef(node_id="1b", actor_kind=ActorKind.IMPLEMENTER, attempt_count=1)]:
+            return _fail("checker completion must leave the running implementer in place while waiting on the barrier")
+        if str(after_checker.evaluator_phase or "").strip() != "checker":
+            return _fail("checker completion must remain in checker phase until implementer completes")
+        barrier_core._advance_after_valid_actor_completion(
+            record=store.load_node("1b"),
+            actor_kind=ActorKind.IMPLEMENTER,
+            task_id=None,
+            completion_payload={},
+        )
+        launched_kinds = [spec.actor_kind for spec in barrier_specs]
+        if launched_kinds != [
+            ActorKind.EVALUATOR_TESTER,
+            ActorKind.EVALUATOR_AI_USER,
+            ActorKind.EVALUATOR_AI_USER,
+        ]:
+            return _fail("tasks must launch only after both checker and implementer are complete")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)

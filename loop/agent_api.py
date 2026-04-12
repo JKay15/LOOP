@@ -30,6 +30,7 @@ from loop.evaluator_runtime import (
     ai_user_current_result_path,
     checker_current_tasks_path,
     feedback_history_path as node_feedback_history_path,
+    kernel_current_report_path,
     reviewer_current_feedback_path,
     reviewer_current_report_path,
     tester_current_result_path,
@@ -336,6 +337,7 @@ def _spawn_router_runtime(
     kernel_rollout_path: str | None = None,
     kernel_started_at: str | None = None,
     final_effects_file: str | None = None,
+    prompt_overlay_ref: str | None = None,
     startup_result_path: Path,
     resume_only: bool = False,
 ):
@@ -363,6 +365,8 @@ def _spawn_router_runtime(
                 str(final_effects_file),
             ]
         )
+        if str(prompt_overlay_ref or "").strip():
+            runtime_cmd.extend(["--prompt-overlay-ref", str(prompt_overlay_ref)])
     log_dir = (router_db_path.parent / "router").resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = log_dir / "runtime.stdout.txt"
@@ -839,10 +843,10 @@ def _handle_complete(args: argparse.Namespace) -> int:
         payload["result_ref"] = str(result_ref)
     elif actor.actor_kind is ActorKind.EVALUATOR_REVIEWER:
         verdict_kind = str(args.verdict_kind or "").strip().upper()
-        if verdict_kind not in {"OK", "IMPLEMENTER_ACTION_REQUIRED", "EVALUATOR_FAULT"}:
+        if verdict_kind not in {"OK", "REROUTE_REQUIRED"}:
             return _reject_complete(
                 reason_code="INVALID_REVIEWER_VERDICT",
-                message="verdict_kind must be one of OK, IMPLEMENTER_ACTION_REQUIRED, or EVALUATOR_FAULT",
+                message="verdict_kind must be one of OK or REROUTE_REQUIRED",
             )
         try:
             report_ref = _resolve_existing_file_ref(args.report_ref, label="report_ref")
@@ -873,46 +877,73 @@ def _handle_complete(args: argparse.Namespace) -> int:
             )
         payload["verdict_kind"] = verdict_kind
         payload["report_ref"] = str(report_ref)
-        if args.feedback_ref not in {None, ""}:
-            try:
-                feedback_ref = _resolve_existing_file_ref(args.feedback_ref, label="feedback_ref")
-            except ValueError as exc:
-                return _reject_complete(reason_code="INVALID_REVIEWER_FEEDBACK_REF", message=str(exc))
-            expected_feedback_ref = reviewer_current_feedback_path(record.workspace_root, record.node_id)
-            if feedback_ref != expected_feedback_ref:
-                return _reject_complete(
-                    reason_code="NONCANONICAL_REVIEWER_FEEDBACK_REF",
-                    message=f"reviewer feedback_ref must be {expected_feedback_ref}",
-                    fix_hint="Write feedback.json to the canonical current feedback path injected by router, then resubmit.",
-                )
-            try:
-                feedback_payload = _load_json_object(feedback_ref, label="feedback_ref")
-            except ValueError as exc:
-                return _reject_complete(
-                    reason_code="INVALID_REVIEWER_FEEDBACK_REF",
-                    message=str(exc),
-                )
-            try:
-                feedback_version = int(feedback_payload.get("version") or 0)
-            except (TypeError, ValueError):
-                feedback_version = -1
-            if feedback_version != 2:
-                return _reject_complete(
-                    reason_code="INVALID_REVIEWER_FEEDBACK_SCHEMA",
-                    message="feedback.json must use version=2",
-                    fix_hint="Rewrite feedback.json using the prompt-provided version=2 schema.",
-                )
-            if str(feedback_payload.get("snapshot_id") or "").strip() != str(manifest.get("snapshot_id") or "").strip():
-                return _reject_complete(
-                    reason_code="STALE_SNAPSHOT_ID",
-                    message="feedback.json snapshot_id must match the current dispatched snapshot id",
-                    fix_hint="Rewrite feedback.json with the exact current snapshot id injected by router.",
-                )
-            payload["feedback_ref"] = str(feedback_ref)
+        if args.feedback_ref in {None, ""}:
+            return _reject_complete(
+                reason_code="INVALID_REVIEWER_FEEDBACK_REF",
+                message="reviewer completion requires feedback_ref",
+                fix_hint="Write feedback.json to the canonical current feedback path injected by router, then resubmit.",
+            )
+        try:
+            feedback_ref = _resolve_existing_file_ref(args.feedback_ref, label="feedback_ref")
+        except ValueError as exc:
+            return _reject_complete(reason_code="INVALID_REVIEWER_FEEDBACK_REF", message=str(exc))
+        expected_feedback_ref = reviewer_current_feedback_path(record.workspace_root, record.node_id)
+        if feedback_ref != expected_feedback_ref:
+            return _reject_complete(
+                reason_code="NONCANONICAL_REVIEWER_FEEDBACK_REF",
+                message=f"reviewer feedback_ref must be {expected_feedback_ref}",
+                fix_hint="Write feedback.json to the canonical current feedback path injected by router, then resubmit.",
+            )
+        try:
+            feedback_payload = _load_json_object(feedback_ref, label="feedback_ref")
+        except ValueError as exc:
+            return _reject_complete(
+                reason_code="INVALID_REVIEWER_FEEDBACK_REF",
+                message=str(exc),
+            )
+        try:
+            feedback_version = int(feedback_payload.get("version") or 0)
+        except (TypeError, ValueError):
+            feedback_version = -1
+        if feedback_version != 3:
+            return _reject_complete(
+                reason_code="INVALID_REVIEWER_FEEDBACK_SCHEMA",
+                message="feedback.json must use version=3",
+                fix_hint="Rewrite feedback.json using the prompt-provided version=3 schema.",
+            )
+        if str(feedback_payload.get("snapshot_id") or "").strip() != str(manifest.get("snapshot_id") or "").strip():
+            return _reject_complete(
+                reason_code="STALE_SNAPSHOT_ID",
+                message="feedback.json snapshot_id must match the current dispatched snapshot id",
+                fix_hint="Rewrite feedback.json with the exact current snapshot id injected by router.",
+            )
+        try:
+            reroute_mask = int(feedback_payload.get("reroute_mask"))
+        except (TypeError, ValueError):
+            reroute_mask = -1
+        if reroute_mask not in {0, 1, 2, 3}:
+            return _reject_complete(
+                reason_code="INVALID_REVIEWER_FEEDBACK_SCHEMA",
+                message="feedback.json reroute_mask must be one of 0, 1, 2, or 3",
+                fix_hint="Rewrite feedback.json with a valid reroute_mask.",
+            )
+        if verdict_kind == "OK" and reroute_mask != 0:
+            return _reject_complete(
+                reason_code="INVALID_REVIEWER_FEEDBACK_SCHEMA",
+                message="OK verdict requires feedback.json reroute_mask=0",
+                fix_hint="Rewrite feedback.json with reroute_mask=0 or change verdict_kind to REROUTE_REQUIRED.",
+            )
+        if verdict_kind == "REROUTE_REQUIRED" and reroute_mask not in {1, 2, 3}:
+            return _reject_complete(
+                reason_code="INVALID_REVIEWER_FEEDBACK_SCHEMA",
+                message="REROUTE_REQUIRED verdict requires feedback.json reroute_mask 1, 2, or 3",
+                fix_hint="Rewrite feedback.json with reroute_mask 1, 2, or 3 or change verdict_kind to OK.",
+            )
+        payload["feedback_ref"] = str(feedback_ref)
     elif actor.actor_kind is ActorKind.KERNEL:
         request_seq = str(os.environ.get(_ENV_REQUEST_SEQ) or "").strip()
         verdict_kind = str(args.verdict_kind or "").strip().upper()
-        if request_seq or verdict_kind or args.reason_ref or args.report_ref:
+        if request_seq:
             if verdict_kind not in {"APPROVE", "REJECT"}:
                 return _print_payload(
                     {
@@ -923,16 +954,6 @@ def _handle_complete(args: argparse.Namespace) -> int:
                             "APPROVE or REJECT"
                         ),
                         "reason_code": "INVALID_KERNEL_VERDICT",
-                        "status": "REJECTED",
-                    }
-                )
-            if not request_seq:
-                return _print_payload(
-                    {
-                        "accepted": False,
-                        "exit_code": 2,
-                        "message": "complete rejected locally: missing LOOP_REQUEST_SEQ for kernel actor",
-                        "reason_code": "INVALID_REQUEST_SEQ",
                         "status": "REJECTED",
                     }
                 )
@@ -966,6 +987,51 @@ def _handle_complete(args: argparse.Namespace) -> int:
                         }
                     )
                 payload["reason_ref"] = str(reason_ref)
+        else:
+            if verdict_kind:
+                return _print_payload(
+                    {
+                        "accepted": False,
+                        "exit_code": 2,
+                        "message": "complete rejected locally: ordinary kernel closeout must not define verdict_kind",
+                        "reason_code": "INVALID_KERNEL_VERDICT",
+                        "status": "REJECTED",
+                    }
+                )
+            if args.reason_ref:
+                return _print_payload(
+                    {
+                        "accepted": False,
+                        "exit_code": 2,
+                        "message": "complete rejected locally: ordinary kernel closeout must not define reason_ref",
+                        "reason_code": "INVALID_KERNEL_REASON_REF",
+                        "status": "REJECTED",
+                    }
+                )
+            try:
+                report_ref = _resolve_existing_file_ref(args.report_ref, label="report_ref")
+            except ValueError as exc:
+                return _print_payload(
+                    {
+                        "accepted": False,
+                        "exit_code": 2,
+                        "message": f"complete rejected locally: {exc}",
+                        "reason_code": "INVALID_KERNEL_REPORT_REF",
+                        "status": "REJECTED",
+                    }
+                )
+            expected_report_ref = kernel_current_report_path(record.workspace_root, record.node_id)
+            if report_ref != expected_report_ref:
+                return _print_payload(
+                    {
+                        "accepted": False,
+                        "exit_code": 2,
+                        "message": f"complete rejected locally: ordinary kernel report_ref must be {expected_report_ref}",
+                        "reason_code": "NONCANONICAL_KERNEL_REPORT_REF",
+                        "status": "REJECTED",
+                    }
+                )
+            payload["report_ref"] = str(report_ref)
     _write_completion_record(completion_path, payload)
     return _print_payload(
         {
@@ -1001,6 +1067,7 @@ def _handle_start(args: argparse.Namespace) -> int:
         kernel_rollout_path=str(inputs.kernel_rollout_path),
         kernel_started_at=inputs.kernel_started_at,
         final_effects_file=str(inputs.final_effects_file),
+        prompt_overlay_ref=str(getattr(args, "prompt_overlay_ref", "") or "").strip() or None,
         startup_result_path=startup_result_path,
     )
     payload = _wait_for_startup_result(
@@ -1038,7 +1105,10 @@ def _handle_resume(args: argparse.Namespace) -> int:
         wakeup_socket_path=router_wakeup_socket_path(store.db_path),
     )
     try:
-        core.prepare_resume(append_final_effects_ref=append_final_effects_ref)
+        core.prepare_resume(
+            append_final_effects_ref=append_final_effects_ref,
+            prompt_overlay_ref=str(getattr(args, "prompt_overlay_ref", "") or "").strip() or None,
+        )
     except RouterResumeError as exc:
         payload = exc.to_payload()
         payload["exit_code"] = 2

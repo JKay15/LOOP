@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -386,6 +386,49 @@ class RouterStore:
         with self._connect() as conn:
             for record in records:
                 self._upsert_node_conn(conn, record)
+
+    def materialize_pause_barrier(self) -> list[ActorRef]:
+        cleared: list[ActorRef] = []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT node_id, components_json, current_components_json
+                FROM node_table
+                """
+            ).fetchall()
+            for row in rows:
+                node_id = str(row["node_id"])
+                current_components = _deserialize_current_components(
+                    str(row["current_components_json"]),
+                    node_id=node_id,
+                )
+                if not current_components:
+                    continue
+                components = _deserialize_components(str(row["components_json"]))
+                updated_components = dict(components)
+                for actor in current_components:
+                    cleared.append(actor)
+                    component_state_key = component_key_for_actor(actor)
+                    component = updated_components.get(component_state_key)
+                    if component is None or component.status is not ComponentStatus.RUNNING:
+                        continue
+                    updated_components[component_state_key] = replace(
+                        component,
+                        status=ComponentStatus.INACTIVE,
+                    )
+                conn.execute(
+                    """
+                    UPDATE node_table
+                    SET components_json = ?,
+                        current_components_json = '[]'
+                    WHERE node_id = ?
+                    """,
+                    (
+                        _canonical_json(_serialize_components(updated_components)),
+                        node_id,
+                    ),
+                )
+        return cleared
 
     def load_node(self, node_id: str) -> NodeRuntimeRecord | None:
         with self._connect() as conn:

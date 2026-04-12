@@ -138,6 +138,7 @@ def run_router_runtime(argv: list[str] | None = None) -> int:
     parser.add_argument("--kernel-rollout-path")
     parser.add_argument("--kernel-started-at")
     parser.add_argument("--final-effects-file")
+    parser.add_argument("--prompt-overlay-ref")
     parser.add_argument("--startup-result-file", required=True)
     parser.add_argument("--resume-only", action="store_true")
     args = parser.parse_args(argv)
@@ -162,6 +163,7 @@ def run_router_runtime(argv: list[str] | None = None) -> int:
                 kernel_rollout_path=args.kernel_rollout_path,
                 kernel_started_at=args.kernel_started_at,
                 final_effects_file=args.final_effects_file,
+                prompt_overlay_ref=args.prompt_overlay_ref,
             )
     except RouterStartError as exc:
         _write_startup_result(Path(args.startup_result_file), exc.to_payload())

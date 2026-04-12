@@ -58,12 +58,45 @@ def main() -> int:
     expected_commands = {"pause", "resume", "start", "status"}
     if commands != expected_commands:
         return _fail(f"router_api parser must expose exactly {sorted(expected_commands)!r}, got {sorted(commands)!r}")
+    start_args = parser.parse_args(
+        [
+            "start",
+            "--router-db",
+            "/tmp/router.sqlite3",
+            "--kernel-session-id",
+            "kernel-session-001",
+            "--kernel-rollout-path",
+            "/tmp/rollout.jsonl",
+            "--kernel-started-at",
+            "2026-04-03T00:30:00Z",
+            "--final-effects-file",
+            "/tmp/FINAL_EFFECTS.md",
+            "--prompt-overlay-ref",
+            "/tmp/prompt-overlay",
+        ]
+    )
+    if str(getattr(start_args, "prompt_overlay_ref", "") or "") != "/tmp/prompt-overlay":
+        return _fail("router_api start parser must accept --prompt-overlay-ref")
+    resume_args = parser.parse_args(
+        [
+            "resume",
+            "--router-db",
+            "/tmp/router.sqlite3",
+            "--prompt-overlay-ref",
+            "/tmp/prompt-overlay",
+        ]
+    )
+    if str(getattr(resume_args, "prompt_overlay_ref", "") or "") != "/tmp/prompt-overlay":
+        return _fail("router_api resume parser must accept --prompt-overlay-ref")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         db_path = tmp / "router.sqlite3"
         final_effects_file = tmp / "FINAL_EFFECTS.md"
         kernel_rollout_file = tmp / "kernel-rollout.jsonl"
+        prompt_overlay = tmp / "prompt-overlay"
+        prompt_overlay.mkdir(parents=True, exist_ok=True)
+        (prompt_overlay / "all.md").write_text("overlay all\n", encoding="utf-8")
         final_effects_file.write_text("Implement correctly.\n", encoding="utf-8")
         kernel_rollout_file.write_text(
             '{"type":"session_meta","payload":{"id":"kernel-session-001","timestamp":"2026-04-03T00:30:00Z"}}\n',
@@ -90,8 +123,10 @@ def main() -> int:
             return _fail("router_api start missing-input rejection must use a stable reason code")
 
         original_spawn = agent_api_module._spawn_router_runtime
+        captured_start_kwargs: dict[str, object] = {}
         try:
             def _fake_spawn_router_runtime(*, startup_result_path: Path, **kwargs):
+                captured_start_kwargs.update(kwargs)
                 del kwargs
                 startup_result_path.parent.mkdir(parents=True, exist_ok=True)
                 startup_result_path.write_text(
@@ -137,6 +172,8 @@ def main() -> int:
                     "2026-04-03T00:30:00Z",
                     "--final-effects-file",
                     str(final_effects_file.resolve()),
+                    "--prompt-overlay-ref",
+                    str(prompt_overlay.resolve()),
                 ],
             )
         finally:
@@ -144,6 +181,8 @@ def main() -> int:
 
         if start_exit_code != 0 or start_payload.get("status") != "STARTED":
             return _fail("router_api start must surface a successful STARTED payload from the runtime helper")
+        if str(captured_start_kwargs.get("prompt_overlay_ref") or "") != str(prompt_overlay.resolve()):
+            return _fail("router_api start must forward --prompt-overlay-ref to the runtime launcher")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -305,6 +344,9 @@ def main() -> int:
         workspace_root.mkdir(parents=True, exist_ok=True)
         final_effects = workspace_root / "FINAL_EFFECTS.md"
         final_effects.write_text("Original paused obligations.\n", encoding="utf-8")
+        prompt_overlay = tmp / "resume-overlay"
+        prompt_overlay.mkdir(parents=True, exist_ok=True)
+        (prompt_overlay / "all.md").write_text("resume overlay all\n", encoding="utf-8")
         append_ref = tmp / "append-final-effects.md"
         append_ref.write_text("Paused append obligations.\n", encoding="utf-8")
         child_ref = ActorRef(
@@ -385,6 +427,8 @@ def main() -> int:
                     "resume",
                     "--router-db",
                     str(db_path),
+                    "--prompt-overlay-ref",
+                    str(prompt_overlay.resolve()),
                     "--append-final-effects-ref",
                     str(append_ref),
                 ],
@@ -401,6 +445,8 @@ def main() -> int:
         merged_paused_final_effects = final_effects.read_text(encoding="utf-8")
         if "Original paused obligations." not in merged_paused_final_effects or "Paused append obligations." not in merged_paused_final_effects:
             return _fail("router_api paused append resume must append to the root FINAL_EFFECTS file")
+        if not (db_path.parent / "router" / "prompt_overlays" / "001" / "all.md").is_file():
+            return _fail("router_api resume must snapshot --prompt-overlay-ref into router/prompt_overlays")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)

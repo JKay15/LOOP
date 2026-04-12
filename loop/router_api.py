@@ -57,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--kernel-rollout-path")
     start.add_argument("--kernel-started-at")
     start.add_argument("--final-effects-file")
+    start.add_argument("--prompt-overlay-ref")
     start.set_defaults(handler=_handle_start)
 
     resume = subparsers.add_parser(
@@ -65,6 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resume.add_argument("--router-db")
     resume.add_argument("--append-final-effects-ref")
+    resume.add_argument("--prompt-overlay-ref")
     resume.set_defaults(handler=_handle_resume)
 
     pause = subparsers.add_parser(

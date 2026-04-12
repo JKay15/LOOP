@@ -140,6 +140,7 @@ def main() -> int:
         from loop.completion import actor_completion_record_path
         from loop.evaluator_runtime import (
             checker_current_tasks_path,
+            kernel_current_report_path,
             reviewer_current_feedback_path,
             reviewer_current_report_path,
             tester_current_result_path,
@@ -346,20 +347,9 @@ def main() -> int:
             reviewer_current_feedback_path(workspace_root, "1"),
             json.dumps(
                 {
-                    "version": 2,
+                    "version": 3,
                     "snapshot_id": "snapshot-local-agent-api",
-                    "implementer": {
-                        "findings": [
-                            {
-                                "blocking": True,
-                                "summary": "implementer finding",
-                                "evidence_ref": str(reviewer_feedback_evidence),
-                            }
-                        ],
-                    },
-                    "checker": {"findings": []},
-                    "tester": {"findings": []},
-                    "ai_user": [],
+                    "reroute_mask": 2,
                 },
                 indent=2,
                 sort_keys=True,
@@ -385,12 +375,26 @@ def main() -> int:
             )
             if invalid_exit_code == 0 or str(invalid_payload.get("reason_code") or "") != "INVALID_REVIEWER_VERDICT":
                 return _fail("reviewer complete must reject invalid verdict kinds")
+            invalid_feedback_exit_code, invalid_feedback_payload = _run_main(
+                agent_api_main,
+                [
+                    "complete",
+                    "--verdict-kind",
+                    "OK",
+                    "--report-ref",
+                    str(reviewer_report),
+                    "--feedback-ref",
+                    str(reviewer_feedback),
+                ],
+            )
+            if invalid_feedback_exit_code == 0 or str(invalid_feedback_payload.get("reason_code") or "") != "INVALID_REVIEWER_FEEDBACK_SCHEMA":
+                return _fail("reviewer complete must reject OK verdicts with a nonzero reroute_mask")
             exit_code, payload = _run_main(
                 agent_api_main,
                 [
                     "complete",
                     "--verdict-kind",
-                    "IMPLEMENTER_ACTION_REQUIRED",
+                    "REROUTE_REQUIRED",
                     "--report-ref",
                     str(reviewer_report),
                     "--feedback-ref",
@@ -401,7 +405,7 @@ def main() -> int:
             return _fail("reviewer complete must record successfully")
         reviewer_completion_path = actor_completion_record_path(workspace_root, ActorKind.EVALUATOR_REVIEWER)
         reviewer_payload = json.loads(reviewer_completion_path.read_text(encoding="utf-8"))
-        if reviewer_payload.get("verdict_kind") != "IMPLEMENTER_ACTION_REQUIRED":
+        if reviewer_payload.get("verdict_kind") != "REROUTE_REQUIRED":
             return _fail("reviewer complete must preserve verdict_kind")
         if reviewer_payload.get("report_ref") != str(reviewer_report):
             return _fail("reviewer complete must preserve report_ref")
@@ -423,6 +427,13 @@ def main() -> int:
             process_birth_time=1711965604.0,
             session_ids=["shell-session"],
             workspace_fingerprint_before="fp-before-shell",
+        )
+        shadow_pkg = shell_workspace_root / "loop"
+        shadow_pkg.mkdir(parents=True, exist_ok=True)
+        _write_file(shadow_pkg / "__init__.py", "")
+        _write_file(
+            shadow_pkg / "agent_api.py",
+            "raise RuntimeError('workspace shadow loop.agent_api should never be imported by routerctl.sh')\n",
         )
         shell_env = dict(os.environ)
         shell_env.update(
@@ -529,7 +540,19 @@ def main() -> int:
             LOOP_ATTEMPT_COUNT="2",
             LOOP_WORKSPACE_ROOT=str(kernel_takeover_workspace_root),
         ):
-            exit_code, payload = _run_main(agent_api_main, ["complete"])
+            exit_code, payload = _run_main(
+                agent_api_main,
+                [
+                    "complete",
+                    "--report-ref",
+                    str(
+                        _write_file(
+                            kernel_current_report_path(kernel_takeover_workspace_root, "0"),
+                            "# Final Closeout\n\nOutcome: complete.\n",
+                        )
+                    ),
+                ],
+            )
         if exit_code != 0 or str(payload.get("status") or "") != "RECORDED":
             return _fail("ordinary kernel complete must record successfully without split-review verdict fields")
         kernel_takeover_completion_path = actor_completion_record_path(
@@ -543,6 +566,10 @@ def main() -> int:
             return _fail("ordinary kernel complete must not inject kernel review verdict fields")
         if kernel_takeover_payload.get("request_seq") not in {None, ""}:
             return _fail("ordinary kernel complete must not inject LOOP_REQUEST_SEQ when absent")
+        if str(kernel_takeover_payload.get("report_ref") or "").strip() != str(
+            kernel_current_report_path(kernel_takeover_workspace_root, "0")
+        ):
+            return _fail("ordinary kernel complete must preserve the canonical closeout report_ref")
 
     return 0
 

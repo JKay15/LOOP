@@ -32,6 +32,8 @@ from loop.evaluator_runtime import (
     checker_accepted_tasks_path,
     checker_current_tasks_path,
     feedback_history_path as node_feedback_history_path,
+    kernel_accepted_report_path,
+    kernel_current_report_path,
     reviewer_accepted_feedback_path,
     reviewer_accepted_report_path,
     reviewer_current_feedback_path,
@@ -41,6 +43,7 @@ from loop.evaluator_runtime import (
     tester_current_result_path,
 )
 from loop.events import (
+    ActorRef,
     ActorKind,
     ApproveSplit,
     KERNEL_NODE_ID,
@@ -67,6 +70,7 @@ ROUTER_THREAD_JOIN_TIMEOUT_SECONDS = 2.0
 ROOT_NODE_ID = "1"
 ROOT_NODE_PARENT_ID = "0"
 ROOT_ACTOR_ATTEMPT_COUNT = 1
+PROMPT_OVERLAY_ALL_FILENAME = "all.md"
 
 
 LOGGER = logging.getLogger(__name__)
@@ -134,6 +138,16 @@ def _resolve_workspace_git_root(workspace_root: Path) -> Path:
     if not root:
         raise RuntimeError(f"could not resolve git root for {Path(workspace_root).expanduser().resolve()}")
     return Path(root).expanduser().resolve()
+
+
+def _publish_workspace_to_commit(workspace_root: Path, result_commit: str) -> None:
+    resolved = Path(workspace_root).expanduser().resolve()
+    commit = str(result_commit or "").strip()
+    if not commit:
+        return
+    repo_root = _resolve_workspace_git_root(resolved)
+    _run_git(repo_root, "reset", "--hard", commit)
+    _run_git(repo_root, "clean", "-fd", "--", ".")
 
 
 def _substantive_git_dirty_paths(workspace_root: Path) -> list[str]:
@@ -463,7 +477,7 @@ class RouterCore:
             )
             self._thread.start()
         if request_terminal_shutdown:
-            self._request_router_terminal_shutdown()
+            self._maybe_request_router_terminal_shutdown()
 
     def stop(self) -> None:
         """Request stop, drain any remaining inbox work, and clean up the socket."""
@@ -494,6 +508,7 @@ class RouterCore:
         kernel_rollout_path: str | Path | None,
         kernel_started_at: str | None,
         final_effects_file: str | Path | None,
+        prompt_overlay_ref: str | Path | None = None,
     ) -> dict[str, object]:
         """Materialize the first LOOP node, launch its actor, and enter steady state."""
 
@@ -508,13 +523,14 @@ class RouterCore:
                 reason_code="ROOT_NODE_MATERIALIZATION_FAILED",
                 message="router start rejected: root node 1 already exists in node_table.",
             )
-        spec = self._build_actor_launch_spec(
-            node_id=ROOT_NODE_ID,
-            parent_node_id=ROOT_NODE_PARENT_ID,
-            actor_kind=ActorKind.IMPLEMENTER,
-            attempt_count=ROOT_ACTOR_ATTEMPT_COUNT,
-            final_effects_file=inputs.final_effects_file,
-        )
+        if prompt_overlay_ref is not None and str(prompt_overlay_ref).strip():
+            try:
+                self._snapshot_prompt_overlay(Path(prompt_overlay_ref))
+            except ValueError as exc:
+                raise RouterStartError(
+                    reason_code="INVALID_PROMPT_OVERLAY_REF",
+                    message=f"router start rejected: {exc}",
+                ) from exc
         proc_supervisor = self._ensure_proc_supervisor()
         previous_kernel_bootstrap = (
             self._store.read_kernel_session_id(),
@@ -522,20 +538,56 @@ class RouterCore:
             self._store.read_kernel_started_at(),
         )
         launch: ActorLaunchResult | None = None
-        launch_committed = False
         try:
             self._store.write_kernel_bootstrap_info(
                 kernel_session_id=inputs.kernel_session_id,
                 kernel_rollout_path=str(inputs.kernel_rollout_path),
                 kernel_started_at=inputs.kernel_started_at,
             )
-            _record, launch = self._launch_and_commit_actor(spec=spec, base_record=None)
-            launch_committed = True
+            root_record = NodeRuntimeRecord(
+                node_id=ROOT_NODE_ID,
+                parent_node_id=ROOT_NODE_PARENT_ID,
+                child_node_ids=[],
+                workspace_root=str(inputs.final_effects_file.parent.resolve()),
+                final_effects_file=str(inputs.final_effects_file.resolve()),
+                split_request=0,
+                split_approved=0,
+                approved_split_request_seq=0,
+                evaluator_phase="",
+                checker_tasks_ref="",
+                task_result_refs={},
+                reviewer_verdict_kind="",
+                reviewer_report_ref="",
+                pending_prelude_lines=[],
+                current_components=[],
+                durable_commit="",
+                result_commit="",
+                escalated_to_kernel=False,
+                last_rejected_split_diff_fingerprint="",
+                components={},
+            )
+            implementer_spec = self._build_actor_launch_spec(
+                node_id=root_record.node_id,
+                parent_node_id=root_record.parent_node_id,
+                actor_kind=ActorKind.IMPLEMENTER,
+                attempt_count=ROOT_ACTOR_ATTEMPT_COUNT,
+                final_effects_file=Path(root_record.final_effects_file),
+                prelude_lines=self._combine_prelude_lines(root_record),
+            )
+            root_record, launch = self._launch_and_commit_actor(
+                spec=implementer_spec,
+                base_record=root_record,
+            )
+            root_record = self._launch_checker_for_node(
+                root_record,
+                preserve_running_components=True,
+            )
             self.start()
         except Exception as exc:
-            if launch_committed and launch is not None:
-                self._terminate_process_best_effort(launch.process)
-                self._store.delete_node(spec.node_id)
+            root_record = self._store.load_node(ROOT_NODE_ID)
+            if root_record is not None:
+                self._terminate_actor_refs_best_effort(list(root_record.current_components))
+                self._store.delete_node(ROOT_NODE_ID)
             try:
                 self._store.write_kernel_bootstrap_info(
                     kernel_session_id=previous_kernel_bootstrap[0],
@@ -559,23 +611,20 @@ class RouterCore:
             "status": "STARTED",
             "message": "router started; root implementer launched",
             "kernel_session_id": inputs.kernel_session_id,
-            "root_node_id": spec.node_id,
-            "root_actor_kind": spec.actor_kind.value,
-            "root_attempt_count": spec.attempt_count,
+            "root_node_id": ROOT_NODE_ID,
+            "root_actor_kind": ActorKind.IMPLEMENTER.value,
+            "root_attempt_count": ROOT_ACTOR_ATTEMPT_COUNT,
             "root_pid": int(getattr(launch.process, "pid", 0) or 0),
             "root_process_birth_time": launch.process_birth_time,
             "root_session_id": launch.session_id,
-            "root_rollout_path": (
-                str(Path(launch.rollout_path).expanduser().resolve())
-                if launch.rollout_path is not None
-                else ""
-            ),
+            "root_rollout_path": "",
         }
 
     def prepare_resume(
         self,
         *,
         append_final_effects_ref: str | Path | None = None,
+        prompt_overlay_ref: str | Path | None = None,
     ) -> dict[str, object]:
         router_status = str(self._store.read_router_status() or "").strip()
         append_ref = (
@@ -583,8 +632,26 @@ class RouterCore:
             if append_final_effects_ref is None
             else Path(append_final_effects_ref).expanduser().resolve()
         )
+        prompt_overlay_path = (
+            None
+            if prompt_overlay_ref is None or not str(prompt_overlay_ref).strip()
+            else Path(prompt_overlay_ref).expanduser().resolve()
+        )
+
+        def _snapshot_prompt_overlay_for_resume() -> None:
+            if prompt_overlay_path is None:
+                return
+            try:
+                self._snapshot_prompt_overlay(prompt_overlay_path)
+            except ValueError as exc:
+                raise RouterResumeError(
+                    reason_code="INVALID_PROMPT_OVERLAY_REF",
+                    message=f"router resume rejected: {exc}",
+                ) from exc
+
         if append_ref is None:
             if router_status == "paused":
+                _snapshot_prompt_overlay_for_resume()
                 self._store.clear_router_pause_state()
                 return {
                     "accepted": True,
@@ -614,6 +681,7 @@ class RouterCore:
                         "router resume rejected: terminal_failed run has no recoverable unfinished frontier components."
                     ),
                 )
+            _snapshot_prompt_overlay_for_resume()
             self._store.clear_router_outcome_state()
             if updated_records:
                 self._store.upsert_nodes(updated_records)
@@ -638,6 +706,7 @@ class RouterCore:
         if router_status == "paused":
             _root_record, final_effects_path = self._resolve_root_append_final_effects_target()
             self._append_final_effects(final_effects_path, append_ref)
+            _snapshot_prompt_overlay_for_resume()
             self._store.clear_router_pause_state()
             return {
                 "accepted": True,
@@ -663,6 +732,7 @@ class RouterCore:
                 )
             _root_record, final_effects_path = self._resolve_root_append_final_effects_target()
             self._append_final_effects(final_effects_path, append_ref)
+            _snapshot_prompt_overlay_for_resume()
             self._store.clear_router_outcome_state()
             if updated_records:
                 self._store.upsert_nodes(updated_records)
@@ -696,6 +766,7 @@ class RouterCore:
             )
         final_effects_path = Path(completed_source.final_effects_file).expanduser().resolve()
         self._append_final_effects(final_effects_path, append_ref)
+        _snapshot_prompt_overlay_for_resume()
         resumed_root = self._prepare_completed_root_resume(
             root_record=root_record,
             completed_source=completed_source,
@@ -806,6 +877,57 @@ class RouterCore:
         if not raw:
             return ""
         return str(Path(raw).expanduser().resolve())
+
+    def _prompt_overlays_root(self) -> Path:
+        return (self._store.db_path.parent / "router" / "prompt_overlays").resolve()
+
+    def _recognized_prompt_overlay_filenames(self) -> set[str]:
+        return {
+            PROMPT_OVERLAY_ALL_FILENAME,
+            *{f"{actor_kind.value}.md" for actor_kind in ActorKind},
+        }
+
+    def _snapshot_prompt_overlay(self, overlay_dir: str | Path) -> Path:
+        resolved_overlay_dir = Path(overlay_dir).expanduser().resolve()
+        if not resolved_overlay_dir.exists() or not resolved_overlay_dir.is_dir():
+            raise ValueError("prompt-overlay-ref must exist and be a directory")
+        overlay_root = self._prompt_overlays_root()
+        overlay_root.mkdir(parents=True, exist_ok=True)
+        existing_sequences: list[int] = []
+        for child in overlay_root.iterdir():
+            if child.is_dir() and child.name.isdigit():
+                existing_sequences.append(int(child.name))
+        next_sequence = (max(existing_sequences) + 1) if existing_sequences else 1
+        snapshot_dir = (overlay_root / f"{next_sequence:03d}").resolve()
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        for filename in sorted(self._recognized_prompt_overlay_filenames()):
+            source = resolved_overlay_dir / filename
+            if source.is_file():
+                shutil.copy2(source, snapshot_dir / filename)
+        return snapshot_dir
+
+    def _iter_prompt_overlay_dirs(self) -> list[Path]:
+        overlay_root = self._prompt_overlays_root()
+        if not overlay_root.is_dir():
+            return []
+        overlays: list[Path] = []
+        for child in overlay_root.iterdir():
+            if child.is_dir() and child.name.isdigit():
+                overlays.append(child.resolve())
+        return sorted(overlays, key=lambda path: int(path.name))
+
+    def _prompt_overlay_texts(self, actor_kind: ActorKind) -> list[str]:
+        texts: list[str] = []
+        actor_filename = f"{actor_kind.value}.md"
+        for overlay_dir in self._iter_prompt_overlay_dirs():
+            for filename in (PROMPT_OVERLAY_ALL_FILENAME, actor_filename):
+                candidate = overlay_dir / filename
+                if not candidate.is_file():
+                    continue
+                text = candidate.read_text(encoding="utf-8", errors="replace").strip()
+                if text:
+                    texts.append(text)
+        return texts
 
     def _ensure_proc_supervisor(self) -> ProcSupervisor:
         if self._proc_supervisor is None:
@@ -1026,7 +1148,7 @@ class RouterCore:
             return lines
         if actor_kind is ActorKind.EVALUATOR_REVIEWER:
             lines.append(
-                f"- Write the canonical reviewer feedback.json first, then the canonical reviewer report path, then use: {routerctl} complete --verdict-kind <OK|IMPLEMENTER_ACTION_REQUIRED|EVALUATOR_FAULT> --report-ref <path> --feedback-ref <path>"
+                f"- Write the canonical reviewer feedback.json first, then the canonical reviewer report path, then use: {routerctl} complete --verdict-kind <OK|REROUTE_REQUIRED> --report-ref <path> --feedback-ref <path>"
             )
             return lines
         if actor_kind is ActorKind.KERNEL:
@@ -1036,7 +1158,9 @@ class RouterCore:
             lines.append(
                 f"- If LOOP_REQUEST_SEQ is set, reject with a written reason: {routerctl} complete --verdict-kind REJECT --reason-ref <path>"
             )
-            lines.append(f"- Otherwise, use: {routerctl} complete")
+            lines.append(
+                f"- Otherwise, write the canonical final closeout report path injected by router, then use: {routerctl} complete --report-ref <path>"
+            )
             return lines
         return lines
 
@@ -1178,16 +1302,19 @@ class RouterCore:
     def _build_kernel_takeover_prompt_lines(self) -> list[str]:
         return [
             "Kernel final-closeout role:",
-            "- You are taking over final closeout for the entire LOOP subtree from the current merged workspace state.",
+            "- You are node-0 taking over final closeout for the entire LOOP subtree.",
             "- This is not a split-review task.",
-            "- Treat the current workspace and FINAL_EFFECTS.md as the authoritative closeout target.",
-            "- Make any final integrated implementation changes needed before the closing evaluator wave.",
+            "- This is not another implementation wave and it is not another evaluator wave.",
+            "- Your job is to publish one concise human-facing final closeout report from the current accepted workspace state.",
             "",
             "Closeout rules:",
             "- Do not look for split proposal artifacts unless router explicitly injects LOOP_REQUEST_SEQ.",
             "- Do not widen scope beyond the current FINAL_EFFECTS.md and explicit router prelude instructions.",
-            "- Preserve already-working behavior unless a final integrated fix is actually needed.",
-            "- Use routerctl complete only when the current workspace itself is your honest final-closeout claim for the full target.",
+            "- Treat the current workspace state and inherited result_commit as authoritative.",
+            "- Write one single closeout report that says, in plain language, that the task is complete and what final artifacts/effects were produced.",
+            "- Keep the closeout report concise, centralized, and human-readable.",
+            "- Do not reopen evaluation.",
+            "- Do not add new implementation scope.",
         ]
 
     def _build_checker_prompt_lines(
@@ -1210,8 +1337,8 @@ class RouterCore:
             "- Do not create parallel authoritative files for obligations, coverage, routing, disposition, manifests, checklists, summaries, certifications, or per-task markdown.",
             "- Do not use task_ref indirection. The task graph itself must contain the full routed task specification.",
             "- Historical checker artifacts are evidence only; they are not authoritative for this wave.",
-            "- If router prelude says the previous evaluator wave ended in EVALUATOR_FAULT, treat the injected reviewer report and feedback as explicit correction targets for this checker pass.",
-            "- In that case, do not reproduce the prior checker manifest blindly; correct the evaluator-side faults first, then emit the new manifest.",
+            "- If router prelude says reviewer requested checker reroute, treat the injected reviewer report and feedback as explicit correction targets for this checker pass.",
+            "- In that case, do not reproduce the prior checker manifest blindly; correct the current checker-side gaps first, then emit the new manifest.",
             "",
             "Checker scope boundary:",
             "- Your job is to operationalize FINAL_EFFECTS.md into a truthful, testable task manifest.",
@@ -1221,6 +1348,18 @@ class RouterCore:
             "- In particular, do not convert an open-text allowance into a stricter hard cap, exclusive path, or smaller permission set unless that stronger restriction is already clearly supported by the authoritative text.",
             "- Do not reduce a requirement's allowable solution space just because a narrower formulation seems easier to evaluate.",
             "- If a requirement remains genuinely ambiguous after good-faith operational clarification, preserve that ambiguity in the task framing rather than resolving it by silently choosing the stricter interpretation.",
+            "",
+            "Implementer-repairability rule:",
+            "- Do not create a checker task whose only possible failure is an irreversible past chronology miss, a non-owned file/history fact, or evaluator-side interpretation drift.",
+            "- Route implementer work only when the current node could still clear the issue now by changing owned files/artifacts or by leaving an authority-grounded rebuttal in current completion materials.",
+            "- Example allowed: the current owned theorem/object graph still exports the wrong assumption surface or wrong contract class.",
+            "- Example forbidden: the node first edited `lean-toolchain` before the first successful helper invocation, when the current workspace is already helper-backed and no present owned-file change can repair that chronology.",
+            "",
+            "FINAL_EFFECTS example-handling rule:",
+            "- FINAL_EFFECTS.md may contain positive examples and negative examples that explain what does and does not satisfy a requirement.",
+            "- Treat those examples as authoritative interpretive aids for later evaluator actors.",
+            "- Do not convert an example snippet, example path, example module name, or example local theorem name into an extra mandatory deliverable unless FINAL_EFFECTS.md separately requires that item outside the example itself.",
+            "- Do not create cleanup tasks whose only purpose is to delete explanatory examples from FINAL_EFFECTS.md.",
             "",
             "Implementer rebuttal handling:",
             "- The implementer may explicitly argue that a checker-derived task interpretation over-tightens FINAL_EFFECTS.md.",
@@ -1303,6 +1442,10 @@ class RouterCore:
             "3. Each lane result file is the sole durable truth for that lane.",
             "4. Local helper/reference files are supporting evidence only; they do not override FINAL_EFFECTS.",
             "",
+            "FINAL_EFFECTS example rule:",
+            "- If FINAL_EFFECTS.md includes positive or negative examples, use them as interpretive reference for what honest pass/fail means.",
+            "- Do not treat an example snippet, example file path, example module name, or example theorem name as a required deliverable unless FINAL_EFFECTS.md separately requires it outside the example itself.",
+            "",
             "Single-source-of-truth rule:",
             "- Do not treat mirrored checker sidecar docs as parallel truth sources.",
             "- If duplicate sidecar files disagree with checker/tasks.json or lane results, the durable source wins.",
@@ -1359,6 +1502,14 @@ class RouterCore:
             "  3. you have concrete evidence for it;",
             "  4. it is actionable by a specific owner.",
             "",
+            "Implementer-blocker repairability rule:",
+            "- Do not report an implementer-owned blocking finding unless the current node can still clear it now by changing owned files/artifacts or by leaving an authority-grounded rebuttal grounded in current evidence.",
+            "- Do not turn irreversible past chronology, non-owned surfaces, or evaluator-side interpretation drift into implementer blockers.",
+            "- If a miss is irreparable now within the current node state machine, document it but still return `PASS`.",
+            "- Irreparable-now issues must not force `FAIL`.",
+            "- Example blocker allowed: the current owned theorem/object graph still exports the wrong assumption surface or wrong contract class.",
+            "- Example blocker forbidden: the node first edited `lean-toolchain` before the first successful helper invocation, when the workspace is already helper-backed and the chronology cannot be repaired now.",
+            "",
             "Artifact gate policy:",
             "- Distinguish between strong-gate evidence and weak-gate mirrored paperwork.",
             "- A strong-gate item is blocking only if at least one is true:",
@@ -1398,6 +1549,10 @@ class RouterCore:
             "2. The routed task entry from checker/tasks.json defines your direct assignment.",
             "3. Workspace code, runtime behavior, and task-local artifacts provide evidence.",
             "4. Local helper/reference files are supporting evidence only; they do not override FINAL_EFFECTS.",
+            "",
+            "FINAL_EFFECTS example rule:",
+            "- If FINAL_EFFECTS.md includes positive or negative examples, use them as interpretive reference for what honest pass/fail means in this lane.",
+            "- Do not treat an example snippet, example file path, example module name, or example theorem name as a required deliverable unless FINAL_EFFECTS.md separately requires it outside the example itself.",
             "",
             "Single-source-of-truth rule:",
             "- The routed task entry is the only task truth for this lane.",
@@ -1474,9 +1629,16 @@ class RouterCore:
             "  3. you have concrete evidence for it;",
             "  4. it is actionable by a specific owner.",
             "",
+            "Implementer-blocker repairability rule:",
+            "- Do not report an implementer-owned blocking finding unless the current node can still clear it now by changing owned files/artifacts or by leaving an authority-grounded rebuttal grounded in current evidence.",
+            "- Do not turn irreversible past chronology, non-owned surfaces, or evaluator-side interpretation drift into implementer blockers.",
+            "- If a miss is irreparable now within the current node state machine, document it but still return `PASS`.",
+            "- Irreparable-now issues must not force `FAIL`.",
+            "- Example blocker allowed: the current owned theorem/object graph still exports the wrong assumption surface or wrong contract class.",
+            "- Example blocker forbidden: the node first edited `lean-toolchain` before the first successful helper invocation, when the workspace is already helper-backed and the chronology cannot be repaired now.",
+            "",
             "Snapshot-writing rule:",
             "- When you write the current lane result, use the exact current dispatched snapshot id injected by router.",
-            "- Do not copy snapshot ids from history into current-pass claims.",
             "- If you mention any older snapshot id, label it explicitly as historical, stale, or superseded.",
             "",
             "Output requirements:",
@@ -1505,8 +1667,7 @@ class RouterCore:
             "1. FINAL_EFFECTS.md defines the true goal.",
             "2. checker/tasks.json is the sole evaluator task truth for the current wave.",
             "3. Each tester result or AI-user lane result is the sole durable truth for that evaluator output.",
-            "4. Active feedback and feedback history provide prior context only; they do not override current evidence.",
-            "5. If current evidence contradicts an older finding, mark the older finding resolved or superseded in reviewer_report.md and reflect only the still-active findings in feedback.json.",
+            "4. Active feedback provides current routing context only; it does not override current evidence.",
             "",
             "Single-source-of-truth rule:",
             "- feedback.json is the sole routing truth for this reviewer pass.",
@@ -1519,6 +1680,7 @@ class RouterCore:
             "- Treat FINAL_EFFECTS.md as the authoritative requirement source.",
             "- Treat checker/tasks.json as a derived operationalization, not as a stronger authority than FINAL_EFFECTS.md.",
             "- If an implementer explicitly argues that a checker-derived task or active finding over-tightens FINAL_EFFECTS.md, you must adjudicate that rebuttal explicitly.",
+            "- The final verdict is about the current workspace and current node state, not about correcting historical evaluator wording.",
             "",
             "Adjudication steps:",
             "1. Read the controlling FINAL_EFFECTS.md text.",
@@ -1544,97 +1706,64 @@ class RouterCore:
             "- If none of the above is true, the finding must be treated as weak-gate by default.",
             "- Missing weak-gate artifacts must not block by themselves.",
             "- If checker or a task contract over-classifies weak-gate artifacts as blockers, route that as a checker-side contract problem instead of repeatedly blocking ai_user lanes for low-value paperwork.",
-            "- Record weak-gate findings in feedback.json only when they are useful advisory context for a later actor; otherwise leave them out of feedback.json and mention them only in reviewer_report.md.",
+            "- Weak-gate and historical notes belong in reviewer_report.md, not in feedback.json.",
+            "",
+            "Implementer-blocker routing rule:",
+            "- Use `REROUTE_REQUIRED` only for still-active defects that can still be repaired by rerouting the current node.",
+            "- `Repairable now` means the current node still has a future transition that can clear the issue.",
+            "- If a miss is irreparable now within the current node state machine, document it but still return `OK`.",
+            "- Irreparable-now issues must not force `REROUTE_REQUIRED`.",
+            "- feedback.json only carries the routing decision; put explanations and historical notes in reviewer_report.md.",
+            "- Example blocker allowed: the current owned Lean theorem/object graph still exports the wrong assumption surface or wrong contract class.",
+            "- Example blocker forbidden: the node first edited `lean-toolchain` before the first successful helper call, when the workspace is already helper-backed and the chronology cannot be repaired now.",
             "",
             "Snapshot-writing rule:",
             "- When you write any current-pass reviewer finding, report, or routing decision, use the exact current dispatched snapshot id injected by router.",
-            "- Do not copy snapshot ids from history into current-pass claims.",
             "- If you mention any older snapshot id, label it explicitly as historical, stale, or superseded.",
             "",
             "Required workflow:",
             "1. Read the current checker task manifest, tester report(s), AI-user lane result(s), and the minimal workspace/closeout state needed for an honest decision.",
-            "2. Read any active feedback or feedback-history paths injected below the ROUTER FEEDBACK SLOT marker.",
+            "2. Read any active feedback paths injected below the ROUTER FEEDBACK SLOT marker.",
             "3. Decide which findings are still active now.",
-            "4. Write feedback.json first as the complete current active-finding snapshot for router.",
-            "5. Write reviewer_report.md second to explain the adjudication and summarize resolved / still-open / superseded findings.",
+            "4. Write feedback.json first as the complete current routing snapshot for router.",
+            "5. Write reviewer_report.md second to explain the adjudication and summarize any historical or irreparable-now notes.",
             "6. Submit both files through routerctl complete.",
             "",
             "feedback.json is the primary routing artifact.",
-            "- feedback.json is a complete snapshot of all findings that are still active after this review pass.",
+            "- feedback.json is a complete routing snapshot for this review pass.",
             "- feedback.json is not an incremental patch.",
-            "- Do not omit empty buckets.",
-            "- Do not duplicate one finding across multiple owner buckets unless the problem is genuinely shared and must be routed as shared evidence inside reviewer_report.md; feedback.json itself must still choose one concrete owner bucket.",
+            "- Do not put explanations, historical notes, or evaluator wording corrections into feedback.json.",
             "",
             "feedback.json schema requirements:",
             "- Top-level keys must be exactly:",
             "  - version",
             "  - snapshot_id",
-            "  - implementer",
-            "  - checker",
-            "  - tester",
-            "  - ai_user",
-            "- version must be exactly 2.",
+            "  - reroute_mask",
+            "- version must be exactly 3.",
             "- snapshot_id must equal the current dispatched snapshot id.",
-            "- implementer/checker/tester must be objects with keys exactly:",
-            "  - findings",
-            "- ai_user must be a list of objects with keys exactly:",
-            "  - task_id",
-            "  - findings",
-            "- Every finding object must contain exactly:",
-            "  - blocking",
-            "  - summary",
-            "  - evidence_ref",
-            "- ai_user.task_id must match a task_id from the current checker manifest.",
+            "- reroute_mask must be one of:",
+            "  - 0 (no reroute; reviewer should return OK)",
+            "  - 1 (reroute checker)",
+            "  - 2 (reroute implementer)",
+            "  - 3 (reroute both checker and implementer)",
             "",
             "feedback.json template:",
             "```json",
             "{",
-            '  "version": 2,',
+            '  "version": 3,',
             '  "snapshot_id": "snapshot-abc123",',
-            '  "implementer": {',
-            '    "findings": [',
-            "      {",
-            '        "blocking": true,',
-            '        "summary": "short actionable statement",',
-            '        "evidence_ref": "/abs/path/to/evidence"',
-            "      }",
-            "    ]",
-            "  },",
-            '  "checker": {',
-            '    "findings": [',
-            "      {",
-            '        "blocking": false,',
-            '        "summary": "non-blocking advisory note about an overweight weak-gate artifact contract",',
-            '        "evidence_ref": "/abs/path/to/evidence"',
-            "      }",
-            "    ]",
-            "  },",
-            '  "tester": {',
-            '    "findings": []',
-            "  },",
-            '  "ai_user": [',
-            "    {",
-            '      "task_id": "task-01",',
-            '      "findings": [',
-            "        {",
-            '          "blocking": true,',
-            '          "summary": "short actionable statement",',
-            '          "evidence_ref": "/abs/path/to/evidence"',
-            "        }",
-            "      ]",
-            "    }",
-            "  ]",
+            '  "reroute_mask": 0',
             "}",
             "```",
             "",
             "Output requirements:",
             "- feedback.json must be written before reviewer_report.md.",
-            "- reviewer_report.md should explain why each active finding belongs to its owner bucket and summarize what is resolved, still open, or superseded.",
+            "- reviewer_report.md should explain the adjudication and any historical, stale, or irreparable-now notes.",
             "- Keep reviewer_report.md consistent with feedback.json.",
-            "- reviewer_report.md should state explicitly which findings are blocking and which are non-blocking.",
+            "- If reroute_mask is 0, reviewer_report.md may still document non-blocking historical or irreparable-now issues.",
             "",
             "Submission interface:",
-            f"- Use: {self._repo_root / 'scripts' / 'routerctl.sh'} complete --verdict-kind <OK|IMPLEMENTER_ACTION_REQUIRED|EVALUATOR_FAULT> --report-ref <path/to/reviewer_report.md> --feedback-ref <path/to/feedback.json>",
+            f"- Use: {self._repo_root / 'scripts' / 'routerctl.sh'} complete --verdict-kind <OK|REROUTE_REQUIRED> --report-ref <path/to/reviewer_report.md> --feedback-ref <path/to/feedback.json>",
             "- report-ref and feedback-ref must be the canonical current reviewer paths injected by router.",
             "- verdict_kind remains required for compatibility with the current router interface.",
             "",
@@ -1708,6 +1837,9 @@ class RouterCore:
                 "--- END FINAL EFFECTS ---",
             ]
         )
+        overlay_texts = self._prompt_overlay_texts(actor_kind)
+        if overlay_texts:
+            lines.extend(["", "\n\n".join(overlay_texts)])
         return "\n".join(lines)
 
     def _build_actor_launch_spec(
@@ -2405,7 +2537,7 @@ class RouterCore:
             None,
         )
         for child_record in new_child_records:
-            self._launch_implementer_for_record(child_record)
+            self._launch_primary_wave_for_record(child_record)
         self._observe_placeholder(item)
 
     def _handle_reject_split(self, item: StoredRouterInboxItem) -> None:
@@ -2755,7 +2887,7 @@ class RouterCore:
             return None, [f"Reviewer feedback_ref must contain valid JSON: {exc.msg}."]
         if not isinstance(raw_payload, dict):
             return None, ["Reviewer feedback_ref JSON must be an object."]
-        allowed_keys = {"version", "snapshot_id", "implementer", "checker", "tester", "ai_user"}
+        allowed_keys = {"version", "snapshot_id", "reroute_mask"}
         extra_keys = sorted(set(raw_payload) - allowed_keys)
         reason_lines: list[str] = []
         if extra_keys:
@@ -2769,8 +2901,8 @@ class RouterCore:
             version_value = int(version)
         except (TypeError, ValueError):
             version_value = -1
-        if version_value != 2:
-            reason_lines.append("Reviewer feedback_ref version must be exactly 2.")
+        if version_value != 3:
+            reason_lines.append("Reviewer feedback_ref version must be exactly 3.")
         expected_snapshot_id = self._current_dispatched_snapshot_id(record)
         observed_snapshot_id = str(raw_payload.get("snapshot_id") or "").strip()
         if not expected_snapshot_id:
@@ -2782,65 +2914,21 @@ class RouterCore:
                 "Reviewer feedback_ref snapshot_id must match the current dispatched snapshot id "
                 f"{expected_snapshot_id}."
             )
-        try:
-            checker_tasks_ref = str(record.checker_tasks_ref or "").strip()
-            dispatched_task_ids = (
-                {
-                    str(task["task_id"])
-                    for task in self._resolve_checker_tasks(Path(checker_tasks_ref))
-                }
-                if checker_tasks_ref
-                else set()
-            )
-        except RouterBusinessError as exc:
-            return None, [
-                "Reviewer feedback_ref requires a valid checker task manifest before ai_user findings can be validated: "
-                + exc.message
-            ]
-        normalized: dict[str, object] = {"version": 2, "snapshot_id": expected_snapshot_id}
-        for owner in ("implementer", "checker", "tester"):
-            if owner not in raw_payload:
-                reason_lines.append(f"Reviewer feedback_ref is missing top-level bucket {owner!r}.")
-                continue
-            normalized_bucket, bucket_reason_lines = self._normalize_reviewer_feedback_bucket(
-                bucket_label=owner,
-                bucket_payload=raw_payload.get(owner),
-                task_id_required=False,
-                dispatched_task_ids=dispatched_task_ids,
-            )
-            reason_lines.extend(bucket_reason_lines)
-            if normalized_bucket is not None:
-                normalized[owner] = normalized_bucket
-        if "ai_user" not in raw_payload:
-            reason_lines.append("Reviewer feedback_ref is missing top-level bucket 'ai_user'.")
-        elif not isinstance(raw_payload.get("ai_user"), list):
-            reason_lines.append("Reviewer feedback_ref.ai_user must be a list.")
+        if "reroute_mask" not in raw_payload:
+            reason_lines.append("Reviewer feedback_ref is missing required key reroute_mask.")
+            reroute_mask = -1
         else:
-            normalized_ai_user: list[dict[str, object]] = []
-            seen_task_ids: set[str] = set()
-            for index, bucket_payload in enumerate(list(raw_payload.get("ai_user") or []), start=1):
-                bucket_label = f"ai_user[{index}]"
-                normalized_bucket, bucket_reason_lines = self._normalize_reviewer_feedback_bucket(
-                    bucket_label=bucket_label,
-                    bucket_payload=bucket_payload,
-                    task_id_required=True,
-                    dispatched_task_ids=dispatched_task_ids,
-                )
-                reason_lines.extend(bucket_reason_lines)
-                if normalized_bucket is None:
-                    continue
-                task_id = str(normalized_bucket.get("task_id") or "").strip()
-                if task_id in seen_task_ids:
-                    reason_lines.append(
-                        f"{bucket_label}.task_id duplicates another ai_user feedback bucket."
-                    )
-                    continue
-                seen_task_ids.add(task_id)
-                normalized_ai_user.append(normalized_bucket)
-            normalized["ai_user"] = sorted(
-                normalized_ai_user,
-                key=lambda item: str(item.get("task_id") or ""),
-            )
+            try:
+                reroute_mask = int(raw_payload.get("reroute_mask"))
+            except (TypeError, ValueError):
+                reroute_mask = -1
+            if reroute_mask not in {0, 1, 2, 3}:
+                reason_lines.append("Reviewer feedback_ref reroute_mask must be one of 0, 1, 2, or 3.")
+        normalized: dict[str, object] = {
+            "version": 3,
+            "snapshot_id": expected_snapshot_id,
+            "reroute_mask": max(reroute_mask, 0),
+        }
         if reason_lines:
             return None, reason_lines
         return normalized, []
@@ -2864,54 +2952,21 @@ class RouterCore:
             return None
         return payload if isinstance(payload, dict) else None
 
-    def _feedback_bucket_has_blocking_findings(self, bucket_payload: object) -> bool:
-        if not isinstance(bucket_payload, dict):
-            return False
-        findings = bucket_payload.get("findings")
-        if not isinstance(findings, list):
-            return False
-        return any(
-            isinstance(finding, dict) and bool(finding.get("blocking"))
-            for finding in findings
-        )
-
-    def _blocking_ai_user_feedback_task_ids(
-        self,
-        ledger_payload: dict[str, object],
-    ) -> list[str]:
-        buckets = ledger_payload.get("ai_user")
-        if not isinstance(buckets, list):
-            return []
-        task_ids: list[str] = []
-        for bucket in buckets:
-            if not isinstance(bucket, dict):
-                continue
-            if not self._feedback_bucket_has_blocking_findings(bucket):
-                continue
-            task_id = str(bucket.get("task_id") or "").strip()
-            if task_id:
-                task_ids.append(task_id)
-        return sorted(set(task_ids))
-
-    def _select_feedback_restart_target(
+    def _select_feedback_reroute_mask(
         self,
         record: NodeRuntimeRecord,
-    ) -> tuple[str | None, bool, list[str]]:
+    ) -> int:
         ledger_payload = self._load_active_feedback_ledger(
             record.workspace_root,
             node_id=record.node_id,
         )
         if ledger_payload is None:
-            return None, False, []
-        if self._feedback_bucket_has_blocking_findings(ledger_payload.get("implementer")):
-            return "implementer", False, []
-        if self._feedback_bucket_has_blocking_findings(ledger_payload.get("checker")):
-            return "checker", False, []
-        rerun_tester = self._feedback_bucket_has_blocking_findings(ledger_payload.get("tester"))
-        ai_user_task_ids = self._blocking_ai_user_feedback_task_ids(ledger_payload)
-        if rerun_tester or ai_user_task_ids:
-            return "tasks", rerun_tester, ai_user_task_ids
-        return None, False, []
+            return 0
+        try:
+            reroute_mask = int(ledger_payload.get("reroute_mask") or 0)
+        except (TypeError, ValueError):
+            reroute_mask = 0
+        return reroute_mask if reroute_mask in {0, 1, 2, 3} else 0
 
     def _build_actor_feedback_prelude(
         self,
@@ -2926,66 +2981,27 @@ class RouterCore:
         )
         if ledger_payload is None:
             return []
-        findings: list[dict[str, object]] = []
-        if actor_kind is ActorKind.IMPLEMENTER:
-            bucket = ledger_payload.get("implementer")
-            if isinstance(bucket, dict):
-                findings = [
-                    dict(item)
-                    for item in list(bucket.get("findings") or [])
-                    if isinstance(item, dict)
-                ]
-        elif actor_kind is ActorKind.EVALUATOR_CHECKER:
-            bucket = ledger_payload.get("checker")
-            if isinstance(bucket, dict):
-                findings = [
-                    dict(item)
-                    for item in list(bucket.get("findings") or [])
-                    if isinstance(item, dict)
-                ]
-        elif actor_kind is ActorKind.EVALUATOR_TESTER:
-            bucket = ledger_payload.get("tester")
-            if isinstance(bucket, dict):
-                findings = [
-                    dict(item)
-                    for item in list(bucket.get("findings") or [])
-                    if isinstance(item, dict)
-                ]
-        elif actor_kind is ActorKind.EVALUATOR_AI_USER:
-            normalized_task_id = str(task_id or "").strip()
-            for bucket in list(ledger_payload.get("ai_user") or []):
-                if not isinstance(bucket, dict):
-                    continue
-                if str(bucket.get("task_id") or "").strip() != normalized_task_id:
-                    continue
-                findings = [
-                    dict(item)
-                    for item in list(bucket.get("findings") or [])
-                    if isinstance(item, dict)
-                ]
-                break
-        if not findings:
+        try:
+            reroute_mask = int(ledger_payload.get("reroute_mask") or 0)
+        except (TypeError, ValueError):
+            reroute_mask = 0
+        if reroute_mask not in {1, 2, 3}:
             return []
         lines = [
-            "Router active feedback for this actor:",
+            "Router active reroute context for this actor:",
             f"- Active feedback ledger: {node_active_feedback_path(record.workspace_root, record.node_id)}",
-            f"- Feedback history reference: {node_feedback_history_path(record.workspace_root, record.node_id)}",
-            "- History may mention older snapshots or superseded task ids; current-pass outputs must use the current dispatched snapshot id injected by router.",
-            "- Active feedback is routing context, not authoritative proof. If it conflicts with current concrete evidence or current-node split truth injected by router, address that conflict explicitly instead of inheriting the finding blindly.",
+            f"- Current reroute mask: {reroute_mask}",
+            "- Active feedback is routing context, not authoritative proof.",
         ]
-        if findings:
-            lines.append("- Active findings:")
-            for finding in findings:
-                blocking = bool(finding.get("blocking"))
-                summary = str(finding.get("summary") or "").strip()
-                evidence_ref = str(finding.get("evidence_ref") or "").strip()
-                if not summary:
-                    continue
-                prefix = "BLOCKING" if blocking else "NON_BLOCKING"
-                if evidence_ref:
-                    lines.append(f"- [{prefix}] {summary} (evidence: {evidence_ref})")
-                else:
-                    lines.append(f"- [{prefix}] {summary}")
+        if actor_kind is ActorKind.IMPLEMENTER:
+            lines.insert(
+                2,
+                f"- Feedback history reference: {node_feedback_history_path(record.workspace_root, record.node_id)}",
+            )
+            lines.insert(
+                3,
+                "- History may mention older snapshots or superseded task ids; current-pass outputs must use the current dispatched snapshot id injected by router.",
+            )
         return lines
 
     def _materialize_reviewer_feedback_ledger(
@@ -3010,7 +3026,7 @@ class RouterCore:
             encoding="utf-8",
         )
         active_payload = {
-            "version": 2,
+            "version": 3,
             "node_id": str(record.node_id),
             "reviewer_attempt_count": int(actor_attempt_count),
             "snapshot_id": str(feedback_submission.get("snapshot_id") or ""),
@@ -3019,10 +3035,7 @@ class RouterCore:
             "feedback_submission_ref": str(feedback_submission_ref),
             "submission_snapshot_ref": str(snapshot_path),
             "updated_at": datetime.now(timezone.utc).isoformat(),
-            "implementer": dict(feedback_submission.get("implementer") or {}),
-            "checker": dict(feedback_submission.get("checker") or {}),
-            "tester": dict(feedback_submission.get("tester") or {}),
-            "ai_user": list(feedback_submission.get("ai_user") or []),
+            "reroute_mask": int(feedback_submission.get("reroute_mask") or 0),
         }
         active_path = node_active_feedback_path(workspace_root, record.node_id)
         active_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3244,9 +3257,9 @@ class RouterCore:
                             completion_payload["result_ref"] = str(accepted_result_ref)
             elif item.actor_kind is ActorKind.EVALUATOR_REVIEWER:
                 verdict_kind = str(completion_payload.get("verdict_kind") or "").strip().upper()
-                if verdict_kind not in {"OK", "IMPLEMENTER_ACTION_REQUIRED", "EVALUATOR_FAULT"}:
+                if verdict_kind not in {"OK", "REROUTE_REQUIRED"}:
                     reason_lines.append(
-                        "Reviewer completion verdict_kind must be one of OK, IMPLEMENTER_ACTION_REQUIRED, or EVALUATOR_FAULT."
+                        "Reviewer completion verdict_kind must be one of OK or REROUTE_REQUIRED."
                     )
                 else:
                     completion_payload["verdict_kind"] = verdict_kind
@@ -3274,7 +3287,9 @@ class RouterCore:
                 feedback_ref = self._resolve_existing_payload_file(
                     completion_payload.get("feedback_ref"),
                 )
-                if feedback_ref is not None:
+                if feedback_ref is None:
+                    reason_lines.append("Reviewer completion must define an existing feedback_ref file.")
+                else:
                     expected_feedback_ref = reviewer_current_feedback_path(
                         record.workspace_root,
                         record.node_id,
@@ -3291,6 +3306,16 @@ class RouterCore:
                         )
                     )
                     reason_lines.extend(feedback_reason_lines)
+                    if normalized_feedback_submission is not None:
+                        reroute_mask = int(normalized_feedback_submission.get("reroute_mask") or 0)
+                        if verdict_kind == "OK" and reroute_mask != 0:
+                            reason_lines.append(
+                                "Reviewer OK completion must use feedback.json with reroute_mask=0."
+                            )
+                        if verdict_kind == "REROUTE_REQUIRED" and reroute_mask not in {1, 2, 3}:
+                            reason_lines.append(
+                                "Reviewer REROUTE_REQUIRED completion must use feedback.json with reroute_mask 1, 2, or 3."
+                            )
                     if normalized_feedback_submission is not None and report_ref is not None:
                         try:
                             accepted_feedback_ref = self._snapshot_runtime_output(
@@ -3316,7 +3341,7 @@ class RouterCore:
                         else:
                             completion_payload["feedback_ref"] = str(accepted_feedback_ref)
                             completion_payload["report_ref"] = str(accepted_report_ref)
-                        completion_payload["feedback_submission"] = normalized_feedback_submission
+                            completion_payload["feedback_submission"] = normalized_feedback_submission
                 if verdict_kind == "OK":
                     result_commit, git_reason_lines = self._resolve_workspace_result_commit(
                         Path(record.workspace_root)
@@ -3339,6 +3364,35 @@ class RouterCore:
                         reason_lines.append(
                             "Ordinary kernel completion must not define reason_ref."
                         )
+                    report_ref = self._resolve_existing_payload_file(completion_payload.get("report_ref"))
+                    expected_report_ref = kernel_current_report_path(
+                        record.workspace_root,
+                        record.node_id,
+                    )
+                    if report_ref is None:
+                        reason_lines.append(
+                            "Ordinary kernel completion must define an existing report_ref file."
+                        )
+                    elif report_ref != expected_report_ref:
+                        reason_lines.append(
+                            "Ordinary kernel completion must use the canonical current closeout report path "
+                            f"{expected_report_ref}; rewrite that file and resubmit."
+                        )
+                    else:
+                        try:
+                            accepted_report_ref = self._snapshot_runtime_output(
+                                source_ref=report_ref,
+                                target_ref=kernel_accepted_report_path(
+                                    record.workspace_root,
+                                    record.node_id,
+                                    attempt_count=int(component.attempt_count),
+                                ),
+                                label="Kernel closeout report",
+                            )
+                        except RouterBusinessError as exc:
+                            reason_lines.append(exc.message)
+                        else:
+                            completion_payload["report_ref"] = str(accepted_report_ref)
                 else:
                     verdict_kind = str(completion_payload.get("verdict_kind") or "").strip().upper()
                     if verdict_kind not in {"APPROVE", "REJECT"}:
@@ -3436,7 +3490,7 @@ class RouterCore:
         lines.extend(self._build_completion_contract_lines(actor_kind=actor_kind, routerctl=routerctl))
         return lines
 
-    def _build_evaluator_fault_checker_prelude(
+    def _build_checker_reroute_prelude(
         self,
         *,
         report_ref: str,
@@ -3455,8 +3509,8 @@ class RouterCore:
             lines.append(f"Previous checker manifest reference: {prior_checker_tasks_ref_text}")
         lines.extend(
             [
-                "Previous evaluator wave ended in EVALUATOR_FAULT. Do not reproduce the prior checker manifest blindly.",
-                "Read the reviewer report and feedback first, identify the evaluator-side faults they call out, and correct those faults before emitting a new checker manifest.",
+                "Reviewer requested checker reroute. Rebuild the checker manifest from the current FINAL_EFFECTS and reviewer report.",
+                "Do not reproduce the prior checker manifest blindly; correct the current checker-side gaps before emitting a new manifest.",
             ]
         )
         return lines
@@ -3576,9 +3630,76 @@ class RouterCore:
             actor_kind,
             task_id=task_id,
         )
-        if actor_kind is ActorKind.IMPLEMENTER or (
-            actor_kind is ActorKind.KERNEL and bool(record.escalated_to_kernel)
-        ):
+        if actor_kind is ActorKind.KERNEL and bool(record.escalated_to_kernel):
+            report_ref = str(completion_payload.get("report_ref") or "").strip()
+            current_report_ref = kernel_current_report_path(
+                record.workspace_root,
+                record.node_id,
+            )
+            if report_ref and Path(report_ref).expanduser().resolve() == current_report_ref:
+                report_ref = str(
+                    self._snapshot_runtime_output(
+                        source_ref=current_report_ref,
+                        target_ref=kernel_accepted_report_path(
+                            record.workspace_root,
+                            record.node_id,
+                            attempt_count=int(
+                                self._component_state_for_kind(
+                                    completed_record,
+                                    ActorKind.KERNEL,
+                                ).attempt_count
+                            ),
+                        ),
+                        label="Kernel closeout report",
+                    )
+                )
+            final_result_commit = str(record.durable_commit or "").strip()
+            closeout_record = replace(
+                completed_record,
+                current_components=[],
+                evaluator_phase="",
+                reviewer_verdict_kind="OK",
+                reviewer_report_ref=report_ref,
+                pending_prelude_lines=[],
+                result_commit=final_result_commit,
+            )
+            self._store.upsert_node(closeout_record)
+            self._mark_router_completed(
+                result_commit=final_result_commit,
+                report_ref=report_ref,
+            )
+            return closeout_record
+        if actor_kind is ActorKind.IMPLEMENTER:
+            if self._checker_manifest_is_current(completed_record):
+                if self._has_running_actor_kind(completed_record, ActorKind.EVALUATOR_CHECKER):
+                    waiting_record = replace(
+                        completed_record,
+                        evaluator_phase="checker",
+                        pending_prelude_lines=[],
+                    )
+                    self._store.upsert_node(waiting_record)
+                    return waiting_record
+                tasks_pending = replace(
+                    completed_record,
+                    evaluator_phase="tasks",
+                    reviewer_verdict_kind="",
+                    reviewer_report_ref="",
+                    pending_prelude_lines=[],
+                )
+                self._store.upsert_node(tasks_pending)
+                return self._continue_tasks_phase(tasks_pending)
+            if self._has_running_actor_kind(completed_record, ActorKind.EVALUATOR_CHECKER):
+                waiting_record = replace(
+                    completed_record,
+                    evaluator_phase="checker",
+                    checker_tasks_ref="",
+                    task_result_refs={},
+                    reviewer_verdict_kind="",
+                    reviewer_report_ref="",
+                    pending_prelude_lines=[],
+                )
+                self._store.upsert_node(waiting_record)
+                return waiting_record
             checker_pending = replace(
                 completed_record,
                 evaluator_phase="checker",
@@ -3591,15 +3712,21 @@ class RouterCore:
             self._store.upsert_node(checker_pending)
             return self._launch_checker_for_node(checker_pending)
         if actor_kind is ActorKind.EVALUATOR_CHECKER:
-            tasks_record = replace(
+            checker_completed = replace(
                 completed_record,
-                current_components=[],
-                evaluator_phase="tasks",
+                evaluator_phase="checker",
                 checker_tasks_ref=str(completion_payload.get("tasks_ref") or ""),
                 task_result_refs={},
                 reviewer_verdict_kind="",
                 reviewer_report_ref="",
                 pending_prelude_lines=[],
+            )
+            if not self._implementer_ready_for_tasks(checker_completed):
+                self._store.upsert_node(checker_completed)
+                return checker_completed
+            tasks_record = replace(
+                checker_completed,
+                evaluator_phase="tasks",
             )
             self._store.upsert_node(tasks_record)
             return self._continue_tasks_phase(tasks_record)
@@ -3695,104 +3822,50 @@ class RouterCore:
                 if str(record.node_id) == ROOT_NODE_ID:
                     return self._activate_final_kernel_takeover(source_record=final_record)
                 return final_record
-            restart_target, rerun_tester, rerun_ai_user_task_ids = self._select_feedback_restart_target(
-                reviewer_completed
-            )
-            if restart_target == "implementer":
-                implementer_pending = replace(
-                    reviewer_completed,
-                    current_components=[],
-                    evaluator_phase="",
-                    pending_prelude_lines=[
-                        "Router resume after evaluator reviewer feedback.",
-                        f"Reviewer report reference: {report_ref}",
-                        "Read the reviewer feedback and either fix the implementation or argue concretely with evidence.",
-                    ],
-                )
-                self._store.upsert_node(implementer_pending)
-                return self._launch_implementer_for_record(implementer_pending)
-            if restart_target == "checker":
-                feedback_ref = str(completion_payload.get("feedback_ref") or "").strip()
-                checker_pending = replace(
-                    reviewer_completed,
-                    current_components=[],
-                    evaluator_phase="checker",
-                    checker_tasks_ref="",
-                    task_result_refs={},
-                    pending_prelude_lines=(
-                        self._build_evaluator_fault_checker_prelude(
+            reroute_mask = self._select_feedback_reroute_mask(reviewer_completed)
+            if verdict_kind == "REROUTE_REQUIRED":
+                if reroute_mask == 3:
+                    feedback_ref = str(completion_payload.get("feedback_ref") or "").strip()
+                    return self._launch_combined_reroute_wave(
+                        record=reviewer_completed,
+                        report_ref=report_ref,
+                        feedback_ref=feedback_ref,
+                    )
+                if reroute_mask & 2:
+                    implementer_pending = replace(
+                        reviewer_completed,
+                        current_components=[],
+                        evaluator_phase="",
+                        checker_tasks_ref="" if (reroute_mask & 1) else reviewer_completed.checker_tasks_ref,
+                        task_result_refs={} if (reroute_mask & 1) else reviewer_completed.task_result_refs,
+                        pending_prelude_lines=[
+                            "Router resume after evaluator reviewer feedback.",
+                            f"Reviewer report reference: {report_ref}",
+                            "Read the reviewer feedback and either fix the implementation or argue concretely with evidence.",
+                        ],
+                    )
+                    self._store.upsert_node(implementer_pending)
+                    return self._launch_implementer_for_record(implementer_pending)
+                if reroute_mask & 1:
+                    feedback_ref = str(completion_payload.get("feedback_ref") or "").strip()
+                    checker_pending = replace(
+                        reviewer_completed,
+                        current_components=[],
+                        evaluator_phase="checker",
+                        checker_tasks_ref="",
+                        task_result_refs={},
+                        pending_prelude_lines=self._build_checker_reroute_prelude(
                             report_ref=report_ref,
                             feedback_ref=feedback_ref,
                             prior_checker_tasks_ref=str(reviewer_completed.checker_tasks_ref or ""),
-                        )
-                        if verdict_kind == "EVALUATOR_FAULT"
-                        else [
-                            "Reviewer reported evaluator-side fault.",
-                            f"Reviewer report reference: {report_ref}",
-                            "Re-run evaluator from checker and keep evaluator-side blame on the evaluator path.",
-                        ]
-                    ),
-                )
-                self._store.upsert_node(checker_pending)
-                return self._launch_checker_for_node(checker_pending)
-            if restart_target == "tasks":
-                task_result_refs = {
-                    str(task_id): dict(result_map)
-                    for task_id, result_map in reviewer_completed.task_result_refs.items()
-                }
-                if rerun_tester:
-                    for result_map in task_result_refs.values():
-                        result_map.pop(ActorKind.EVALUATOR_TESTER.value, None)
-                for rerun_task_id in rerun_ai_user_task_ids:
-                    task_result_refs.setdefault(str(rerun_task_id), {}).pop(
-                        ActorKind.EVALUATOR_AI_USER.value,
-                        None,
+                        ),
                     )
-                tasks_pending = replace(
-                    reviewer_completed,
-                    current_components=[],
-                    evaluator_phase="tasks",
-                    task_result_refs=task_result_refs,
-                    pending_prelude_lines=[
-                        "Router resume after evaluator reviewer feedback.",
-                        f"Reviewer report reference: {report_ref}",
-                        "Re-run only the evaluator lanes that still have active reviewer feedback.",
-                    ],
+                    self._store.upsert_node(checker_pending)
+                    return self._launch_checker_for_node(checker_pending)
+                raise InvalidReviewerVerdictError(
+                    "REROUTE_REQUIRED reviewer verdict must carry reroute_mask 1, 2, or 3."
                 )
-                self._store.upsert_node(tasks_pending)
-                return self._continue_tasks_phase(tasks_pending)
-            if verdict_kind == "IMPLEMENTER_ACTION_REQUIRED":
-                implementer_pending = replace(
-                    reviewer_completed,
-                    current_components=[],
-                    evaluator_phase="",
-                    pending_prelude_lines=[
-                        "Router resume after evaluator reviewer feedback.",
-                        f"Reviewer report reference: {report_ref}",
-                        "Read the reviewer feedback and either fix the implementation or argue concretely with evidence.",
-                    ],
-                )
-                self._store.upsert_node(implementer_pending)
-                return self._launch_implementer_for_record(implementer_pending)
-            if verdict_kind == "EVALUATOR_FAULT":
-                feedback_ref = str(completion_payload.get("feedback_ref") or "").strip()
-                checker_pending = replace(
-                    reviewer_completed,
-                    current_components=[],
-                    evaluator_phase="checker",
-                    checker_tasks_ref="",
-                    task_result_refs={},
-                    pending_prelude_lines=self._build_evaluator_fault_checker_prelude(
-                        report_ref=report_ref,
-                        feedback_ref=feedback_ref,
-                        prior_checker_tasks_ref=str(reviewer_completed.checker_tasks_ref or ""),
-                    ),
-                )
-                self._store.upsert_node(checker_pending)
-                return self._launch_checker_for_node(checker_pending)
-            raise InvalidReviewerVerdictError(
-                "reviewer verdict must be one of OK, IMPLEMENTER_ACTION_REQUIRED, or EVALUATOR_FAULT"
-            )
+            raise InvalidReviewerVerdictError("reviewer verdict must be one of OK or REROUTE_REQUIRED")
         if actor_kind is ActorKind.KERNEL:
             verdict_kind = str(completion_payload.get("verdict_kind") or "").strip().upper()
             request_seq = int(completion_payload.get("request_seq") or 0)
@@ -4003,6 +4076,7 @@ class RouterCore:
                 "snapshot_id",
                 "workspace_root",
                 "authoritative_final_effects_path",
+                "final_effects_sha256",
                 "obligations",
                 "tasks",
             }
@@ -4108,6 +4182,7 @@ class RouterCore:
             "authoritative_final_effects_path": str(
                 payload.get("authoritative_final_effects_path") or ""
             ).strip(),
+            "final_effects_sha256": str(payload.get("final_effects_sha256") or "").strip(),
             "obligations": list(payload.get("obligations") or []),
             "tasks_ref": str(resolved),
             "tasks": normalized_tasks,
@@ -4136,6 +4211,7 @@ class RouterCore:
             "snapshot_id": snapshot_id,
             "workspace_root": str(record.workspace_root),
             "authoritative_final_effects_path": str(record.final_effects_file),
+            "final_effects_sha256": self._final_effects_sha256(record.final_effects_file),
             "obligations": list(manifest.get("obligations") or []),
             "tasks": [
                 {
@@ -4160,6 +4236,42 @@ class RouterCore:
             raise InvalidCheckerTasksError(
                 f"checker task manifest snapshot failed: {exc}"
             ) from exc
+
+    def _final_effects_sha256(self, final_effects_file: str | Path) -> str:
+        resolved = Path(final_effects_file).expanduser().resolve()
+        return hashlib.sha256(resolved.read_bytes()).hexdigest()
+
+    def _checker_manifest_is_current(self, record: NodeRuntimeRecord) -> bool:
+        checker_tasks_ref = str(record.checker_tasks_ref or "").strip()
+        if not checker_tasks_ref:
+            return False
+        try:
+            manifest = self._load_checker_task_manifest(Path(checker_tasks_ref))
+        except RouterBusinessError:
+            return False
+        expected_sha = str(manifest.get("final_effects_sha256") or "").strip()
+        if expected_sha:
+            return expected_sha == self._final_effects_sha256(record.final_effects_file)
+        manifest_final_effects_path = str(manifest.get("authoritative_final_effects_path") or "").strip()
+        if manifest_final_effects_path:
+            try:
+                return Path(manifest_final_effects_path).expanduser().resolve() == Path(
+                    record.final_effects_file
+                ).expanduser().resolve()
+            except OSError:
+                return False
+        return True
+
+    def _implementer_ready_for_tasks(self, record: NodeRuntimeRecord) -> bool:
+        primary_actor_kind = (
+            ActorKind.KERNEL
+            if str(record.node_id) == KERNEL_NODE_ID and bool(record.escalated_to_kernel)
+            else ActorKind.IMPLEMENTER
+        )
+        component = self._component_state_for_kind(record, primary_actor_kind)
+        if component is None:
+            return True
+        return component.status is ComponentStatus.COMPLETED
 
     def _pending_ai_user_tasks(
         self,
@@ -4403,14 +4515,22 @@ class RouterCore:
         record: NodeRuntimeRecord,
         *,
         prelude_lines: list[str] | None = None,
+        preserve_running_components: bool = False,
     ) -> NodeRuntimeRecord:
         pending_record = record
-        for current_actor in list(pending_record.current_components):
-            pending_record = self._mark_component_completed(
-                pending_record,
-                current_actor.actor_kind,
-                task_id=current_actor.task_id,
-            )
+        if preserve_running_components:
+            if self._has_running_actor_kind(pending_record, ActorKind.EVALUATOR_CHECKER):
+                pending_record = self._mark_component_completed(
+                    pending_record,
+                    ActorKind.EVALUATOR_CHECKER,
+                )
+        else:
+            for current_actor in list(pending_record.current_components):
+                pending_record = self._mark_component_completed(
+                    pending_record,
+                    current_actor.actor_kind,
+                    task_id=current_actor.task_id,
+                )
         pending_record = replace(
             pending_record,
             evaluator_phase="checker",
@@ -4418,7 +4538,11 @@ class RouterCore:
             task_result_refs={},
             reviewer_verdict_kind="",
             reviewer_report_ref="",
-            current_components=[],
+            current_components=(
+                list(pending_record.current_components)
+                if preserve_running_components
+                else []
+            ),
         )
         self._store.upsert_node(pending_record)
         spec = self._build_actor_launch_spec(
@@ -4441,6 +4565,59 @@ class RouterCore:
             pending_record=pending_record,
             spec=spec,
             failure_context=f"checker launch for node {pending_record.node_id}",
+        )
+
+    def _launch_primary_wave_for_record(self, record: NodeRuntimeRecord) -> NodeRuntimeRecord:
+        pending_record = replace(
+            record,
+            evaluator_phase="checker",
+            checker_tasks_ref="",
+            task_result_refs={},
+            reviewer_verdict_kind="",
+            reviewer_report_ref="",
+        )
+        self._store.upsert_node(pending_record)
+        if not self._has_running_actor_kind(pending_record, ActorKind.IMPLEMENTER):
+            pending_record = self._launch_implementer_for_record(pending_record)
+        if not self._checker_manifest_is_current(pending_record) and not self._has_running_actor_kind(
+            pending_record,
+            ActorKind.EVALUATOR_CHECKER,
+        ):
+            pending_record = self._launch_checker_for_node(
+                pending_record,
+                preserve_running_components=True,
+            )
+        return pending_record
+
+    def _launch_combined_reroute_wave(
+        self,
+        *,
+        record: NodeRuntimeRecord,
+        report_ref: str,
+        feedback_ref: str,
+    ) -> NodeRuntimeRecord:
+        pending_record = replace(
+            record,
+            current_components=[],
+            evaluator_phase="checker",
+            checker_tasks_ref="",
+            task_result_refs={},
+            pending_prelude_lines=[
+                "Router resume after evaluator reviewer feedback.",
+                f"Reviewer report reference: {report_ref}",
+                "Read the reviewer feedback and either fix the implementation or argue concretely with evidence.",
+            ],
+        )
+        self._store.upsert_node(pending_record)
+        pending_record = self._launch_implementer_for_record(pending_record)
+        return self._launch_checker_for_node(
+            pending_record,
+            prelude_lines=self._build_checker_reroute_prelude(
+                report_ref=report_ref,
+                feedback_ref=feedback_ref,
+                prior_checker_tasks_ref=str(record.checker_tasks_ref or ""),
+            ),
+            preserve_running_components=True,
         )
 
     def _has_running_actor_kind(
@@ -4689,7 +4866,8 @@ class RouterCore:
                 f"Source node id: {source_record.node_id}",
                 f"Source result commit: {source_record.result_commit}",
                 f"Takeover resolution reference: {resolution_ref}",
-                "Take over final closeout for the entire LOOP subtree from this workspace state.",
+                "Publish the final closeout for the entire LOOP subtree from this workspace state.",
+                f"Write the single closeout report to: {kernel_current_report_path(workspace_root, KERNEL_NODE_ID)}",
             ],
         )
         self._store.upsert_node(pending_record)
@@ -5237,7 +5415,7 @@ class RouterCore:
         implementer_state = self._component_state_for_kind(record, primary_actor_kind)
         if evaluator_phase in {"checker", "tasks", "reviewer"}:
             return True
-        if reviewer_verdict_kind == "IMPLEMENTER_ACTION_REQUIRED":
+        if reviewer_verdict_kind == "REROUTE_REQUIRED":
             return True
         if implementer_state is None:
             return True
@@ -5250,7 +5428,8 @@ class RouterCore:
     def _maybe_request_router_terminal_shutdown(self) -> None:
         router_status = str(self._store.read_router_status() or "").strip()
         if router_status == "paused":
-            self._terminate_all_running_actors_best_effort()
+            paused_actors = self._materialize_pause_barrier()
+            self._terminate_actor_refs_best_effort(paused_actors)
             self._request_router_terminal_shutdown()
             return
         if router_status in {"terminal_failed", "completed"}:
@@ -5298,6 +5477,7 @@ class RouterCore:
         if str(self._store.read_router_status() or "").strip() == "completed":
             self._request_router_terminal_shutdown()
             return
+        self._publish_root_workspace_result(result_commit=result_commit)
         self._store.write_router_completed_state(
             router_status="completed",
             router_completed_result_commit=str(result_commit),
@@ -5305,6 +5485,18 @@ class RouterCore:
             router_completed_at=datetime.now(timezone.utc).isoformat(),
         )
         self._request_router_terminal_shutdown()
+
+    def _publish_root_workspace_result(self, *, result_commit: str) -> None:
+        commit = str(result_commit or "").strip()
+        if not commit:
+            return
+        root_record = self._store.load_node(ROOT_NODE_ID)
+        if root_record is None:
+            return
+        workspace_root = str(root_record.workspace_root or "").strip()
+        if not workspace_root:
+            return
+        _publish_workspace_to_commit(Path(workspace_root), commit)
 
     def _terminate_all_running_actors_best_effort(self) -> None:
         proc_supervisor = self._proc_supervisor
@@ -5327,11 +5519,36 @@ class RouterCore:
                 except OSError:
                     pass
 
+    def _terminate_actor_refs_best_effort(self, actor_refs: list[ActorRef]) -> None:
+        proc_supervisor = self._proc_supervisor
+        terminate_actor = (
+            None if proc_supervisor is None else getattr(proc_supervisor, "terminate_actor", None)
+        )
+        for actor_ref in list(actor_refs):
+            terminated = False
+            if callable(terminate_actor):
+                terminated = bool(terminate_actor(actor_ref))
+            if terminated:
+                continue
+            record = self._store.load_node(str(actor_ref.node_id))
+            if record is None:
+                continue
+            component = self._component_state_for_actor(record, actor_ref)
+            pid = 0 if component is None else int(component.pid or 0)
+            if pid <= 0:
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
     def _build_reject_recovery_prelude(self, reason_ref: str | None) -> list[str]:
         lines = [
             "Router resume after split rejection.",
-            "Continue this node instead of splitting right now.",
+            "Do not treat this rejection as evidence that serial continuation is preferred.",
+            "Read the reject reason first and repair the cited split-bundle coverage gaps before deciding whether to continue serially or resubmit split.",
             "Do not request split again until there is new effective git diff progress.",
+            "You may request split again after new effective git diff progress and a materially improved, coverage-complete split case.",
         ]
         if reason_ref:
             lines.append(f"Reject reason reference: {reason_ref}")
@@ -5489,11 +5706,13 @@ class RouterCore:
                     ],
                 )
 
+    def _materialize_pause_barrier(self) -> list[ActorRef]:
+        return list(self._store.materialize_pause_barrier())
+
     def _reconcile_pending_launches_once(self) -> None:
         if str(self._store.read_router_status() or "").strip() in {"paused", "terminal_failed", "completed"}:
             if str(self._store.read_router_status() or "").strip() == "paused":
-                self._terminate_all_running_actors_best_effort()
-                self._request_router_terminal_shutdown()
+                self._maybe_request_router_terminal_shutdown()
             return
         pending_reviews = self._store.list_pending_split_reviews()
         if pending_reviews and self._store.load_node(KERNEL_NODE_ID) is None:
@@ -5566,29 +5785,92 @@ class RouterCore:
         )
         implementer_state = self._component_state_for_kind(record, primary_actor_kind)
         if evaluator_phase == "checker":
-            self._launch_checker_for_node(record)
+            implementer_running = self._has_running_actor_kind(record, primary_actor_kind)
+            checker_running = self._has_running_actor_kind(record, ActorKind.EVALUATOR_CHECKER)
+            if implementer_state is None and not implementer_running and not checker_running:
+                self._launch_primary_wave_for_record(record)
+                return
+            if self._checker_manifest_is_current(record):
+                if self._implementer_ready_for_tasks(record):
+                    self._continue_tasks_phase(replace(record, evaluator_phase="tasks"))
+                    return
+                if not implementer_running:
+                    self._launch_implementer_for_record(record)
+                return
+            if self._implementer_ready_for_tasks(record):
+                if not checker_running:
+                    self._launch_checker_for_node(record)
+                return
+            if not implementer_running and not checker_running:
+                self._launch_primary_wave_for_record(record)
+                return
+            if not implementer_running:
+                self._launch_implementer_for_record(record)
+                return
+            if not checker_running:
+                self._launch_checker_for_node(
+                    record,
+                    preserve_running_components=True,
+                )
             return
         if evaluator_phase == "reviewer":
             self._launch_reviewer_for_node(record)
             return
-        if reviewer_verdict_kind == "IMPLEMENTER_ACTION_REQUIRED":
-            self._relaunch_implementer_after_review(
-                record,
-                report_ref=str(record.reviewer_report_ref or ""),
-            )
+        if reviewer_verdict_kind == "REROUTE_REQUIRED":
+            reroute_mask = self._select_feedback_reroute_mask(record)
+            if reroute_mask == 3:
+                self._launch_combined_reroute_wave(
+                    record=record,
+                    report_ref=str(record.reviewer_report_ref or ""),
+                    feedback_ref=str(node_active_feedback_path(record.workspace_root, record.node_id)),
+                )
+                return
+            if reroute_mask & 2:
+                self._relaunch_implementer_after_review(
+                    record,
+                    report_ref=str(record.reviewer_report_ref or ""),
+                )
+                return
+            if reroute_mask & 1:
+                self._launch_checker_for_node(record)
+                return
             return
         if implementer_state is None:
-            self._launch_implementer_for_record(record)
+            self._launch_primary_wave_for_record(record)
             return
         if (
             implementer_state.status is ComponentStatus.INACTIVE
             and reviewer_verdict_kind == ""
             and evaluator_phase == ""
         ):
-            self._launch_implementer_for_record(record)
+            self._launch_primary_wave_for_record(record)
 
     def _continue_tasks_phase(self, record: NodeRuntimeRecord) -> NodeRuntimeRecord:
         try:
+            if not self._implementer_ready_for_tasks(record):
+                waiting_record = replace(record, evaluator_phase="checker")
+                self._store.upsert_node(waiting_record)
+                return waiting_record
+            if not self._checker_manifest_is_current(record):
+                if self._has_running_actor_kind(record, ActorKind.EVALUATOR_CHECKER):
+                    waiting_record = replace(record, evaluator_phase="checker")
+                    self._store.upsert_node(waiting_record)
+                    return waiting_record
+                checker_pending = replace(
+                    record,
+                    evaluator_phase="checker",
+                    checker_tasks_ref="",
+                    task_result_refs={},
+                    reviewer_verdict_kind="",
+                    reviewer_report_ref="",
+                    pending_prelude_lines=[
+                        "Router evaluator task-manifest recovery.",
+                        "The current checker task manifest is missing, stale, or invalid.",
+                        "Re-run checker and write a fresh valid task manifest before evaluator tasks continue.",
+                    ],
+                )
+                self._store.upsert_node(checker_pending)
+                return self._launch_checker_for_node(checker_pending)
             checker_tasks_ref = str(record.checker_tasks_ref or "").strip()
             if not checker_tasks_ref:
                 raise InvalidCheckerTasksError(

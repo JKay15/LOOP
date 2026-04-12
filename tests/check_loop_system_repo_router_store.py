@@ -315,6 +315,25 @@ def main() -> int:
             return _fail("stored AI-user node record must preserve current_components")
         if loaded_ai_record.current_components[0].task_id != "task-7":
             return _fail("stored current_components must preserve AI-user task_id")
+        cleared = store.materialize_pause_barrier()
+        if len(cleared) != 2:
+            return _fail("pause barrier must report how many current actors were durably cleared")
+        paused_node_record = store.load_node("node-001")
+        paused_ai_record = store.load_node("node-002")
+        if paused_node_record is None or paused_ai_record is None:
+            return _fail("pause barrier must preserve durable nodes")
+        if paused_node_record.current_components:
+            return _fail("pause barrier must clear node current_components")
+        if paused_ai_record.current_components:
+            return _fail("pause barrier must clear AI-user current_components")
+        if paused_node_record.components[component_key(actor_kind=ActorKind.IMPLEMENTER)].status is not ComponentStatus.INACTIVE:
+            return _fail("pause barrier must mark running implementer components inactive")
+        if paused_ai_record.components[component_key(actor_kind=ActorKind.EVALUATOR_AI_USER, task_id="task-7")].status is not ComponentStatus.INACTIVE:
+            return _fail("pause barrier must mark running AI-user components inactive")
+        if paused_ai_record.evaluator_phase != "tasks":
+            return _fail("pause barrier must preserve evaluator_phase so resume can relaunch the same frontier")
+        if paused_ai_record.checker_tasks_ref != "/tmp/workspace/node-002/checker/tasks.json":
+            return _fail("pause barrier must preserve checker_tasks_ref")
         pending_reviews = store.list_pending_split_reviews()
         if pending_reviews != [("node-001", fourth_seq)]:
             pending_reviews = [
@@ -436,10 +455,12 @@ def main() -> int:
         if reopened.read_router_completed_at() != "2026-04-06T00:00:00+00:00":
             return _fail("reopened store must preserve router_completed_at")
         reopened_record = reopened.load_node("node-001")
-        if reopened_record is None or len(reopened_record.current_components) != 1:
-            return _fail("reopened store must preserve node current_components")
-        if reopened_record.current_components[0].actor_kind is not ActorKind.IMPLEMENTER:
-            return _fail("reopened store must preserve the implementer current actor")
+        if reopened_record is None:
+            return _fail("reopened store must preserve node records after pause barrier cleanup")
+        if reopened_record.current_components:
+            return _fail("reopened store must preserve cleared current_components after pause barrier cleanup")
+        if reopened_record.components[component_key(actor_kind=ActorKind.IMPLEMENTER)].status is not ComponentStatus.INACTIVE:
+            return _fail("reopened store must preserve inactive component status after pause barrier cleanup")
 
     print("[loop-system-router-store][PASS] minimal router store persists mixed inbox items, node table, and cursor")
     return 0
